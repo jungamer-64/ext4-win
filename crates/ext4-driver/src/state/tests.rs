@@ -524,23 +524,26 @@ fn mounted_volume_dismount_is_terminal_and_cleanup_can_release_lock() -> Result<
         .prepare_close(VolumeCloseTarget::Dismount(owner))?
         .seal_close(VolumeCloseTarget::Dismount(owner))
         .ok_or(DriverError::InternalInvariantViolation)?;
-    // Without a lock, dismount releases media at once so a fresh mount can own it.
     let unlocked = unlocked_close
         .finish_close(VolumeCloseTarget::Dismount(owner))
         .ok_or(DriverError::InternalInvariantViolation)?;
+    for kind in [RawVolumeOperationKind::Read, RawVolumeOperationKind::Write] {
+        assert_eq!(unlocked.authorize_raw(owner, kind), Ok(()));
+        assert_eq!(
+            unlocked.authorize_raw(competing, kind),
+            Err(DriverError::AccessDenied)
+        );
+    }
+    assert_eq!(unlocked.unlock(owner), Err(DriverError::NotLocked));
     assert_eq!(
-        unlocked,
-        MountedVolumeState::Dismounted {
-            access: DismountedAccess::Released
-        }
-    );
-    assert_eq!(
-        unlocked.authorize_raw(owner, RawVolumeOperationKind::Write),
-        Err(DriverError::AccessDenied)
-    );
-    assert_eq!(
-        unlocked.cleanup(owner),
+        unlocked.cleanup(competing),
         (unlocked, VolumeHandleCleanup::Released)
+    );
+    let (released, cleanup) = unlocked.cleanup(owner);
+    assert_eq!(cleanup, VolumeHandleCleanup::ExclusionReleased);
+    assert_eq!(
+        released.authorize_raw(owner, RawVolumeOperationKind::Write),
+        Err(DriverError::AccessDenied)
     );
     assert_eq!(dismounted.unlock(competing), Err(DriverError::NotLocked));
     assert_eq!(
@@ -553,7 +556,7 @@ fn mounted_volume_dismount_is_terminal_and_cleanup_can_release_lock() -> Result<
             MountedVolumeState::Dismounted {
                 access: DismountedAccess::Released
             },
-            VolumeHandleCleanup::Unlocked
+            VolumeHandleCleanup::ExclusionReleased
         )
     );
     Ok(())

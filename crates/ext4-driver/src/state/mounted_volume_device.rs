@@ -686,7 +686,7 @@ impl MountedVolumeDevice {
         })?
     }
 
-    /// Publishes whether the mounted VPB rejects creates for a volume lock.
+    /// Publishes a volume lock or releases native exclusion after its owner lets go.
     /// # Errors
     ///
     /// Stops the system if the live mounted device has lost its VPB association.
@@ -1051,7 +1051,7 @@ impl MountedVpb {
         })
     }
 
-    /// Releases an explicit lock; an ended session's lock release publishes fresh remount routing.
+    /// Clearing exclusion on an ended session publishes fresh remount routing.
     #[expect(
         unsafe_code,
         reason = "the global VPB lock serializes this interior state and the corresponding native flags"
@@ -1074,7 +1074,7 @@ impl MountedVpb {
         .unwrap_or_else(|_| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
     }
 
-    /// Only a surviving lock retains routing; failure grants no media writes.
+    /// A direct-access owner or surviving lock retains routing until release.
     #[expect(
         unsafe_code,
         reason = "the actor projects ended-session routing under the VPB lock"
@@ -2303,7 +2303,7 @@ mod tests {
     /// # Errors
     /// Returns native fixture setup or finalization failure.
     /// # Panics
-    /// Fails if dismount loses raw-lock exclusion or unlock fails to admit a successor mount.
+    /// Fails if direct access loses remount exclusion or owner release leaves stale native flags.
     #[test]
     #[expect(
         clippy::panic_in_result_fn,
@@ -2323,7 +2323,12 @@ mod tests {
             })?;
             publication.publish_lock(false);
             assert_ne!(fixture.real.Vpb, original);
-            fixture.original(|vpb| assert_eq!(vpb.Flags & vpb_flag(wdk_sys::VPB_LOCKED), 0))?;
+            fixture.original(|vpb| {
+                assert_eq!(
+                    vpb.Flags & vpb_flag(wdk_sys::VPB_LOCKED | wdk_sys::VPB_DIRECT_WRITES_ALLOWED),
+                    0
+                );
+            })?;
             drop(
                 publication
                     .begin_retirement()

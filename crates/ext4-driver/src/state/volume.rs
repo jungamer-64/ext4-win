@@ -58,7 +58,7 @@ impl VolumeControlPlane {
 /// Native routing projection after filesystem session termination.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SessionEndRouting {
-    /// The lock owner retains raw access, and remount exclusion, until unlock or cleanup.
+    /// The direct-access owner retains both raw access and remount exclusion.
     DirectAccess,
     /// Failed finalization retains an existing lock without granting media writes.
     Retain,
@@ -67,13 +67,12 @@ pub(crate) enum SessionEndRouting {
 }
 
 /// Exclusive direct access retained after the filesystem session ends.
-///
-/// Only an explicit lock owner keeps raw media access. Without a lock, new opens remount the
-/// volume at once, so no old handle may write media that a fresh instance could own.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DismountedAccess {
     /// No old handle may access media; a fresh mount may recover it.
     Released,
+    /// The issuing direct-volume handle owns access until cleanup.
+    DismountOwner(KernelFileObject),
     /// Explicit unlock or cleanup releases both direct access and remount exclusion.
     Locked(KernelFileObject),
 }
@@ -84,7 +83,7 @@ impl DismountedAccess {
     /// Returns access denied after release or for another handle.
     fn authorize(self, owner: KernelFileObject) -> DriverResult<()> {
         match self {
-            Self::Locked(current) if current == owner => Ok(()),
+            Self::DismountOwner(current) | Self::Locked(current) if current == owner => Ok(()),
             _ => Err(DriverError::AccessDenied),
         }
     }
@@ -126,7 +125,7 @@ pub(super) enum MountedVolumeState {
     },
     /// Filesystem admission is terminal; direct access has its own lifetime.
     Dismounted {
-        /// Direct access and remount exclusion retained only by an explicit lock owner.
+        /// Direct access and remount exclusion retained by the issuing volume handle.
         access: DismountedAccess,
     },
     /// System shutdown observed a fully durable clean marker.
@@ -299,7 +298,7 @@ impl MountedVolumeState {
             VolumeCloseTarget::Dismount(owner) => Self::Dismounted {
                 access: match lock_owner {
                     Some(current) if current == owner => DismountedAccess::Locked(owner),
-                    None => DismountedAccess::Released,
+                    None => DismountedAccess::DismountOwner(owner),
                     Some(_) => return None,
                 },
             },
@@ -335,12 +334,20 @@ impl MountedVolumeState {
         }
     }
 
-    /// Cleanup of the lock owner releases its lock and any direct access it retained.
+    /// Handle cleanup releases any lock or direct access owned by that FILE_OBJECT.
     pub(super) fn cleanup(self, owner: KernelFileObject) -> (Self, VolumeHandleCleanup) {
         match self {
             Self::Locking { owner: current } if current == owner => {
                 (Self::Mounted, VolumeHandleCleanup::Released)
             }
+            Self::Dismounted {
+                access: DismountedAccess::DismountOwner(current),
+            } if current == owner => (
+                Self::Dismounted {
+                    access: DismountedAccess::Released,
+                },
+                VolumeHandleCleanup::ExclusionReleased,
+            ),
             Self::Locked { owner: current } | Self::RawLocked { owner: current }
                 if current == owner =>
             {
@@ -348,7 +355,7 @@ impl MountedVolumeState {
                     self.unlock(owner).unwrap_or_else(|_| {
                         KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
                     }),
-                    VolumeHandleCleanup::Unlocked,
+                    VolumeHandleCleanup::ExclusionReleased,
                 )
             }
             Self::Dismounted {
@@ -372,7 +379,7 @@ impl MountedVolumeState {
                 self.unlock(owner).unwrap_or_else(|_| {
                     KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
                 }),
-                VolumeHandleCleanup::Unlocked,
+                VolumeHandleCleanup::ExclusionReleased,
             ),
             Self::Retiring => KernelWideInconsistency::mounted_volume_state_corruption().bugcheck(),
             _ => (self, VolumeHandleCleanup::Released),
@@ -876,8 +883,8 @@ impl MountedVolumeAccess<'_> {
 pub(crate) enum VolumeHandleCleanup {
     /// Only the direct-volume share claim was released.
     Released,
-    /// The cleaned-up FILE_OBJECT also owned the volume lock.
-    Unlocked,
+    /// The cleaned-up FILE_OBJECT also excluded new opens through a lock or direct access.
+    ExclusionReleased,
 }
 
 /// Physical-retirement decision produced by one actor-owned Close transition.
@@ -2161,14 +2168,13 @@ impl MountedVolumeAccess<'_> {
         self.runtime.finish_abandoned_session()
     }
 
-    /// Projects the terminal session state onto native routing: only a surviving explicit lock
-    /// excludes remount.
+    /// Projects direct access and remount exclusion from the terminal session state.
     ///
     /// Must follow publication or failure of a session-end transition on still-authorized storage.
     pub(crate) fn session_end_routing(&self) -> SessionEndRouting {
         match self.volume_control.state {
             MountedVolumeState::Dismounted {
-                access: DismountedAccess::Locked(_),
+                access: DismountedAccess::DismountOwner(_) | DismountedAccess::Locked(_),
             }
             | MountedVolumeState::RawLocked { .. } => SessionEndRouting::DirectAccess,
             MountedVolumeState::CloseFailed {
