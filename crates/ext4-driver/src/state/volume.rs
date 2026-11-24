@@ -849,27 +849,25 @@ impl MountedVolumeAccess<'_> {
         Some(self.begin_retirement())
     }
 
-    /// Ends this instance after verification observed another medium in the same device.
-    ///
-    /// Storage is revoked before the verify IRP reports WRONG_VOLUME and the I/O Manager installs
-    /// its own successor VPB, so a fresh mount can never race this instance's lower submissions.
-    /// Physical ownership is revoked without writing a clean marker or MMP release to the
-    /// replacement medium. The actor's next revocation observation completes the session
-    /// termination and selects retirement.
-    pub(crate) fn publish_media_replacement(&mut self, device: crate::state::KernelDevice) {
+    /// Revokes this mount before acknowledging replacement of its verified medium.
+    /// # Errors
+    /// Returns a stale association or storage revocation before publishing a replacement.
+    pub(crate) fn publish_media_replacement(
+        &mut self,
+        association: super::MediaVerificationAssociation,
+    ) -> DriverResult<()> {
         #[expect(
             unsafe_code,
             reason = "the mounted actor retains the pinned VCB and native header through publication"
         )]
-        let published = unsafe {
+        unsafe {
             // SAFETY: The sole actor owns this pinned VCB until terminal reactor join.
-            self.volume.stream_context.publish_media_replacement()
-        }
-        .unwrap_or_else(|_| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
-        if published {
-            self.runtime.record_media_changed();
-        }
-        crate::state::MountedVolumeDevice::withdraw_replaced_media(device);
+            self.volume
+                .stream_context
+                .with_media_replacement(|replacement| association.publish_replacement(replacement))
+        }?;
+        self.runtime.record_media_changed();
+        Ok(())
     }
 
     /// Returns the write-only operational event capability for this mounted volume.

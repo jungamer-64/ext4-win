@@ -32,7 +32,6 @@ use std::sync::Mutex;
 use wdk_sys::STATUS_INSUFFICIENT_RESOURCES;
 use wdk_sys::{NTSTATUS, STATUS_SUCCESS};
 
-#[cfg(not(test))]
 use crate::kernel::fatal::KernelWideInconsistency;
 use crate::kernel::operational_trace::{OperationalOutcome, OperationalPath, OperationalTrace};
 use crate::kernel::status::{DriverError, DriverResult};
@@ -742,6 +741,21 @@ impl VolumeStorageAccess {
     }
 }
 
+/// Authority to revoke the verified volume while lower submissions are exclusively excluded.
+pub(crate) struct MediaReplacement<'a> {
+    /// Admission of the volume whose submission resource this scope holds.
+    admission: &'a StorageAdmission,
+}
+
+impl MediaReplacement<'_> {
+    /// Revokes the present medium before the verified association is released.
+    pub(crate) fn revoke(self) {
+        if !self.admission.replace_media() {
+            KernelWideInconsistency::mounted_volume_state_corruption().bugcheck();
+        }
+    }
+}
+
 /// Same-thread native resource acquisition consumed immediately after lower submission.
 /// This value must never be deferred or moved to another thread.
 #[derive(Debug)]
@@ -1115,16 +1129,16 @@ impl StreamContext {
         Ok(StorageRemovalPublisher { access })
     }
 
-    /// Revokes storage because verification observed another medium.
-    ///
-    /// Exclusive submission exclusion guarantees that no lower request of this instance is inside
-    /// IoCallDriver once this returns; already-pending requests are not awaited. Returns false
-    /// when removal revoked storage first, which then remains the authoritative cause.
+    /// Excludes lower submissions while the actor commits a verified media replacement.
+    /// Already-pending lower requests retain their own completion owners.
     /// # Safety
     /// The caller must be the mounted actor and retain this volume at its current address.
     /// # Errors
-    /// Rejects a node stream, which has no volume-wide revocation authority.
-    pub(crate) unsafe fn publish_media_replacement(&self) -> DriverResult<bool> {
+    /// Returns a storage revocation or the failure to commit the verified association.
+    pub(crate) unsafe fn with_media_replacement(
+        &self,
+        publish: impl FnOnce(MediaReplacement<'_>) -> DriverResult<()>,
+    ) -> DriverResult<()> {
         let access = unsafe {
             // SAFETY: The caller retains this pinned volume through the publication.
             self.storage_access()
@@ -1137,13 +1151,17 @@ impl StreamContext {
         {
             KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
         }
-        let replaced = access.state().replace_media();
+        let result = access.authorize().and_then(|()| {
+            publish(MediaReplacement {
+                admission: access.state(),
+            })
+        });
         #[cfg(not(test))]
         unsafe {
             // SAFETY: This same thread holds the exclusive resource and its APC scope.
             ext4win_stream_release_submissions(access.header.as_ptr());
         }
-        Ok(replaced)
+        result
     }
 
     /// Binds one pinned VCB as the sole direct-volume stream owner.
@@ -2964,10 +2982,14 @@ mod tests {
         );
         assert!(!storage.revocation_permits_retirement());
         // Removal won first, so a later replacement cannot change the revocation cause.
-        assert!(!unsafe {
+        let replacement = unsafe {
             // SAFETY: The fixture retains its local volume through the publication.
-            volume.publish_media_replacement()
-        }?);
+            volume.with_media_replacement(|replacement| {
+                replacement.revoke();
+                Ok(())
+            })
+        };
+        assert_eq!(replacement, Err(DriverError::DeviceRemoved));
         publisher.publish(super::StorageRemovalNotification::Final);
         publisher.publish(super::StorageRemovalNotification::Surprise);
         assert!(storage.revocation_permits_retirement());
@@ -3008,10 +3030,13 @@ mod tests {
         }?;
         let replace = || unsafe {
             // SAFETY: The fixture is the sole actor and retains its local volume.
-            volume.publish_media_replacement()
+            volume.with_media_replacement(|replacement| {
+                replacement.revoke();
+                Ok(())
+            })
         };
-        assert!(replace()?);
-        assert!(!replace()?);
+        replace()?;
+        assert_eq!(replace(), Err(DriverError::MediaReplaced));
         assert_eq!(storage.authorize(), Err(DriverError::MediaReplaced));
         assert_eq!(storage.authorize_create(), Err(DriverError::MediaReplaced));
         assert!(storage.revocation_permits_retirement());

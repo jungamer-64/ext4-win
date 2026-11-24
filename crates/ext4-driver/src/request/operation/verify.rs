@@ -106,10 +106,9 @@ impl MountedVolumeOperation for VerifyOperation {
                     // installs a new VPB itself and mounts it, so routing ends without a successor.
                     Ok(
                         MediaVerificationOutcome::Different | MediaVerificationOutcome::Invalid(_),
-                    ) => {
-                        access.publish_media_replacement(association.device());
-                        Err(DriverError::WrongVolume)
-                    }
+                    ) => access
+                        .publish_media_replacement(association)
+                        .and(Err(DriverError::WrongVolume)),
                     // Failed or canceled reads never consume native verify acknowledgment.
                     Err(error) => Err(DriverError::from(error)),
                 };

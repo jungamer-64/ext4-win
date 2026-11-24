@@ -125,7 +125,7 @@ pub enum LowerOperation {
     Flush,
     /// Query `GET_LENGTH_INFORMATION` during mount admission.
     QueryLength,
-    /// Query `IOCTL_DISK_IS_WRITABLE`; status is the entire output.
+    /// Observe write protection during mount admission; status is the entire output.
     QueryWriteAccess,
     /// Hold a consistent filesystem image until lower snapshot completion.
     SnapshotHold,
@@ -164,7 +164,10 @@ impl LowerOperation {
     /// # Errors
     /// Returns an ABI width mismatch before initializing a private lower stack.
     fn stack_flags(self) -> DriverResult<u8> {
-        if matches!(self, Self::VerifyRead | Self::MountWrite) {
+        if matches!(
+            self,
+            Self::VerifyRead | Self::MountWrite | Self::QueryLength | Self::QueryWriteAccess
+        ) {
             u8::try_from(wdk_sys::SL_OVERRIDE_VERIFY_VOLUME)
                 .map_err(|_| DriverError::InvalidParameter)
         } else {
@@ -1691,12 +1694,24 @@ mod tests {
         );
         assert!(LowerOperation::Read.transfers_bytes());
         assert!(LowerOperation::VerifyRead.transfers_bytes());
-        assert_eq!(LowerOperation::Read.stack_flags(), Ok(0));
-        assert_eq!(
-            LowerOperation::VerifyRead.stack_flags(),
-            u8::try_from(wdk_sys::SL_OVERRIDE_VERIFY_VOLUME)
-                .map_err(|_| DriverError::InvalidParameter)
-        );
+        let verify_override = u8::try_from(wdk_sys::SL_OVERRIDE_VERIFY_VOLUME)
+            .map_err(|_| DriverError::InvalidParameter);
+        for operation in [
+            LowerOperation::VerifyRead,
+            LowerOperation::MountWrite,
+            LowerOperation::QueryLength,
+            LowerOperation::QueryWriteAccess,
+        ] {
+            assert_eq!(operation.stack_flags(), verify_override);
+        }
+        for operation in [
+            LowerOperation::Read,
+            LowerOperation::Write,
+            LowerOperation::SnapshotHold,
+            LowerOperation::Trim,
+        ] {
+            assert_eq!(operation.stack_flags(), Ok(0));
+        }
         assert_eq!(
             LowerOperation::VerifyRead.major_function(),
             LowerOperation::Read.major_function()
