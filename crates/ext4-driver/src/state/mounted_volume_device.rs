@@ -531,6 +531,7 @@ impl MountedVolumeDevice {
             vpb,
             binding,
             reported,
+            retry,
         } = pending;
         let trace = binding.volume().trace;
         match vpb.try_finish() {
@@ -562,6 +563,7 @@ impl MountedVolumeDevice {
                         vpb: retained,
                         binding,
                         reported: Some(references),
+                        retry: retry.next(),
                     });
                 }
                 let timer = extension.retirement_timer.get();
@@ -572,7 +574,7 @@ impl MountedVolumeDevice {
                     ffi::KeSetTimer(
                         timer,
                         LARGE_INTEGER {
-                            QuadPart: VPB_RETIREMENT_RETRY_DELAY,
+                            QuadPart: retry.relative_due_time(),
                         },
                         dpc,
                     )
@@ -619,6 +621,7 @@ impl MountedVolumeDevice {
             vpb: publication.begin_retirement(),
             binding,
             reported: None,
+            retry: RetirementRetryDelay::FIRST,
         }
     }
 
@@ -1620,9 +1623,44 @@ impl Drop for MountedVolumeAdmission {
     }
 }
 
-/// Retry delay while the original VPB still has native references, in relative 100 ns units.
+/// Delay before the next retirement attempt while the original VPB still has native references.
+///
+/// References normally drain within the I/O Manager's FILE_OBJECT deletion just after Close, so
+/// the first retry is short. A reference held longer, such as by another component's stream file
+/// object, backs off exponentially to a bounded interval instead of polling at a fixed rate.
 #[cfg(not(test))]
-const VPB_RETIREMENT_RETRY_DELAY: i64 = -100_000;
+#[derive(Clone, Copy, Debug)]
+struct RetirementRetryDelay {
+    /// Positive delay in 100 ns units.
+    units_100ns: i64,
+}
+
+#[cfg(not(test))]
+impl RetirementRetryDelay {
+    /// First retry after 10 ms.
+    const FIRST: Self = Self {
+        units_100ns: 100_000,
+    };
+    /// Retries never wait longer than 1 s.
+    const LIMIT: Self = Self {
+        units_100ns: 10_000_000,
+    };
+
+    /// Relative due time in the negative 100 ns representation that `KeSetTimer` expects.
+    const fn relative_due_time(self) -> i64 {
+        self.units_100ns.saturating_neg()
+    }
+
+    /// Doubles the delay up to the limit.
+    fn next(self) -> Self {
+        Self {
+            units_100ns: self
+                .units_100ns
+                .saturating_mul(2)
+                .min(Self::LIMIT.units_100ns),
+        }
+    }
+}
 
 /// Physical teardown parked between retirement work-item invocations.
 #[cfg(not(test))]
@@ -1633,6 +1671,8 @@ struct PendingRetirement {
     binding: MountedVolumeBinding,
     /// Last reported native reference count; `None` before the first retained attempt.
     reported: Option<u32>,
+    /// Delay before the next attempt if references still remain.
+    retry: RetirementRetryDelay,
 }
 
 /// Outcome of one retirement work-item invocation.
