@@ -26,6 +26,7 @@ mod request;
 mod security_descriptor;
 mod short_name;
 mod state;
+mod volume_label;
 mod wire;
 
 #[cfg(not(test))]

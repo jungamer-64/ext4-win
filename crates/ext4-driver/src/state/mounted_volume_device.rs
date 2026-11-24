@@ -3,6 +3,7 @@
 use super::*;
 #[cfg(not(test))]
 use crate::kernel::operational_trace::{OperationalOutcome, OperationalPath};
+use crate::volume_label::WindowsVolumeLabel;
 
 /// Windows volume serial number derived from the ext4 filesystem UUID.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -64,16 +65,17 @@ pub(crate) struct MountedVolumeDevice;
 pub(crate) struct PreparedVpbLabelPublication {
     /// Mounted association retained by the operation until reactor drain.
     device: KernelDevice,
-    /// Fully encoded fixed-capacity VPB label.
-    label: VpbLabel,
+    /// Windows projection of the label committed by ext4.
+    label: WindowsVolumeLabel,
 }
 
 impl PreparedVpbLabelPublication {
     /// Publishes under the VPB lock after ext4 commit; retirement cannot race the owning operation.
     pub(crate) fn publish(self) {
-        VpbSpinLock::with_mounted(self.device, |vpb| self.label.write_to(vpb)).unwrap_or_else(
-            |_| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck(),
-        );
+        VpbSpinLock::with_mounted(self.device, |vpb| write_vpb_label(vpb, &self.label))
+            .unwrap_or_else(|_| {
+                KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
+            });
     }
 }
 
@@ -232,7 +234,7 @@ impl MountedVolumeDevice {
         let trace = binding.volume().trace;
         let identity = binding.actor.runtime.identity();
         let serial_number = VolumeSerialNumber::from_uuid(identity.uuid()).as_u32();
-        let volume_label = VpbLabel::encode(identity.label())?;
+        let volume_label = WindowsVolumeLabel::from_ext4(identity.label())?;
         let replacement_vpb = PoolVpb::try_new()?;
         let extension_slot = unsafe {
             // SAFETY: The mount exclusively owns this newly created, unpublished device.
@@ -648,12 +650,12 @@ impl MountedVolumeDevice {
 
     /// Prepares label bytes and checks the mounted association before ext4 mutation begins.
     /// # Errors
-    /// Returns invalid parameter for a missing or foreign association or an unencodable label.
+    /// Returns invalid parameter for a missing or foreign association.
     pub(crate) fn prepare_vpb_label_publication(
         device: KernelDevice,
         volume_label: ext4_core::Ext4VolumeLabel,
     ) -> DriverResult<PreparedVpbLabelPublication> {
-        let label = VpbLabel::encode(volume_label)?;
+        let label = WindowsVolumeLabel::from_ext4(volume_label)?;
         VpbSpinLock::with_mounted(device, |_| ())?;
         Ok(PreparedVpbLabelPublication { device, label })
     }
@@ -1001,7 +1003,7 @@ impl MountedVpb {
         supplied: KernelVpb,
         device: KernelDevice,
         serial_number: u32,
-        label: VpbLabel,
+        label: WindowsVolumeLabel,
         replacement: PoolVpb,
     ) -> DriverResult<Self> {
         let _lock = VpbSpinLock::acquire();
@@ -1031,7 +1033,7 @@ impl MountedVpb {
             .ok_or(DriverError::InsufficientResources)?;
         vpb.ReferenceCount = references;
         vpb.SerialNumber = serial_number;
-        label.write_to(vpb);
+        write_vpb_label(vpb, &label);
         vpb.DeviceObject = device.as_ptr();
         unsafe {
             // SAFETY: The unpublished mounted device's association publishes with the owned reference.
@@ -1723,46 +1725,17 @@ pub(super) fn shutdown_registration_status(status: wdk_sys::NTSTATUS) -> DriverR
     Ok(())
 }
 
-/// Count of UTF-16 code units exposed by WDK VPB::VolumeLabel.
-const VPB_VOLUME_LABEL_UNITS: usize = 32;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// VPB label payload prevalidated before mount publish mutates kernel-visible state.
-struct VpbLabel {
-    /// UTF-16 code units to copy into VPB::VolumeLabel.
-    units: [u16; VPB_VOLUME_LABEL_UNITS],
-    /// Byte length stored in VPB::VolumeLabelLength.
-    byte_len: u16,
-}
-
-impl VpbLabel {
-    /// Encodes an ext4 label into the VPB label layout.
-    /// # Errors
-    ///
-    /// Returns an error when the ext4 label exceeds the VPB label capacity or the UTF-16 byte
-    /// length cannot be represented by the VPB.
-    fn encode(label: ext4_core::Ext4VolumeLabel) -> DriverResult<Self> {
-        let bytes = label.bytes();
-        if bytes.len() > VPB_VOLUME_LABEL_UNITS {
-            return Err(DriverError::InvalidParameter);
-        }
-        let mut units = [0_u16; VPB_VOLUME_LABEL_UNITS];
-        for (target, byte) in units.iter_mut().zip(bytes.iter().copied()) {
-            *target = u16::from(byte);
-        }
-        let wchar_bytes = bytes
-            .len()
-            .checked_mul(core::mem::size_of::<u16>())
-            .ok_or(DriverError::InvalidParameter)?;
-        let byte_len = u16::try_from(wchar_bytes).map_err(|_| DriverError::InvalidParameter)?;
-        Ok(Self { units, byte_len })
+/// Writes the Windows label projection into the VPB, zeroing the unused label units.
+fn write_vpb_label(vpb: &mut wdk_sys::VPB, label: &WindowsVolumeLabel) {
+    let units = label
+        .padded_units()
+        .iter()
+        .copied()
+        .chain(core::iter::repeat(0));
+    for (target, unit) in vpb.VolumeLabel.iter_mut().zip(units) {
+        *target = unit;
     }
-
-    /// Writes a prevalidated label into a VPB.
-    fn write_to(self, vpb: &mut wdk_sys::VPB) {
-        vpb.VolumeLabel = self.units;
-        vpb.VolumeLabelLength = self.byte_len;
-    }
+    vpb.VolumeLabelLength = label.byte_len();
 }
 
 #[cfg(test)]
@@ -2038,7 +2011,7 @@ mod tests {
                 supplied,
                 self.device()?,
                 0x1234_5678,
-                VpbLabel::encode(Ext4VolumeLabel::new(b"AB")?)?,
+                WindowsVolumeLabel::from_ext4(Ext4VolumeLabel::new(b"AB")?)?,
                 PoolVpb::try_new()?,
             )?;
             let original = self
@@ -2245,7 +2218,7 @@ mod tests {
             supplied,
             fresh_device,
             73,
-            VpbLabel::encode(Ext4VolumeLabel::new(b"fresh")?)?,
+            WindowsVolumeLabel::from_ext4(Ext4VolumeLabel::new(b"fresh")?)?,
             PoolVpb::try_new()?,
         )?;
         let successor = fixture.real.Vpb;

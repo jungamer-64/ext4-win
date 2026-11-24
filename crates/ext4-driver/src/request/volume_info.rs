@@ -19,11 +19,12 @@ use crate::{
         status::{DriverError, DriverResult},
         storage::{SectorSizeInformation, StorageFailureClass},
     },
-    memory::{self, DriverVec},
+    memory,
     state::{
         MountedVolumeAccess, MountedVolumeDevice, PreparedVpbLabelPublication, TransferSectorSize,
         VolumeSerialNumber,
     },
+    volume_label::WindowsVolumeLabel,
     wire::{LittleEndianInput, LittleEndianOutput, WireOffset, WireRange},
 };
 
@@ -311,8 +312,8 @@ impl PreparedVolumeLabelPublication {
 /// Decodes a Windows label information buffer into an ext4 volume label.
 /// # Errors
 ///
-/// Returns an error when the label buffer is truncated, has odd UTF-16 byte length, contains
-/// non-byte-representable UTF-16 units, or is not a valid ext4 label.
+/// Returns an error when the label buffer is truncated, has odd UTF-16 byte length, or does not
+/// encode as a valid UTF-8 ext4 label.
 fn volume_label_from_file_fs_label(input: &[u8]) -> DriverResult<Ext4VolumeLabel> {
     let header = core::mem::offset_of!(FILE_FS_LABEL_INFORMATION, VolumeLabel);
     if input.len() < header {
@@ -331,16 +332,11 @@ fn volume_label_from_file_fs_label(input: &[u8]) -> DriverResult<Ext4VolumeLabel
         WireOffset::new(header),
         WireOffset::new(end),
     )?)?;
-    let mut label = DriverVec::new();
     let (chunks, remainder) = label_input.as_chunks::<2>();
     if !remainder.is_empty() {
         return Err(DriverError::InvalidParameter);
     }
-    for unit in chunks {
-        let unit = u16::from_le_bytes(*unit);
-        label.try_push(u8::try_from(unit).map_err(|_| DriverError::NotSupported)?)?;
-    }
-    Ext4VolumeLabel::new(label.as_slice()).map_err(|_| DriverError::InvalidParameter)
+    WindowsVolumeLabel::to_ext4(chunks.iter().copied().map(u16::from_le_bytes))
 }
 
 /// Packs `FILE_FS_VOLUME_INFORMATION`.
@@ -352,12 +348,9 @@ fn pack_volume_information(
     label: Ext4VolumeLabel,
     output: &mut [u8],
 ) -> DriverResult<IrpCompletion> {
-    let label_bytes = label.bytes();
+    let label = WindowsVolumeLabel::from_ext4(label)?;
     let header = core::mem::offset_of!(FILE_FS_VOLUME_INFORMATION, VolumeLabel);
-    let label_len = label_bytes
-        .len()
-        .checked_mul(core::mem::size_of::<u16>())
-        .ok_or(DriverError::InvalidParameter)?;
+    let label_len = usize::from(label.byte_len());
     let required = header
         .checked_add(label_len)
         .ok_or(DriverError::InvalidParameter)?;
@@ -404,11 +397,10 @@ fn pack_volume_information(
         WireOffset::new(header),
         WireOffset::new(information),
     )?)?;
-    for (destination, byte) in label_output.iter_mut().zip(
-        label_bytes
-            .iter()
-            .flat_map(|byte| u16::from(*byte).to_le_bytes()),
-    ) {
+    for (destination, byte) in label_output
+        .iter_mut()
+        .zip(label.units().iter().flat_map(|unit| unit.to_le_bytes()))
+    {
         *destination = byte;
     }
     if information == required {
@@ -928,12 +920,18 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn file_fs_label_information_decodes_byte_representable_utf16() {
+    fn file_fs_label_information_decodes_utf16_as_utf8() {
         let input = label_information_bytes(b"EXT4");
         let label = volume_label_from_file_fs_label(input.as_slice());
         assert!(label.is_ok());
         if let Ok(label) = label {
             assert_eq!(label.bytes(), b"EXT4");
+        }
+        let units: Vec<u16> = "ラベル".encode_utf16().collect();
+        let label = volume_label_from_file_fs_label(&label_information_units(&units));
+        assert!(label.is_ok());
+        if let Ok(label) = label {
+            assert_eq!(label.bytes(), "ラベル".as_bytes());
         }
     }
 
@@ -953,11 +951,11 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn file_fs_label_information_rejects_unrepresentable_utf16() {
-        let input = vec![2, 0, 0, 0, 0x00, 0x01];
+    fn file_fs_label_information_rejects_unpaired_surrogate() {
+        let input = vec![2, 0, 0, 0, 0x00, 0xD8];
         assert_eq!(
             volume_label_from_file_fs_label(input.as_slice()),
-            Err(DriverError::NotSupported)
+            Err(DriverError::InvalidParameter)
         );
     }
 
@@ -991,19 +989,25 @@ mod tests {
             );
         }
 
-        for byte in 1..=u8::MAX {
-            let label = [byte];
-            let decoded = volume_label_from_file_fs_label(&label_information_bytes(&label));
-            assert!(decoded.is_ok());
-            if let Ok(decoded) = decoded {
-                assert_eq!(decoded.bytes(), label.as_slice());
+        for unit in (1..=u16::from(u8::MAX)).chain([0x0100, 0xd7ff, 0xe000, 0xffff]) {
+            let decoded = volume_label_from_file_fs_label(&label_information_units(&[unit]));
+            let expected = char::from_u32(u32::from(unit));
+            assert!(expected.is_some());
+            if let (Ok(decoded), Some(expected)) = (decoded, expected) {
+                let mut encoded = [0_u8; 4];
+                assert_eq!(
+                    decoded.bytes(),
+                    expected.encode_utf8(&mut encoded).as_bytes()
+                );
+            } else {
+                assert!(decoded.is_ok());
             }
         }
 
-        for unit in [0x0100_u16, 0xd7ff, 0xd800, 0xdfff, 0xffff] {
+        for unit in [0xd800_u16, 0xdbff, 0xdc00, 0xdfff] {
             assert_eq!(
                 volume_label_from_file_fs_label(&label_information_units(&[unit])),
-                Err(DriverError::NotSupported)
+                Err(DriverError::InvalidParameter)
             );
         }
 
