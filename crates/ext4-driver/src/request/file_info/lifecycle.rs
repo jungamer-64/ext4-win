@@ -468,10 +468,7 @@ fn cleanup_opened_volume(
         return Err(DriverError::InvalidDeviceRequest);
     }
     let effect = operations.cleanup_volume_handle(opened_volume.file_object());
-    if matches!(
-        effect,
-        VolumeHandleCleanup::Unlocked | VolumeHandleCleanup::DirectAccessReleased
-    ) {
+    if effect == VolumeHandleCleanup::Unlocked {
         MountedVolumeDevice::publish_volume_lock(device, false);
     }
     opened_volume.finish_cleanup();
@@ -547,10 +544,7 @@ fn release_file_contexts(
                     .bugcheck();
             }
             let outcome = operations.close_volume_file_object(file_object_address, release_plan);
-            if matches!(
-                outcome.cleanup(),
-                VolumeHandleCleanup::Unlocked | VolumeHandleCleanup::DirectAccessReleased
-            ) {
+            if outcome.cleanup() == VolumeHandleCleanup::Unlocked {
                 MountedVolumeDevice::publish_volume_lock(device, false);
             }
             unsafe {

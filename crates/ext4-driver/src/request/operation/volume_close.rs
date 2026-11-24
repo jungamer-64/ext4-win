@@ -3,8 +3,7 @@
 use super::*;
 use crate::memory::DriverVec;
 use crate::state::{
-    KernelDevice, KernelFileObject, PreparedVolumeClose, SessionEndRouting, StreamCacheLease,
-    VolumeCloseTarget,
+    KernelDevice, KernelFileObject, PreparedVolumeClose, StreamCacheLease, VolumeCloseTarget,
 };
 
 /// External request selecting the terminal close outcome.
@@ -272,14 +271,7 @@ impl VolumeCloseOperation {
             }
         };
         if !matches!(target, VolumeCloseTarget::Shutdown) && access.authorize_storage().is_ok() {
-            let routing = if result.is_ok() {
-                SessionEndRouting::DirectAccess
-            } else if access.failed_close_retains_lock() {
-                SessionEndRouting::Retain
-            } else {
-                SessionEndRouting::Remount
-            };
-            MountedVolumeDevice::publish_session_end(self.device, routing);
+            MountedVolumeDevice::publish_session_end(self.device, access.session_end_routing());
             MountedVolumeDevice::unregister_shutdown_notification(self.device);
             if matches!(target, VolumeCloseTarget::Dismount(_)) {
                 MountedVolumeDevice::complete_dismount(

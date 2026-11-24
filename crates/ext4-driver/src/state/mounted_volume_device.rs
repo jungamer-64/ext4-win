@@ -1046,7 +1046,7 @@ impl MountedVpb {
         })
     }
 
-    /// Releases an explicit lock or ended-session direct owner and publishes fresh remount routing.
+    /// Releases an explicit lock; an ended session's lock release publishes fresh remount routing.
     #[expect(
         unsafe_code,
         reason = "the global VPB lock serializes this interior state and the corresponding native flags"
@@ -1069,7 +1069,7 @@ impl MountedVpb {
         .unwrap_or_else(|_| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
     }
 
-    /// Direct access retains routing even without a volume lock; failure grants no media writes.
+    /// Only a surviving lock retains routing; failure grants no media writes.
     #[expect(
         unsafe_code,
         reason = "the actor projects ended-session routing under the VPB lock"

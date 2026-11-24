@@ -58,7 +58,7 @@ impl VolumeControlPlane {
 /// Native routing projection after filesystem session termination.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SessionEndRouting {
-    /// A retained handle owns raw access until unlock or cleanup.
+    /// The lock owner retains raw access, and remount exclusion, until unlock or cleanup.
     DirectAccess,
     /// Failed finalization retains an existing lock without granting media writes.
     Retain,
@@ -67,12 +67,13 @@ pub(crate) enum SessionEndRouting {
 }
 
 /// Exclusive direct access retained after the filesystem session ends.
+///
+/// Only an explicit lock owner keeps raw media access. Without a lock, new opens remount the
+/// volume at once, so no old handle may write media that a fresh instance could own.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DismountedAccess {
     /// No old handle may access media; a fresh mount may recover it.
     Released,
-    /// The dismounting handle retains direct access until cleanup.
-    Unlocked(KernelFileObject),
     /// Explicit unlock or cleanup releases both direct access and remount exclusion.
     Locked(KernelFileObject),
 }
@@ -83,7 +84,7 @@ impl DismountedAccess {
     /// Returns access denied after release or for another handle.
     fn authorize(self, owner: KernelFileObject) -> DriverResult<()> {
         match self {
-            Self::Unlocked(current) | Self::Locked(current) if current == owner => Ok(()),
+            Self::Locked(current) if current == owner => Ok(()),
             _ => Err(DriverError::AccessDenied),
         }
     }
@@ -125,7 +126,7 @@ pub(super) enum MountedVolumeState {
     },
     /// Filesystem admission is terminal; direct access has its own lifetime.
     Dismounted {
-        /// Direct access and remount exclusion retained by the dismounting handle.
+        /// Direct access and remount exclusion retained only by an explicit lock owner.
         access: DismountedAccess,
     },
     /// System shutdown observed a fully durable clean marker.
@@ -298,7 +299,7 @@ impl MountedVolumeState {
             VolumeCloseTarget::Dismount(owner) => Self::Dismounted {
                 access: match lock_owner {
                     Some(current) if current == owner => DismountedAccess::Locked(owner),
-                    None => DismountedAccess::Unlocked(owner),
+                    None => DismountedAccess::Released,
                     Some(_) => return None,
                 },
             },
@@ -334,20 +335,12 @@ impl MountedVolumeState {
         }
     }
 
-    /// Cleanup releases direct access independently of whether an explicit lock existed.
+    /// Cleanup of the lock owner releases its lock and any direct access it retained.
     pub(super) fn cleanup(self, owner: KernelFileObject) -> (Self, VolumeHandleCleanup) {
         match self {
             Self::Locking { owner: current } if current == owner => {
                 (Self::Mounted, VolumeHandleCleanup::Released)
             }
-            Self::Dismounted {
-                access: DismountedAccess::Unlocked(current),
-            } if current == owner => (
-                Self::Dismounted {
-                    access: DismountedAccess::Released,
-                },
-                VolumeHandleCleanup::DirectAccessReleased,
-            ),
             Self::Locked { owner: current } | Self::RawLocked { owner: current }
                 if current == owner =>
             {
@@ -881,8 +874,6 @@ impl MountedVolumeAccess<'_> {
 /// VPB-visible effect produced when a direct-volume handle is cleaned up.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VolumeHandleCleanup {
-    /// Cleanup released direct access acquired without an explicit volume lock.
-    DirectAccessReleased,
     /// Only the direct-volume share claim was released.
     Released,
     /// The cleaned-up FILE_OBJECT also owned the volume lock.
@@ -2170,15 +2161,28 @@ impl MountedVolumeAccess<'_> {
         self.runtime.finish_abandoned_session()
     }
 
-    /// Native remount routing stays excluded while an explicit lock survives a failed close.
-    pub(crate) fn failed_close_retains_lock(&self) -> bool {
-        matches!(
-            self.volume_control.state,
+    /// Projects the terminal session state onto native routing: only a surviving explicit lock
+    /// excludes remount.
+    ///
+    /// Must follow publication or failure of a session-end transition on still-authorized storage.
+    pub(crate) fn session_end_routing(&self) -> SessionEndRouting {
+        match self.volume_control.state {
+            MountedVolumeState::Dismounted {
+                access: DismountedAccess::Locked(_),
+            }
+            | MountedVolumeState::RawLocked { .. } => SessionEndRouting::DirectAccess,
             MountedVolumeState::CloseFailed {
                 lock_owner: Some(_),
                 ..
+            } => SessionEndRouting::Retain,
+            MountedVolumeState::Dismounted {
+                access: DismountedAccess::Released,
             }
-        )
+            | MountedVolumeState::CloseFailed {
+                lock_owner: None, ..
+            } => SessionEndRouting::Remount,
+            _ => KernelWideInconsistency::mounted_volume_state_corruption().bugcheck(),
+        }
     }
 
     /// Reports whether no mutation or checkpoint owns journal space.
