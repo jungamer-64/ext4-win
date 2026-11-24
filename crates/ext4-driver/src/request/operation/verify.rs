@@ -102,8 +102,8 @@ impl MountedVolumeOperation for VerifyOperation {
                     Ok(MediaVerificationOutcome::Same) => {
                         association.acknowledge().map(|()| IrpCompletion::EMPTY)
                     }
-                    // The I/O Manager mounts the device's current VPB after WRONG_VOLUME, so the
-                    // replacement must reach an unmounted successor before this IRP completes.
+                    // Storage is revoked before completion. After WRONG_VOLUME the I/O Manager
+                    // installs a new VPB itself and mounts it, so routing ends without a successor.
                     Ok(
                         MediaVerificationOutcome::Different | MediaVerificationOutcome::Invalid(_),
                     ) => {

@@ -150,8 +150,10 @@ impl MountedVolumeDevice {
         })
     }
 
-    /// Moves new-open routing to an unmounted successor after storage revocation for a replaced
-    /// medium. Retained FILE_OBJECTs keep the original VPB; no direct-write permission remains.
+    /// Ends this mount's routing after storage revocation for a replaced medium, before the verify
+    /// IRP reports WRONG_VOLUME. The I/O Manager then installs its own successor VPB, so none is
+    /// published here. Retained FILE_OBJECTs keep the original VPB; no direct-write permission
+    /// remains.
     pub(crate) fn withdraw_replaced_media(device: KernelDevice) {
         Self::with_vpb(device, MountedVpb::withdraw_replaced_media);
     }
@@ -928,6 +930,11 @@ enum VpbPublication {
     Mounted(PoolVpb),
     /// The ended session retains direct-access or failed-lock exclusion until owner release.
     Excluded(PoolVpb),
+    /// A replaced medium ended routing, and the I/O Manager installs its own successor after the
+    /// verify IRP reports WRONG_VOLUME. Publishing ours would be overwritten and leaked. The
+    /// replacement is kept only so retirement can still detach an original VPB that remained
+    /// current.
+    Relinquished(PoolVpb),
     /// The I/O Manager owns a successor; this mount retains only its original VPB reference.
     Withdrawn,
 }
@@ -1108,7 +1115,7 @@ impl MountedVpb {
                     // SAFETY: with_mounted holds the global lock, the sole mutation authority.
                     &*self.publication.get()
                 },
-                VpbPublication::Withdrawn
+                VpbPublication::Relinquished(_) | VpbPublication::Withdrawn
             );
             // SAFETY: The mounted VPB retains its real device while the global lock is held.
             let real = unsafe { KernelDevice::from_raw(vpb.RealDevice) }
@@ -1191,10 +1198,13 @@ impl MountedVpb {
     }
 
     /// Accepts a kernel verify only for the original VPB that still routes the real device.
-    /// A stale verify after withdrawal reports a wrong volume, so the I/O Manager mounts the
-    /// current successor instead of this ended instance.
+    ///
+    /// A stale verify after this mount's own withdrawal reports the ended session, not
+    /// WRONG_VOLUME: the I/O Manager answers WRONG_VOLUME by installing a new VPB over the current
+    /// one, which here is this mount's published successor and would leak. The successor still
+    /// admits a fresh mount on the next access.
     /// # Errors
-    /// Returns a foreign or unmounted VPB, a withdrawn association, or removal.
+    /// Returns a foreign or unmounted VPB, a withdrawn association as dismounted, or removal.
     fn prepare_media_verification(
         &self,
         supplied: KernelVpb,
@@ -1205,9 +1215,7 @@ impl MountedVpb {
             {
                 return Err(DriverError::InvalidParameter);
             }
-            let VpbRouting::Current(real_device) = routing else {
-                return Err(DriverError::WrongVolume);
-            };
+            let real_device = routing.current()?;
             if vpb.Flags & vpb_flag(wdk_sys::VPB_REMOVE_PENDING) != 0 {
                 return Err(DriverError::DeviceRemoved);
             }
@@ -1251,7 +1259,8 @@ impl MountedVpb {
         })
     }
 
-    /// Withdraws routing for a replaced medium from any publication state.
+    /// Ends routing for a replaced medium from any publication state without publishing a
+    /// successor; an earlier withdrawal already transferred routing.
     fn withdraw_replaced_media(&self) {
         VpbSpinLock::with_mounted(self.device, |vpb| {
             vpb.Flags &= !vpb_flag(wdk_sys::VPB_DIRECT_WRITES_ALLOWED);
@@ -1263,22 +1272,31 @@ impl MountedVpb {
                 // SAFETY: with_mounted holds the global lock, the sole mutation authority.
                 &mut *self.publication.get()
             };
-            Self::withdraw_locked(vpb, publication);
+            *publication = match core::mem::replace(publication, VpbPublication::Withdrawn) {
+                VpbPublication::Mounted(replacement)
+                | VpbPublication::Excluded(replacement)
+                | VpbPublication::Relinquished(replacement) => {
+                    VpbPublication::Relinquished(replacement)
+                }
+                VpbPublication::Withdrawn => VpbPublication::Withdrawn,
+            };
         })
         .unwrap_or_else(|_| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
     }
 
     /// Transfers new-open routing to a successor under the global VPB lock. The original VPB
     /// remains mounted for native routing of retained FILE_OBJECTs until its last reference drains.
+    /// An original that is no longer current already has an I/O Manager successor, so the unused
+    /// replacement is released instead.
     #[expect(
         unsafe_code,
         reason = "the global lock encloses native association replacement and sole allocation-ownership transfer"
     )]
     fn withdraw_locked(vpb: &mut wdk_sys::VPB, publication: &mut VpbPublication) {
         let replacement = match core::mem::replace(publication, VpbPublication::Withdrawn) {
-            VpbPublication::Mounted(replacement) | VpbPublication::Excluded(replacement) => {
-                replacement
-            }
+            VpbPublication::Mounted(replacement)
+            | VpbPublication::Excluded(replacement)
+            | VpbPublication::Relinquished(replacement) => replacement,
             VpbPublication::Withdrawn => return,
         };
         let current = unsafe {
@@ -1856,10 +1874,10 @@ mod tests {
             publication.prepare_storage_verification(),
             Err(DriverError::VolumeDismounted)
         ));
-        // A stale kernel verify lets the I/O Manager mount the current successor instead.
+        // WRONG_VOLUME would make the I/O Manager overwrite the published successor.
         assert!(matches!(
             publication.prepare_media_verification(supplied),
-            Err(DriverError::WrongVolume)
+            Err(DriverError::VolumeDismounted)
         ));
         assert_eq!(fixture.real.Flags, wdk_sys::DO_VERIFY_VOLUME | 0x4000);
         drop(
@@ -1874,8 +1892,8 @@ mod tests {
     /// # Errors
     /// Returns native fixture setup or finalization failure.
     /// # Panics
-    /// Fails if a replaced medium leaves the original VPB routing new opens, keeps direct-write
-    /// permission, or blocks a fresh mount on the successor, from any publication state.
+    /// Fails if a replaced medium keeps this mount's routing or direct-write permission, publishes
+    /// a successor the I/O Manager would overwrite, or lets retirement free a still-current VPB.
     #[test]
     #[expect(
         clippy::panic_in_result_fn,
@@ -1883,43 +1901,71 @@ mod tests {
     )]
     #[expect(
         unsafe_code,
-        reason = "the fixture's real device retains the published successor under the lock"
+        reason = "the fixture's real device retains its current VPB under the lock"
     )]
-    fn replaced_media_withdraws_routing_from_every_publication_state() -> DriverResult<()> {
+    fn replaced_media_ends_routing_without_publishing_a_successor() -> DriverResult<()> {
         for session_end in [
             None,
             Some(SessionEndRouting::DirectAccess),
             Some(SessionEndRouting::Remount),
         ] {
-            let mut fixture = VpbFixture::new()?;
-            let publication = fixture.publish()?;
-            fixture.original(|vpb| vpb.Flags |= vpb_flag(wdk_sys::VPB_MOUNTED))?;
-            let original = fixture.real.Vpb;
-            if let Some(routing) = session_end {
-                publication.publish_session_end(routing);
+            for io_manager_replaces in [true, false] {
+                let mut fixture = VpbFixture::new()?;
+                let publication = fixture.publish()?;
+                fixture.original(|vpb| vpb.Flags |= vpb_flag(wdk_sys::VPB_MOUNTED))?;
+                let original = fixture.real.Vpb;
+                if let Some(routing) = session_end {
+                    publication.publish_session_end(routing);
+                }
+                let withdrawn = fixture.real.Vpb;
+                publication.withdraw_replaced_media();
+                publication.withdraw_replaced_media();
+                // Only an earlier session-end withdrawal can have published a successor.
+                assert_eq!(fixture.real.Vpb, withdrawn);
+                assert_eq!(
+                    withdrawn == original,
+                    session_end != Some(SessionEndRouting::Remount)
+                );
+                fixture.original(|vpb| {
+                    assert_eq!(vpb.Flags & vpb_flag(wdk_sys::VPB_DIRECT_WRITES_ALLOWED), 0);
+                    assert_ne!(vpb.Flags & vpb_flag(wdk_sys::VPB_MOUNTED), 0);
+                })?;
+                assert!(publication.prepare_verify_work()?.is_none());
+                assert!(matches!(
+                    publication.prepare_storage_verification(),
+                    Err(DriverError::VolumeDismounted)
+                ));
+                if io_manager_replaces && fixture.real.Vpb == original {
+                    // IoVerifyVolume installs a fresh VPB after WRONG_VOLUME.
+                    let fresh = PoolVpb::try_new()?.into_raw();
+                    let _lock = VpbSpinLock::acquire();
+                    // SAFETY: The fresh allocation is unpublished and exclusively owned here.
+                    unsafe {
+                        (*fresh.as_ptr()).RealDevice = core::ptr::from_mut(fixture.real.as_mut())
+                    };
+                    fixture.real.Vpb = fresh.as_ptr();
+                }
+                let current = fixture.real.Vpb;
+                let retirement = publication.begin_retirement();
+                if current == original {
+                    assert_ne!(fixture.real.Vpb, original);
+                } else {
+                    assert_eq!(fixture.real.Vpb, current);
+                }
+                {
+                    let _lock = VpbSpinLock::acquire();
+                    // SAFETY: The fixture's real device retains its current VPB under the lock.
+                    let successor = unsafe { &*fixture.real.Vpb };
+                    assert_eq!(successor.Flags & vpb_flag(wdk_sys::VPB_MOUNTED), 0);
+                    assert!(successor.DeviceObject.is_null());
+                }
+                drop(
+                    retirement
+                        .try_finish()
+                        .map_err(|_| DriverError::DeviceBusy)?,
+                );
+                fixture.finish()?;
             }
-            publication.withdraw_replaced_media();
-            publication.withdraw_replaced_media();
-            assert_ne!(fixture.real.Vpb, original);
-            fixture.original(|vpb| {
-                assert_eq!(vpb.Flags & vpb_flag(wdk_sys::VPB_DIRECT_WRITES_ALLOWED), 0);
-                assert_ne!(vpb.Flags & vpb_flag(wdk_sys::VPB_MOUNTED), 0);
-            })?;
-            {
-                let _lock = VpbSpinLock::acquire();
-                // SAFETY: The fixture's real device retains the successor under the global lock.
-                let successor = unsafe { &*fixture.real.Vpb };
-                assert_eq!(successor.Flags & vpb_flag(wdk_sys::VPB_MOUNTED), 0);
-                assert!(successor.DeviceObject.is_null());
-            }
-            assert!(publication.prepare_verify_work()?.is_none());
-            drop(
-                publication
-                    .begin_retirement()
-                    .try_finish()
-                    .map_err(|_| DriverError::DeviceBusy)?,
-            );
-            fixture.finish()?;
         }
         Ok(())
     }

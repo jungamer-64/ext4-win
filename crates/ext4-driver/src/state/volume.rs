@@ -851,10 +851,11 @@ impl MountedVolumeAccess<'_> {
 
     /// Ends this instance after verification observed another medium in the same device.
     ///
-    /// Storage is revoked before the VPB moves new opens to an unmounted successor, so a fresh
-    /// mount can never race this instance's lower submissions. Physical ownership is revoked
-    /// without writing a clean marker or MMP release to the replacement medium. The actor's next
-    /// revocation observation completes the session termination and selects retirement.
+    /// Storage is revoked before the verify IRP reports WRONG_VOLUME and the I/O Manager installs
+    /// its own successor VPB, so a fresh mount can never race this instance's lower submissions.
+    /// Physical ownership is revoked without writing a clean marker or MMP release to the
+    /// replacement medium. The actor's next revocation observation completes the session
+    /// termination and selects retirement.
     pub(crate) fn publish_media_replacement(&mut self, device: crate::state::KernelDevice) {
         #[expect(
             unsafe_code,
