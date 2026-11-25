@@ -2393,7 +2393,13 @@ impl<State> Journal<State> {
         }
     }
 
-    /// Parses one descriptor tag and returns the next tag offset.
+    /// Parses one descriptor tag and returns the next tag offset, or `None` when no complete fixed
+    /// tag fits before `limit`.
+    ///
+    /// Only `LAST_TAG` and the payload limit end a tag stream. An all-zero tag is a valid record:
+    /// JBD2 leaves the checksum field zero without checksum features, so a first tag for
+    /// filesystem block 0, which holds the primary superblock at block sizes above 1024 bytes,
+    /// carries zero address, flags and checksum.
     /// # Errors
     ///
     /// Returns an error when tag fields exceed the descriptor payload, tag flags are unsupported, or
@@ -2418,9 +2424,6 @@ impl<State> Journal<State> {
             let flags = be_u32(block, disk_offset(offset).checked_add_bytes(4)?)?;
             let block_high = u64::from(be_u32(block, disk_offset(offset).checked_add_bytes(8)?)?);
             let checksum = be_u32(block, disk_offset(offset).checked_add_bytes(12)?)?;
-            if block_low == 0 && block_high == 0 && flags == 0 && checksum == 0 {
-                return Ok(None);
-            }
             validate_tag_flags(flags)?;
             if first_tag && flags & JBD2_TAG_FLAG_SAME_UUID != 0 {
                 return Err(Error::JournalCorrupt);
@@ -2473,9 +2476,6 @@ impl<State> Journal<State> {
         let block_low = u64::from(be_u32(block, disk_offset(offset))?);
         let checksum = u32::from(be_u16(block, disk_offset(offset).checked_add_bytes(4)?)?);
         let flags = u32::from(be_u16(block, disk_offset(offset).checked_add_bytes(6)?)?);
-        if block_low == 0 && flags == 0 && checksum == 0 {
-            return Ok(None);
-        }
         validate_tag_flags(flags)?;
         if first_tag && flags & JBD2_TAG_FLAG_SAME_UUID != 0 {
             return Err(Error::JournalCorrupt);
@@ -5178,6 +5178,76 @@ mod tests {
             assert!(matches!(recovery.phase, RecoveryPhase::Validate));
             assert_eq!(recovery.summary.transactions, 1);
             assert_eq!(recovery.summary.next_sequence, JournalSequence::new(18));
+        }
+        Ok(())
+    }
+
+    /// # Errors
+    /// Returns fixture encoding or journal scan failures.
+    /// # Panics
+    /// Fails if a first tag for filesystem block 0 with a zero checksum field, as JBD2 writes it
+    /// without checksum features, ends the descriptor's tag stream and drops its transaction.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare the recovered transaction with independently selected tags"
+    )]
+    fn recovery_replays_a_zero_valued_first_tag_for_block_zero() -> Result<()> {
+        for incompat in [
+            0,
+            JBD2_FEATURE_INCOMPAT_64BIT,
+            JBD2_FEATURE_INCOMPAT_CSUM_V2,
+            JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_64BIT,
+            JBD2_FEATURE_INCOMPAT_CSUM_V3,
+            JBD2_FEATURE_INCOMPAT_CSUM_V3 | JBD2_FEATURE_INCOMPAT_64BIT,
+        ] {
+            let journal = test_external_journal::<LoadedJournal>(2, incompat, 64, 17, 3, 3, 100)?;
+            let block_size = journal.geometry.block_size;
+            let block_bytes =
+                usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
+            let metadata = [
+                JournalBlock::new(BlockAddress::new(0), vec![0x11; block_bytes]),
+                JournalBlock::new(BlockAddress::new(20), vec![0x22; block_bytes]),
+            ];
+            let data = [vec![0x11; block_bytes], vec![0x22; block_bytes]];
+            let mut descriptor = journal.encode_descriptor_block(
+                JournalSequence::new(17),
+                &metadata,
+                &data,
+                block_size,
+            )?;
+            let (checksum_offset, checksum_width) = if journal.profile.has_csum_v3() {
+                (12_usize, 4_usize)
+            } else {
+                (4, 2)
+            };
+            let checksum_start = JOURNAL_HEADER_BYTES
+                .checked_add(checksum_offset)
+                .ok_or(Error::ArithmeticOverflow)?;
+            let checksum_end = checksum_start
+                .checked_add(checksum_width)
+                .ok_or(Error::ArithmeticOverflow)?;
+            descriptor
+                .get_mut(checksum_start..checksum_end)
+                .ok_or(Error::TruncatedStructure)?
+                .fill(0);
+            journal.write_block_tail_checksum(&mut descriptor)?;
+            let commit = journal.encode_commit_block(JournalSequence::new(17), block_size)?;
+
+            let mut recovery =
+                JournalRecoveryOperation::new(journal, RecoveryState::NeedsRecovery)?;
+            recovery.scan_control_block(&descriptor)?;
+            recovery.scan_control_block(&commit)?;
+            recovery.finish_scan()?;
+            assert_eq!(recovery.summary.transactions, 1, "incompat {incompat:#x}");
+            assert_eq!(recovery.summary.next_sequence, JournalSequence::new(18));
+            recovery.validate_or_replay_control_block(&descriptor)?;
+            let homes: Vec<BlockAddress> = recovery.tags.iter().map(|tag| tag.home).collect();
+            assert_eq!(
+                homes,
+                [BlockAddress::new(0), BlockAddress::new(20)],
+                "incompat {incompat:#x}"
+            );
         }
         Ok(())
     }
