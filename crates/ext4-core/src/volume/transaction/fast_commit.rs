@@ -471,7 +471,7 @@ impl MetadataMutation<'_, '_> {
         }
         let mut references = memory::repeated_vec(0_u32, targets.len())?;
         let superblock = self.volume.superblock;
-        for group in 0..superblock.block_group_count()?.as_u32() {
+        for group in 0..superblock.block_group_count().as_u32() {
             let group = BlockGroupId::from_u32(group);
             let descriptor =
                 BlockGroupDescriptor::read_from(&mut self.volume.device, &superblock, group)?;

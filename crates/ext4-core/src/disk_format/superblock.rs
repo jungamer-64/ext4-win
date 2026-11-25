@@ -377,15 +377,20 @@ impl BlocksPerCluster {
 pub struct ClustersPerGroup(u32);
 
 impl ClustersPerGroup {
-    /// Creates a clusters-per-group value.
+    /// Creates a clusters-per-group value whose block bitmap is one group bitmap domain.
     ///
     /// # Errors
-    /// Returns an error when the allocation clusters-per-group value is zero.
-    pub fn new(value: u32) -> Result<Self> {
-        if value == 0 {
-            Err(Error::InvalidClusterGeometry)
-        } else {
+    /// Returns an error when the count is not a group bitmap domain for this block size and
+    /// descriptor layout.
+    pub(crate) fn new(
+        value: u32,
+        block_size: BlockSize,
+        layout: BlockGroupDescriptorLayout,
+    ) -> Result<Self> {
+        if is_group_bitmap_domain(value, block_size, layout) {
             Ok(Self(value))
+        } else {
+            Err(Error::InvalidClusterGeometry)
         }
     }
 
@@ -650,29 +655,26 @@ impl ReservedGdtBlockCount {
 pub struct InodesPerGroup(u32);
 
 impl InodesPerGroup {
-    /// Creates an inodes-per-group value whose inode table fills whole blocks and whose inode
-    /// bitmap fits in one block with byte-aligned semantic bits.
+    /// Creates an inodes-per-group value whose inode bitmap is one group bitmap domain and whose
+    /// inode table fills whole blocks.
     ///
     /// # Errors
-    /// Returns an error when the count is smaller than one inode-table block, exceeds the bits of
-    /// one bitmap block, or is not a multiple of eight and of the inodes stored per block.
-    pub fn new(value: u32, block_size: BlockSize, inode_size: InodeRecordSize) -> Result<Self> {
+    /// Returns an error when the count is not a group bitmap domain for this block size and
+    /// descriptor layout, or is not a multiple of the inodes stored per block.
+    pub(crate) fn new(
+        value: u32,
+        block_size: BlockSize,
+        inode_size: InodeRecordSize,
+        layout: BlockGroupDescriptorLayout,
+    ) -> Result<Self> {
         let per_block = block_size
             .bytes()
             .checked_div(u32::from(inode_size.as_u16()))
             .ok_or(Error::InvalidSuperblock)?;
-        let bitmap_bits = block_size
-            .bytes()
-            .checked_mul(8)
-            .ok_or(Error::ArithmeticOverflow)?;
-        if value < per_block
-            || value > bitmap_bits
-            || !value.is_multiple_of(8)
-            || !value.is_multiple_of(per_block)
-        {
-            Err(Error::InvalidSuperblock)
-        } else {
+        if is_group_bitmap_domain(value, block_size, layout) && value.is_multiple_of(per_block) {
             Ok(Self(value))
+        } else {
+            Err(Error::InvalidSuperblock)
         }
     }
 
@@ -1109,6 +1111,31 @@ impl BlockGroupDescriptorLayout {
     pub(crate) const fn has_high_fields(self) -> bool {
         matches!(self, Self::SixtyFourBit)
     }
+
+    /// Largest per-group count the descriptor count fields can record; without high fields the
+    /// free, used-directory and unused-table counts are 16 bits wide.
+    pub(crate) fn max_group_count(self) -> u32 {
+        match self {
+            Self::Standard32 => u32::from(u16::MAX),
+            Self::SixtyFourBit => u32::MAX,
+        }
+    }
+}
+
+/// Returns whether `bits` can be one block group's allocation-bitmap domain: the bitmap fits in
+/// one block, its checksum covers whole bytes, and the descriptor can count every member.
+fn is_group_bitmap_domain(
+    bits: u32,
+    block_size: BlockSize,
+    layout: BlockGroupDescriptorLayout,
+) -> bool {
+    bits != 0
+        && bits.is_multiple_of(u8::BITS)
+        && block_size
+            .bytes()
+            .checked_mul(u8::BITS)
+            .is_some_and(|block_bits| bits <= block_bits)
+        && bits <= layout.max_group_count()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1133,6 +1160,8 @@ struct ClusterGeometry {
     clusters_per_group: ClustersPerGroup,
     /// Total allocation clusters addressable by the filesystem.
     cluster_count: ClusterCount,
+    /// Block groups covering the cluster domain; the final group may hold fewer clusters.
+    group_count: BlockGroupCount,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1154,14 +1183,17 @@ struct RawClusterGeometry {
     clusters_per_group: u32,
     /// Allocation bitmap addressing domain selected by validated features.
     allocation_bitmap_domain: AllocationBitmapDomain,
+    /// Descriptor layout whose count fields record per-group free clusters.
+    descriptor_layout: BlockGroupDescriptorLayout,
 }
 
 impl ClusterGeometry {
     /// Validates cluster fields against feature flags and block geometry.
     /// # Errors
     ///
-    /// Returns an error when block and cluster feature bits disagree, cluster ratios are invalid, or
-    /// derived cluster counts overflow.
+    /// Returns an error when block and cluster feature bits disagree, cluster ratios are invalid,
+    /// the data domain does not start where the block and cluster sizes place it, a group is not a
+    /// bitmap domain, or derived cluster and group counts overflow.
     fn new(raw: RawClusterGeometry) -> Result<Self> {
         match raw.allocation_bitmap_domain {
             AllocationBitmapDomain::Blocks => {
@@ -1174,14 +1206,6 @@ impl ClusterGeometry {
             AllocationBitmapDomain::Clusters => {}
         }
         if raw.log_cluster_size < raw.log_block_size || raw.log_cluster_size > 31 {
-            return Err(Error::InvalidClusterGeometry);
-        }
-        // With 1 KiB blocks the primary superblock occupies block 1; only a bigalloc cluster may
-        // start the data domain at block 0 and contain it.
-        if raw.first_data_block.get() == 0
-            && raw.log_block_size == 0
-            && raw.log_cluster_size == raw.log_block_size
-        {
             return Err(Error::InvalidClusterGeometry);
         }
 
@@ -1202,13 +1226,27 @@ impl ClusterGeometry {
                 }
             }
         }
+        // Group 0 starts at the block holding the primary superblock, except that a multi-block
+        // cluster 0 already contains it from block 0. Descriptor placement follows the same block.
+        let first_data_block = if blocks_per_cluster.as_u32() == 1 {
+            Superblock::primary_block(raw.block_size)
+        } else {
+            BlockAddress::new(0)
+        };
+        if raw.first_data_block != first_data_block {
+            return Err(Error::InvalidClusterGeometry);
+        }
         let cluster_size = ClusterSize::new(
             raw.block_size
                 .bytes()
                 .checked_mul(blocks_per_cluster.as_u32())
                 .ok_or(Error::ArithmeticOverflow)?,
         )?;
-        let clusters_per_group = ClustersPerGroup::new(raw.clusters_per_group)?;
+        let clusters_per_group = ClustersPerGroup::new(
+            raw.clusters_per_group,
+            raw.block_size,
+            raw.descriptor_layout,
+        )?;
         if clusters_per_group
             .as_u32()
             .checked_mul(blocks_per_cluster.as_u32())
@@ -1220,18 +1258,26 @@ impl ClusterGeometry {
         let data_blocks = raw
             .block_count
             .as_u64()
-            .checked_sub(raw.first_data_block.get())
+            .checked_sub(first_data_block.get())
             .ok_or(Error::InvalidClusterGeometry)?;
         let cluster_count = ClusterCount::new(round_up_div(
             data_blocks,
             u64::from(blocks_per_cluster.as_u32()),
         )?)?;
+        let group_count = BlockGroupCount::from_u32(
+            u32::try_from(round_up_div(
+                cluster_count.as_u64(),
+                u64::from(clusters_per_group.as_u32()),
+            )?)
+            .map_err(|_| Error::InvalidClusterGeometry)?,
+        );
 
         Ok(Self {
             cluster_size,
             blocks_per_cluster,
             clusters_per_group,
             cluster_count,
+            group_count,
         })
     }
 }
@@ -1735,6 +1781,8 @@ pub struct Superblock {
     blocks_per_cluster: BlocksPerCluster,
     /// Total allocation cluster count.
     cluster_count: ClusterCount,
+    /// Block groups covering the cluster domain.
+    block_group_count: BlockGroupCount,
     /// Total free cluster count advertised by the superblock.
     free_clusters_count: FreeClusterCount,
     /// Mount-fixed reservation in the allocation domain; it is not allocated bitmap space.
@@ -2009,12 +2057,16 @@ impl Superblock {
         let raw_clusters_per_group = le_u32(raw, disk_offset(36))?;
         let first_inode = InodeId::try_from(le_u32(raw, disk_offset(84))?)?;
         let inode_size = InodeRecordSize::new(le_u16(raw, disk_offset(88))?, block_size)?;
-        let inodes_per_group =
-            InodesPerGroup::new(le_u32(raw, disk_offset(40))?, block_size, inode_size)?;
         let features = validate_features(
             le_u32(raw, disk_offset(92))?,
             le_u32(raw, disk_offset(96))?,
             le_u32(raw, disk_offset(100))?,
+        )?;
+        let inodes_per_group = InodesPerGroup::new(
+            le_u32(raw, disk_offset(40))?,
+            block_size,
+            inode_size,
+            features.descriptor_layout(),
         )?;
         if features.metadata_checksum() == MetadataChecksum::Crc32c
             && *raw.get(0x175).ok_or(Error::TruncatedStructure)? != 1
@@ -2043,14 +2095,11 @@ impl Superblock {
             blocks_per_group,
             clusters_per_group: raw_clusters_per_group,
             allocation_bitmap_domain: features.allocation_bitmap_domain(),
+            descriptor_layout: features.descriptor_layout(),
         })?;
         // Every group owns a complete inode table, so group-local inode arithmetic has no
         // partial final group.
-        let group_count = round_up_div(
-            geometry.cluster_count.as_u64(),
-            u64::from(geometry.clusters_per_group.as_u32()),
-        )?;
-        if group_count
+        if u64::from(geometry.group_count.as_u32())
             .checked_mul(u64::from(inodes_per_group.as_u32()))
             .ok_or(Error::ArithmeticOverflow)?
             != u64::from(inode_count.as_u32())
@@ -2171,6 +2220,7 @@ impl Superblock {
             cluster_size: geometry.cluster_size,
             blocks_per_cluster: geometry.blocks_per_cluster,
             cluster_count: geometry.cluster_count,
+            block_group_count: geometry.group_count,
             free_clusters_count,
             reserved_clusters_count,
             free_inodes_count,
@@ -2596,19 +2646,10 @@ impl Superblock {
         put_le_u32(raw, disk_offset(SUPERBLOCK_CHECKSUM_OFFSET), checksum)
     }
 
-    /// Number of block groups implied by the superblock.
-    ///
-    /// # Errors
-    /// Returns an error when validated geometry cannot be combined without
-    /// overflow.
-    pub fn block_group_count(self) -> Result<BlockGroupCount> {
-        let groups = round_up_div(
-            self.cluster_count.as_u64(),
-            u64::from(self.clusters_per_group.as_u32()),
-        )?;
-        Ok(BlockGroupCount::from_u32(
-            u32::try_from(groups).map_err(|_| Error::ArithmeticOverflow)?,
-        ))
+    /// Number of block groups covering the cluster domain.
+    #[must_use]
+    pub const fn block_group_count(self) -> BlockGroupCount {
+        self.block_group_count
     }
 
     /// Returns the allocation cluster containing a physical block.
@@ -2926,24 +2967,112 @@ mod tests {
     /// # Errors
     /// Returns fixture encoding failure or an unexpected admission result.
     /// # Panics
-    /// Fails if a 1 KiB non-bigalloc data domain may start at the primary superblock's block.
+    /// Fails if group 0 may start anywhere but the primary superblock's block, or block 0 when a
+    /// bigalloc cluster contains that superblock.
     #[test]
     #[expect(
         clippy::panic_in_result_fn,
-        reason = "assertions compare the 1 KiB superblock placement with admission"
+        reason = "assertions compare independently placed data domains with admission"
     )]
-    fn one_kib_block_groups_start_after_the_boot_block() -> Result<()> {
-        assert_eq!(
-            admit_geometry(|raw| put_le_u32(raw, disk_offset(20), 0)),
-            Err(Error::InvalidClusterGeometry)
-        );
-        // With 4 KiB blocks the superblock lies inside block 0, which starts the data domain.
-        admit_geometry(|raw| {
-            put_le_u32(raw, disk_offset(20), 0)?;
-            put_le_u32(raw, disk_offset(24), 2)?;
-            put_le_u32(raw, disk_offset(28), 2)?;
-            put_le_u32(raw, disk_offset(4), 1024)
-        })
+    fn data_domain_starts_at_the_primary_superblock_block() -> Result<()> {
+        // (s_log_block_size, s_log_cluster_size, s_first_data_block, admitted)
+        for (log_block, log_cluster, first, admitted) in [
+            (0, 0, 1, true),
+            (0, 0, 0, false),
+            (0, 0, 2, false),
+            (2, 2, 0, true),
+            (2, 2, 1, false),
+            (0, 2, 0, true),
+            (0, 2, 1, false),
+        ] {
+            let result = admit_geometry(|raw| {
+                put_le_u32(raw, disk_offset(20), first)?;
+                put_le_u32(raw, disk_offset(24), log_block)?;
+                put_le_u32(raw, disk_offset(28), log_cluster)?;
+                put_le_u32(raw, disk_offset(36), 8192 >> (log_cluster - log_block))?;
+                if log_cluster != log_block {
+                    put_le_u32(
+                        raw,
+                        disk_offset(100),
+                        RO_COMPAT_METADATA_CSUM | RO_COMPAT_BIGALLOC,
+                    )?;
+                }
+                put_le_u32(raw, disk_offset(4), 1024)
+            });
+            let expected = if admitted {
+                Ok(())
+            } else {
+                Err(Error::InvalidClusterGeometry)
+            };
+            assert_eq!(
+                result, expected,
+                "log block {log_block}, log cluster {log_cluster}, first data block {first}"
+            );
+        }
+        Ok(())
+    }
+
+    /// # Errors
+    /// Returns fixture encoding failure or an unexpected admission result.
+    /// # Panics
+    /// Fails if a group bitmap that overflows one block, splits a byte, or holds more members
+    /// than the descriptor counts can record is admitted, or a conforming one rejected.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare independently chosen group sizes with admission"
+    )]
+    fn group_bitmaps_fit_one_block_and_the_descriptor_counts() -> Result<()> {
+        // 1 KiB blocks after block 1 leave 4095 data blocks; each group owns 128 inodes.
+        for (per_group, admitted) in [(8192, true), (2048, true), (8200, false), (2044, false)] {
+            let result = admit_geometry(|raw| {
+                put_le_u32(raw, disk_offset(32), per_group)?;
+                put_le_u32(raw, disk_offset(36), per_group)?;
+                put_le_u32(raw, disk_offset(0), 4095_u32.div_ceil(per_group) * 128)
+            });
+            let expected = if admitted {
+                Ok(())
+            } else {
+                Err(Error::InvalidClusterGeometry)
+            };
+            assert_eq!(result, expected, "clusters per group {per_group}");
+        }
+        // One 8 KiB-block group has 65536 bitmap bits, one more than a 16-bit count can hold.
+        for (clusters, inodes, wide, expected) in [
+            (65528, 65504, false, Ok(())),
+            (65536, 128, false, Err(Error::InvalidClusterGeometry)),
+            (8192, 65536, false, Err(Error::InvalidSuperblock)),
+            (65536, 65536, true, Ok(())),
+        ] {
+            let result = admit_geometry(|raw| {
+                for (offset, value) in [
+                    (0, inodes),
+                    (4, 8192),
+                    (20, 0),
+                    (24, 3),
+                    (28, 3),
+                    (32, clusters),
+                    (36, clusters),
+                    (40, inodes),
+                ] {
+                    put_le_u32(raw, disk_offset(offset), value)?;
+                }
+                if wide {
+                    put_le_u32(
+                        raw,
+                        disk_offset(96),
+                        INCOMPAT_EXTENTS | INCOMPAT_FILETYPE | INCOMPAT_64BIT,
+                    )?;
+                    put_le_u16(raw, disk_offset(254), 64)?;
+                }
+                Ok(())
+            });
+            assert_eq!(
+                result, expected,
+                "{clusters} clusters, {inodes} inodes, 64bit {wide}"
+            );
+        }
+        Ok(())
     }
 
     /// # Errors

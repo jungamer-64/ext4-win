@@ -181,7 +181,7 @@ impl BlockGroupDescriptor {
         superblock: &Superblock,
         group: BlockGroupId,
     ) -> Result<Self> {
-        if group.as_u32() >= superblock.block_group_count()?.as_u32() {
+        if group.as_u32() >= superblock.block_group_count().as_u32() {
             return Err(Error::InvalidSuperblock);
         }
         let offset =
@@ -332,18 +332,13 @@ impl BlockGroupDescriptor {
                 .checked_add(u32::try_from(raw_delta).map_err(|_| Error::ArithmeticOverflow)?)
                 .ok_or(Error::ArithmeticOverflow)?
         };
-        put_le_u16(
+        write_descriptor_count(
             &mut self.bytes,
-            disk_offset(BG_FREE_BLOCKS_LO_OFFSET),
-            u16::try_from(updated & u32::from(u16::MAX)).map_err(|_| Error::ArithmeticOverflow)?,
+            BG_FREE_BLOCKS_LO_OFFSET,
+            BG_FREE_BLOCKS_HI_OFFSET,
+            updated,
+            superblock.descriptor_layout(),
         )?;
-        if superblock.descriptor_layout().has_high_fields() {
-            put_le_u16(
-                &mut self.bytes,
-                disk_offset(BG_FREE_BLOCKS_HI_OFFSET),
-                u16::try_from(updated >> 16).map_err(|_| Error::ArithmeticOverflow)?,
-            )?;
-        }
         self.free_clusters_count = updated;
         write_block_group_descriptor_checksum(superblock, group, &mut self.bytes)?;
         Ok(())
@@ -360,14 +355,15 @@ impl BlockGroupDescriptor {
         superblock: &Superblock,
         group: BlockGroupId,
     ) -> Result<()> {
-        self.free_inodes_count = apply_u32_delta(self.free_inodes_count, delta)?;
+        let updated = apply_u32_delta(self.free_inodes_count, delta)?;
         write_descriptor_count(
             &mut self.bytes,
             BG_FREE_INODES_LO_OFFSET,
             BG_FREE_INODES_HI_OFFSET,
-            self.free_inodes_count,
+            updated,
             superblock.descriptor_layout(),
         )?;
+        self.free_inodes_count = updated;
         write_block_group_descriptor_checksum(superblock, group, &mut self.bytes)
     }
 
@@ -382,14 +378,15 @@ impl BlockGroupDescriptor {
         superblock: &Superblock,
         group: BlockGroupId,
     ) -> Result<()> {
-        self.used_dirs_count = apply_u32_delta(self.used_dirs_count, delta)?;
+        let updated = apply_u32_delta(self.used_dirs_count, delta)?;
         write_descriptor_count(
             &mut self.bytes,
             BG_USED_DIRS_LO_OFFSET,
             BG_USED_DIRS_HI_OFFSET,
-            self.used_dirs_count,
+            updated,
             superblock.descriptor_layout(),
         )?;
+        self.used_dirs_count = updated;
         write_block_group_descriptor_checksum(superblock, group, &mut self.bytes)
     }
 
@@ -425,15 +422,15 @@ impl BlockGroupDescriptor {
         group: BlockGroupId,
         bitmap: &[u8],
     ) -> Result<()> {
-        self.itable_unused_count =
-            trailing_unused_inode_count(bitmap, superblock.inodes_per_group().as_u32())?;
+        let unused = trailing_unused_inode_count(bitmap, superblock.inodes_per_group().as_u32())?;
         write_descriptor_count(
             &mut self.bytes,
             BG_ITABLE_UNUSED_LO_OFFSET,
             BG_ITABLE_UNUSED_HI_OFFSET,
-            self.itable_unused_count,
+            unused,
             superblock.descriptor_layout(),
         )?;
+        self.itable_unused_count = unused;
         self.refresh_bitmap_checksum(
             superblock,
             group,
@@ -654,11 +651,10 @@ fn descriptor_offset(
     descriptor_size: BlockGroupDescriptorSize,
     group: BlockGroupId,
 ) -> Result<ByteOffset> {
-    let bgdt_start_block = if block_size.bytes() == 1024 {
-        2_u64
-    } else {
-        1_u64
-    };
+    let bgdt_start_block = Superblock::primary_block(block_size)
+        .get()
+        .checked_add(1)
+        .ok_or(Error::ArithmeticOverflow)?;
     let table_offset = block_size
         .offset_of(BlockAddress::new(bgdt_start_block))?
         .get();
@@ -713,7 +709,8 @@ fn descriptor_count(
 /// Splits a 32-bit count across the low and optional high descriptor fields.
 /// # Errors
 ///
-/// Returns an error when either count field cannot be written to the supplied descriptor bytes.
+/// Returns an error when the layout cannot record `value` or either count field cannot be written
+/// to the supplied descriptor bytes; the descriptor bytes are unchanged on a range failure.
 fn write_descriptor_count(
     bytes: &mut [u8],
     lo_offset: usize,
@@ -721,6 +718,9 @@ fn write_descriptor_count(
     value: u32,
     layout: BlockGroupDescriptorLayout,
 ) -> Result<()> {
+    if value > layout.max_group_count() {
+        return Err(Error::ArithmeticOverflow);
+    }
     put_le_u16(
         bytes,
         disk_offset(lo_offset),
@@ -797,4 +797,57 @@ fn trailing_unused_inode_count(bitmap: &[u8], bitmap_bits: u32) -> Result<u32> {
         }
     }
     Ok(bitmap_bits)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BG_FREE_INODES_HI_OFFSET, BG_FREE_INODES_LO_OFFSET, BlockGroupDescriptorLayout,
+        descriptor_count, write_descriptor_count,
+    };
+    use crate::error::{Error, Result};
+
+    /// # Errors
+    /// Returns descriptor field encoding or decoding failure.
+    /// # Panics
+    /// Fails if a count is truncated to the 16-bit field of a 32-byte descriptor, or a refused
+    /// write changes the descriptor.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare independently chosen counts with descriptor field contents"
+    )]
+    fn counts_beyond_the_descriptor_fields_are_refused_unchanged() -> Result<()> {
+        for (layout, count, accepted) in [
+            (BlockGroupDescriptorLayout::Standard32, 65535, true),
+            (BlockGroupDescriptorLayout::Standard32, 65536, false),
+            (BlockGroupDescriptorLayout::SixtyFourBit, 65536, true),
+            (BlockGroupDescriptorLayout::SixtyFourBit, u32::MAX, true),
+        ] {
+            let mut bytes = [0x5a_u8; 64];
+            let result = write_descriptor_count(
+                &mut bytes,
+                BG_FREE_INODES_LO_OFFSET,
+                BG_FREE_INODES_HI_OFFSET,
+                count,
+                layout,
+            );
+            if accepted {
+                assert_eq!(result, Ok(()));
+                assert_eq!(
+                    descriptor_count(
+                        &bytes,
+                        BG_FREE_INODES_LO_OFFSET,
+                        BG_FREE_INODES_HI_OFFSET,
+                        layout
+                    )?,
+                    count
+                );
+            } else {
+                assert_eq!(result, Err(Error::ArithmeticOverflow));
+                assert!(bytes.iter().all(|byte| *byte == 0x5a));
+            }
+        }
+        Ok(())
+    }
 }

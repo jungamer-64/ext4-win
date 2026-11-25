@@ -41,7 +41,7 @@ pub(super) fn read_group_metadata_layouts(
     reader: &mut OperationDevice<'_>,
     superblock: &Superblock,
 ) -> Result<Vec<GroupMetadataLayout>> {
-    let group_count = superblock.block_group_count()?;
+    let group_count = superblock.block_group_count();
     let mut layouts = Vec::new();
     for group in 0..group_count.as_u32() {
         let group = BlockGroupId::from_u32(group);
@@ -483,7 +483,7 @@ pub(super) fn is_power_of(mut value: u32, base: u32) -> bool {
 ///
 /// Returns an error when descriptor byte count multiplication or rounded block division overflows.
 pub(super) fn descriptor_table_blocks(superblock: &Superblock) -> Result<u64> {
-    let descriptor_bytes = u64::from(superblock.block_group_count()?.as_u32())
+    let descriptor_bytes = u64::from(superblock.block_group_count().as_u32())
         .checked_mul(u64::from(superblock.descriptor_size().as_u16()))
         .ok_or(Error::ArithmeticOverflow)?;
     round_up_div(descriptor_bytes, u64::from(superblock.block_size().bytes()))

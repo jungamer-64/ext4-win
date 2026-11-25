@@ -182,7 +182,7 @@ impl MetadataMutation<'_, '_> {
     /// Returns an error when no full free cluster is available, bitmap state conflicts with staged
     /// references, or cluster/group accounting cannot be updated.
     pub(super) fn allocate_cluster(&mut self) -> Result<BlockAddress> {
-        let groups = self.volume.superblock.block_group_count()?;
+        let groups = self.volume.superblock.block_group_count();
         for group in 0..groups.as_u32() {
             let group = BlockGroupId::from_u32(group);
             let descriptor = BlockGroupDescriptor::read_from(
@@ -236,7 +236,7 @@ impl MetadataMutation<'_, '_> {
     ) -> Result<ClusterAddress> {
         let mut run = 0_u64;
         let mut first = ClusterAddress::new(0);
-        for group in 0..self.volume.superblock.block_group_count()?.as_u32() {
+        for group in 0..self.volume.superblock.block_group_count().as_u32() {
             let group = BlockGroupId::from_u32(group);
             let descriptor = BlockGroupDescriptor::read_from(
                 &mut self.volume.device,
@@ -564,7 +564,7 @@ impl MetadataMutation<'_, '_> {
     /// the previous-generation read or inode accounting fails. Retirement reservations do not
     /// survive publication or abandonment.
     pub(super) fn allocate_inode(&mut self) -> Result<AllocatedInodeRecord> {
-        let groups = self.volume.superblock.block_group_count()?;
+        let groups = self.volume.superblock.block_group_count();
         for group in 0..groups.as_u32() {
             let group = BlockGroupId::from_u32(group);
             let descriptor = BlockGroupDescriptor::read_from(

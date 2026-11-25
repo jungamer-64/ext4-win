@@ -271,7 +271,7 @@ impl AllocationIndexBuild {
             } => {
                 let group =
                     u32::try_from(descriptors.len()).map_err(|_| Error::ArithmeticOverflow)?;
-                if group == superblock.block_group_count()?.as_u32() {
+                if group == superblock.block_group_count().as_u32() {
                     self.phase = IndexPhase::Bitmaps {
                         descriptors: core::mem::take(descriptors),
                         layouts: core::mem::take(layouts),
@@ -1337,8 +1337,11 @@ mod tests {
     ) -> Result<(Superblock, MountedAllocationSnapshot)> {
         let mut primary = [0_u8; 1024];
         put_le_u32(&mut primary, DiskOffset::new(76), 1)?;
+        // 1 KiB blocks: group 0 starts at the superblock's block 1 unless BIGALLOC cluster 0
+        // already covers it from block 0.
+        let first_data_block = u32::from(cluster_log == 0);
         let inodes = blocks
-            .checked_sub(1)
+            .checked_sub(first_data_block)
             .ok_or(Error::InvalidSuperblock)?
             .div_ceil(8192)
             .checked_mul(inodes_per_group)
@@ -1346,7 +1349,7 @@ mod tests {
         for (offset, value) in [
             (0, inodes),
             (4, blocks),
-            (20, 1),
+            (20, first_data_block),
             (28, cluster_log),
             (32, 8192),
             (
@@ -1532,10 +1535,10 @@ mod tests {
         let (superblock, allocation) = allocation_fixture(2, 4096, 128)?;
         let mut ranges = Vec::new();
         for (start, blocks, ownership) in [
-            (9, 1, BlockOwnership::SharedXattr),
-            (2, 5, BlockOwnership::Exclusive),
-            (9, 1, BlockOwnership::SharedXattr),
-            (8, 1, BlockOwnership::Exclusive),
+            (8, 1, BlockOwnership::SharedXattr),
+            (1, 5, BlockOwnership::Exclusive),
+            (8, 1, BlockOwnership::SharedXattr),
+            (7, 1, BlockOwnership::Exclusive),
         ] {
             ranges.try_push(AllocationRange::new(
                 BlockAddress::new(start),
@@ -1548,7 +1551,7 @@ mod tests {
         assert_eq!(
             inventory.xattrs,
             vec![XattrOwnerCount {
-                block: BlockAddress::new(9),
+                block: BlockAddress::new(8),
                 owners: 2
             }]
         );
@@ -1682,7 +1685,7 @@ mod tests {
             &mut bitmap,
             &superblock,
             BlockGroupId::from_u32(0),
-            BlockAddress::new(4),
+            BlockAddress::new(3),
             6,
         )?;
         assert_eq!(bitmap.first().copied(), Some(0b111));
