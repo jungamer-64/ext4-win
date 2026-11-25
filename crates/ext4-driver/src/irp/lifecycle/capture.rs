@@ -1025,21 +1025,24 @@ impl QueueContext {
     }
 }
 
-/// Checks the effective requestor token before leaving its dispatch context.
+/// Checks the active IRP's effective requestor token before queue publication.
 /// # Errors
 /// Returns access denied without enabled volume-management privilege.
 #[cfg_attr(
     not(test),
     expect(
         unsafe_code,
-        reason = "dispatch capture retains the original requestor context"
+        reason = "dispatch retains the IRP and its issuing thread"
     )
 )]
 fn authorize_volume_management(_target: &ActiveIrp<'_>) -> Result<(), IrpCompletion> {
     #[cfg(not(test))]
     let allowed = unsafe {
-        // SAFETY: Request capture calls here before its original dispatch thread queues work.
-        ffi::ext4win_volume_management_privilege(_target.requestor_mode())
+        // SAFETY: The active dispatch retains the IRP throughout the check.
+        ffi::ext4win_requestor_has_privilege(
+            _target.irp.as_ptr(),
+            wdk_sys::SE_MANAGE_VOLUME_PRIVILEGE,
+        )
     } != 0;
     #[cfg(test)]
     let allowed = false;
@@ -1050,21 +1053,24 @@ fn authorize_volume_management(_target: &ActiveIrp<'_>) -> Result<(), IrpComplet
     }
 }
 
-/// Checks symbolic-link authority before the request leaves its effective token's thread.
+/// Checks symbolic-link authority from the active IRP before queue publication.
 /// # Errors
 /// Returns privilege-not-held without enabled symbolic-link creation privilege.
 #[cfg_attr(
     not(test),
     expect(
         unsafe_code,
-        reason = "capture still owns the original requestor context"
+        reason = "dispatch retains the IRP and its issuing thread"
     )
 )]
 fn authorize_symbolic_link(_target: &ActiveIrp<'_>) -> Result<(), IrpCompletion> {
     #[cfg(not(test))]
     let allowed = unsafe {
-        // SAFETY: Capture executes on the original dispatch thread before queue publication.
-        ffi::ext4win_symbolic_link_privilege(_target.requestor_mode())
+        // SAFETY: The active dispatch retains the IRP throughout the check.
+        ffi::ext4win_requestor_has_privilege(
+            _target.irp.as_ptr(),
+            wdk_sys::SE_CREATE_SYMBOLIC_LINK_PRIVILEGE,
+        )
     } != 0;
     #[cfg(test)]
     let allowed = false;
@@ -1077,7 +1083,7 @@ fn authorize_symbolic_link(_target: &ActiveIrp<'_>) -> Result<(), IrpCompletion>
     }
 }
 
-/// Captured mount-key operation authority, checked on the original requestor thread.
+/// Captured mount-key operation authority of the active IRP's requestor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PreparedKeyControl {
     /// Adds a key with enabled volume-management privilege.
@@ -1293,10 +1299,17 @@ impl PreparedRequest {
                         | super::SetFileOperation::Link(_)
                         | super::SetFileOperation::LinkEx(_))
                 ) {
-                    let subject = crate::kernel::requestor_subject::RequestorSubject::capture(
-                        target.device(),
-                        target.requestor_mode(),
-                    )
+                    #[expect(
+                        unsafe_code,
+                        reason = "the active dispatch owns the device and IRP during synchronous capture"
+                    )]
+                    let subject = unsafe {
+                        // SAFETY: The active request view retains both native objects during capture.
+                        crate::kernel::requestor_subject::RequestorSubject::capture(
+                            target.device(),
+                            target.irp,
+                        )
+                    }
                     .map_err(IrpCompletion::from_error)?;
                     Ok((Self::NamespaceInformation(subject), generic_key()))
                 } else {
@@ -1323,12 +1336,18 @@ impl PreparedRequest {
                         stack
                             .notify_directory()
                             .map_err(IrpCompletion::from_error)?;
-                        let subject =
+                        #[expect(
+                            unsafe_code,
+                            reason = "the active dispatch owns the device and IRP during synchronous capture"
+                        )]
+                        let subject = unsafe {
+                            // SAFETY: The active request view retains both native objects during capture.
                             crate::kernel::requestor_subject::NotificationSubject::capture(
                                 target.device(),
-                                target.requestor_mode(),
+                                target.irp,
                             )
-                            .map_err(IrpCompletion::from_error)?;
+                        }
+                        .map_err(IrpCompletion::from_error)?;
                         Self::DirectoryControl(PreparedDirectoryControl::NotifyChangeDirectory(
                             subject,
                         ))

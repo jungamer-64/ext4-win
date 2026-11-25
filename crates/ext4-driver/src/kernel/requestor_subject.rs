@@ -3,11 +3,12 @@
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::security_descriptor::SecurityDescriptorRef;
 use crate::state::KernelDevice;
+use core::ptr::NonNull;
 
-/// Traversal authority captured on the requesting thread before notification queueing.
+/// Traversal authority captured from the active IRP before notification queueing.
 #[derive(Debug)]
 pub(crate) struct NotificationSubject {
-    /// Only original-context native capture may establish either authority.
+    /// Native capture establishes authority from the IRP's requestor.
     #[cfg(not(test))]
     authority: NotificationTraversalAuthority,
 }
@@ -23,32 +24,35 @@ enum NotificationTraversalAuthority {
 }
 
 impl NotificationSubject {
-    /// Captures traversal bypass or the effective subject before leaving requestor context.
+    /// Captures traversal bypass or the effective subject before queue publication.
+    /// # Safety
+    /// The active dispatch must retain the device and IRP through this call.
     /// # Errors
     /// Returns native IRQL/allocation failure; host fixtures cannot fabricate token authority.
-    #[cfg_attr(
-        not(test),
-        expect(
-            unsafe_code,
-            reason = "native capture interprets the original effective token before queue publication"
-        )
+    #[expect(
+        unsafe_code,
+        reason = "native capture borrows the active IRP and device for effective-token capture"
     )]
-    pub(crate) fn capture(
+    pub(crate) unsafe fn capture(
         device: KernelDevice,
-        mode: wdk_sys::KPROCESSOR_MODE,
+        irp: NonNull<wdk_sys::IRP>,
     ) -> DriverResult<Self> {
         #[cfg(not(test))]
         {
             let mut native = core::ptr::null_mut();
             let status = unsafe {
-                // SAFETY: Original dispatch retains the device and this output during capture.
-                super::ffi::ext4win_notification_subject_capture(device.as_ptr(), mode, &mut native)
+                // SAFETY: Active dispatch retains the device and IRP. The output is local.
+                super::ffi::ext4win_notification_subject_capture(
+                    device.as_ptr(),
+                    irp.as_ptr(),
+                    &raw mut native,
+                )
             };
             if status < 0 {
                 return Err(DriverError::SecurityCheckFailed(status));
             }
             Ok(Self {
-                authority: match core::ptr::NonNull::new(native) {
+                authority: match NonNull::new(native) {
                     Some(native) => {
                         NotificationTraversalAuthority::Traverse(RequestorSubject { native })
                     }
@@ -58,7 +62,7 @@ impl NotificationSubject {
         }
         #[cfg(test)]
         {
-            core::hint::black_box((device, mode));
+            core::hint::black_box((device, irp));
             Err(DriverError::NotSupported)
         }
     }
@@ -94,33 +98,35 @@ pub(crate) struct RequestorSubject {
 }
 
 impl RequestorSubject {
-    /// Captures the dispatch thread's effective subject before queue handoff.
+    /// Captures the active IRP's effective subject before queue handoff.
+    /// # Safety
+    /// The active dispatch must retain the device and IRP through this call.
     /// # Errors
     /// Returns native allocation/IRQL failure; host tests cannot capture kernel token authority.
-    #[cfg_attr(
-        not(test),
-        expect(
-            unsafe_code,
-            reason = "native capture retains tokens and a device-referenced release work item"
-        )
+    #[expect(
+        unsafe_code,
+        reason = "native capture retains tokens and a device-referenced release work item"
     )]
-    pub(crate) fn capture(
+    pub(crate) unsafe fn capture(
         _device: KernelDevice,
-        _mode: wdk_sys::KPROCESSOR_MODE,
+        _irp: NonNull<wdk_sys::IRP>,
     ) -> DriverResult<Self> {
         #[cfg(not(test))]
         {
             let mut native = core::ptr::null_mut();
             let status = unsafe {
-                // SAFETY: Dispatch retains this device and writable output through original-context capture.
-                super::ffi::ext4win_subject_capture(_device.as_ptr(), _mode, &mut native)
+                // SAFETY: Active dispatch retains the device and IRP. The output is local.
+                super::ffi::ext4win_subject_capture(
+                    _device.as_ptr(),
+                    _irp.as_ptr(),
+                    &raw mut native,
+                )
             };
             if status < 0 {
                 return Err(DriverError::SecurityCheckFailed(status));
             }
             Ok(Self {
-                native: core::ptr::NonNull::new(native)
-                    .ok_or(DriverError::InternalInvariantViolation)?,
+                native: NonNull::new(native).ok_or(DriverError::InternalInvariantViolation)?,
             })
         }
         #[cfg(test)]

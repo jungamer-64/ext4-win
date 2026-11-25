@@ -10,6 +10,47 @@ typedef struct _EXT4WIN_REQUESTOR_SUBJECT {
 /* FsRtl releases and pool-frees this prefix after notification ownership transfers. */
 C_ASSERT(FIELD_OFFSET(EXT4WIN_REQUESTOR_SUBJECT, Subject) == 0);
 
+/* A filter may resume this IRP on a different thread. Use the IRP's retained
+ * issuing thread and its stable owning process for user authorization. */
+static NTSTATUS ext4win_capture_irp_subject(PIRP irp, PSECURITY_SUBJECT_CONTEXT subject)
+{
+    PETHREAD thread = irp->Tail.Overlay.Thread;
+    PEPROCESS process;
+    if (irp->RequestorMode == KernelMode) {
+        SeCaptureSubjectContext(subject);
+        return STATUS_SUCCESS;
+    }
+    if (irp->RequestorMode != UserMode) { return STATUS_INVALID_PARAMETER; }
+    if (thread == NULL) { return STATUS_INVALID_DEVICE_STATE; }
+    process = PsGetThreadProcess(thread);
+    if (process == NULL || IoGetRequestorProcess(irp) != process) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+    SeCaptureSubjectContextEx(thread, process, subject);
+    return STATUS_SUCCESS;
+}
+
+static BOOLEAN ext4win_subject_has_privilege(PSECURITY_SUBJECT_CONTEXT subject, ULONG privilege)
+{
+    PRIVILEGE_SET required = {0};
+    required.PrivilegeCount = 1;
+    required.Control = PRIVILEGE_SET_ALL_NECESSARY;
+    required.Privilege[0].Luid = RtlConvertUlongToLuid(privilege);
+    return SePrivilegeCheck(&required, subject, UserMode);
+}
+
+BOOLEAN NTAPI ext4win_requestor_has_privilege(PIRP irp, ULONG privilege)
+{
+    SECURITY_SUBJECT_CONTEXT subject;
+    BOOLEAN allowed;
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) { return 0; }
+    if (irp->RequestorMode == KernelMode) { return TRUE; }
+    if (!NT_SUCCESS(ext4win_capture_irp_subject(irp, &subject))) { return 0; }
+    allowed = ext4win_subject_has_privilege(&subject, privilege);
+    SeReleaseSubjectContext(&subject);
+    return allowed;
+}
+
 /* The work item references the device until PASSIVE_LEVEL token retirement completes.
  * Queue cancellation may transfer this unique cleanup owner at DISPATCH_LEVEL. */
 static VOID ext4win_subject_destroy(PEXT4WIN_REQUESTOR_SUBJECT subject)
@@ -28,19 +69,37 @@ static VOID ext4win_subject_release_worker(PDEVICE_OBJECT device, PVOID context)
     ext4win_subject_destroy((PEXT4WIN_REQUESTOR_SUBJECT)context);
 }
 
-NTSTATUS ext4win_subject_capture(PDEVICE_OBJECT device, KPROCESSOR_MODE mode, PVOID *output)
+/* Consumes the captured token references, transferring them to the pool context on success. */
+static NTSTATUS ext4win_subject_retain(PDEVICE_OBJECT device, KPROCESSOR_MODE mode,
+    PSECURITY_SUBJECT_CONTEXT captured, PVOID *output)
 {
     PEXT4WIN_REQUESTOR_SUBJECT subject;
-    *output = NULL;
-    if (KeGetCurrentIrql() != PASSIVE_LEVEL) { return STATUS_INVALID_DEVICE_STATE; }
     subject = ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*subject), 'sR4E');
-    if (subject == NULL) { return STATUS_INSUFFICIENT_RESOURCES; }
+    if (subject == NULL) {
+        SeReleaseSubjectContext(captured);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
     subject->ReleaseWork = IoAllocateWorkItem(device);
-    if (subject->ReleaseWork == NULL) { ExFreePool(subject); return STATUS_INSUFFICIENT_RESOURCES; }
+    if (subject->ReleaseWork == NULL) {
+        ExFreePool(subject);
+        SeReleaseSubjectContext(captured);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
     subject->Mode = mode;
-    SeCaptureSubjectContext(&subject->Subject);
+    subject->Subject = *captured;
     *output = subject;
     return STATUS_SUCCESS;
+}
+
+NTSTATUS NTAPI ext4win_subject_capture(PDEVICE_OBJECT device, PIRP irp, PVOID *output)
+{
+    SECURITY_SUBJECT_CONTEXT captured;
+    NTSTATUS status;
+    *output = NULL;
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) { return STATUS_INVALID_DEVICE_STATE; }
+    status = ext4win_capture_irp_subject(irp, &captured);
+    if (!NT_SUCCESS(status)) { return status; }
+    return ext4win_subject_retain(device, irp->RequestorMode, &captured, output);
 }
 
 VOID ext4win_subject_release(PVOID context)
@@ -54,15 +113,20 @@ VOID ext4win_subject_release(PVOID context)
 }
 
 /* NULL on success means the original requestor acquired traversal bypass authority. */
-NTSTATUS ext4win_notification_subject_capture(PDEVICE_OBJECT device, KPROCESSOR_MODE mode, PVOID *output)
+NTSTATUS NTAPI ext4win_notification_subject_capture(PDEVICE_OBJECT device, PIRP irp, PVOID *output)
 {
+    SECURITY_SUBJECT_CONTEXT captured;
+    NTSTATUS status;
     *output = NULL;
     if (KeGetCurrentIrql() != PASSIVE_LEVEL) { return STATUS_INVALID_DEVICE_STATE; }
-    if (mode != KernelMode && mode != UserMode) { return STATUS_INVALID_PARAMETER; }
-    if (SeSinglePrivilegeCheck(RtlConvertLongToLuid(SE_CHANGE_NOTIFY_PRIVILEGE), mode)) {
+    if (irp->RequestorMode == KernelMode) { return STATUS_SUCCESS; }
+    status = ext4win_capture_irp_subject(irp, &captured);
+    if (!NT_SUCCESS(status)) { return status; }
+    if (ext4win_subject_has_privilege(&captured, SE_CHANGE_NOTIFY_PRIVILEGE)) {
+        SeReleaseSubjectContext(&captured);
         return STATUS_SUCCESS;
     }
-    return ext4win_subject_capture(device, mode, output);
+    return ext4win_subject_retain(device, UserMode, &captured, output);
 }
 
 /* Preparation/cancellation retain the work item. FsRtl takes only the pool allocation

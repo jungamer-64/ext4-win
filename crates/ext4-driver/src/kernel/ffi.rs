@@ -203,22 +203,23 @@ pub(crate) use wdk_sys::ntddk::{
 #[link(name = "wdmsec", kind = "static")]
 unsafe extern "system" {
     /// # Safety
-    /// Must run on the original requestor dispatch thread before queue insertion.
-    pub(crate) fn ext4win_volume_management_privilege(mode: wdk_sys::KPROCESSOR_MODE) -> u8;
-    /// Checks symbolic-link creation against the dispatch thread's effective token.
-    pub(crate) fn ext4win_symbolic_link_privilege(mode: wdk_sys::KPROCESSOR_MODE) -> u8;
+    /// The active IRP must retain its issuing thread through the privilege check.
+    pub(crate) fn ext4win_requestor_has_privilege(
+        irp: wdk_sys::PIRP,
+        privilege: wdk_sys::ULONG,
+    ) -> u8;
     /// Captures the effective requestor and retains a device-bound cleanup work item.
     pub(crate) fn ext4win_subject_capture(
         device: wdk_sys::PDEVICE_OBJECT,
-        mode: wdk_sys::KPROCESSOR_MODE,
+        irp: wdk_sys::PIRP,
         output: *mut wdk_sys::PVOID,
     ) -> wdk_sys::NTSTATUS;
     /// Consumes the subject; raised-IRQL cancellation defers token retirement to its retained worker.
     pub(crate) fn ext4win_subject_release(subject: wdk_sys::PVOID);
-    /// Captures notification traversal authority on the original dispatch thread.
+    /// Captures notification traversal authority from the active IRP.
     pub(crate) fn ext4win_notification_subject_capture(
         device: wdk_sys::PDEVICE_OBJECT,
-        mode: wdk_sys::KPROCESSOR_MODE,
+        irp: wdk_sys::PIRP,
         output: *mut wdk_sys::PVOID,
     ) -> wdk_sys::NTSTATUS;
     /// Consumes a captured subject and transfers its token/pool ownership to FsRtl.
