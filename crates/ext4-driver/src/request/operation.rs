@@ -1266,7 +1266,11 @@ impl ReadRequestOperation {
                 crate::request::file_info::read(owned.request(), read, authority)
             }
             PreparedReadRequest::Other(ReadRequestKind::QueryInformation) => {
-                crate::request::file_info::query(owned.request(), read)
+                crate::request::file_info::query(
+                    owned.request(),
+                    read,
+                    crate::state::VolumeSerialNumber::from_uuid(access.volume_identity().uuid()),
+                )
             }
             PreparedReadRequest::Other(ReadRequestKind::QueryEa) => {
                 crate::request::ea::query(owned.request(), read)

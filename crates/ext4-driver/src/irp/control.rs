@@ -598,6 +598,8 @@ pub(crate) enum QueryFileInformationClass {
     AlternateName,
     /// Windows `FileAttributeTagInformation`.
     AttributeTag,
+    /// Windows `FileIdInformation`.
+    Id,
 }
 
 impl QueryFileInformationClass {
@@ -625,6 +627,7 @@ impl QueryFileInformationClass {
                 Ok(Self::NormalizedName)
             }
             wdk_sys::_FILE_INFORMATION_CLASS::FileAttributeTagInformation => Ok(Self::AttributeTag),
+            wdk_sys::_FILE_INFORMATION_CLASS::FileIdInformation => Ok(Self::Id),
             _ => Err(DriverError::InvalidInfoClass),
         }
     }

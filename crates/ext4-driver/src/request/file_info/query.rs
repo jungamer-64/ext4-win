@@ -89,6 +89,7 @@ mod query_all_tests;
 pub(super) fn query_file_information(
     mut request: PendingIrpLease<'_>,
     read: &mut impl CommittedReadPass,
+    serial: crate::state::VolumeSerialNumber,
 ) -> DriverResult<IrpCompletion> {
     let plan = request.with_active(|active| {
         let current = active.current_stack()?;
@@ -151,7 +152,8 @@ pub(super) fn query_file_information(
             | QueryFileInformationClass::StandardLink
             | QueryFileInformationClass::Internal
             | QueryFileInformationClass::NetworkOpen
-            | QueryFileInformationClass::AttributeTag => {}
+            | QueryFileInformationClass::AttributeTag
+            | QueryFileInformationClass::Id => {}
         }
         Ok(QueryFilePlan::Metadata {
             length,
@@ -269,6 +271,7 @@ pub(super) fn query_file_information(
             QueryFileInformationClass::AttributeTag => {
                 pack_attribute_tag_information(buffer, metadata)
             }
+            QueryFileInformationClass::Id => pack_id_information(buffer, serial, metadata),
             QueryFileInformationClass::Position
             | QueryFileInformationClass::All
             | QueryFileInformationClass::Ea
@@ -811,6 +814,32 @@ fn pack_internal_information(
             IndexNumber
         )),
         metadata.file_id.as_u64(),
+    )?;
+    IrpCompletion::from_usize(size)
+}
+
+/// Packs FILE_ID_INFORMATION. The volume serial is the zero-extended value published by
+/// `FileFsVolumeInformation`, so both queries identify the volume identically.
+/// # Errors
+///
+/// Returns an error when the output buffer is too small for `FILE_ID_INFORMATION`.
+fn pack_id_information(
+    output: &mut [u8],
+    serial: crate::state::VolumeSerialNumber,
+    metadata: FileMetadata,
+) -> DriverResult<IrpCompletion> {
+    let size = core::mem::size_of::<wdk_sys::FILE_ID_INFORMATION>();
+    let mut writer = fixed_record_writer(output, size)?;
+    writer.write_u64(
+        WireOffset::new(core::mem::offset_of!(
+            wdk_sys::FILE_ID_INFORMATION,
+            VolumeSerialNumber
+        )),
+        u64::from(serial.as_u32()),
+    )?;
+    writer.write_bytes(
+        WireOffset::new(core::mem::offset_of!(wdk_sys::FILE_ID_INFORMATION, FileId)),
+        &metadata.file_id.to_file_id_128(),
     )?;
     IrpCompletion::from_usize(size)
 }

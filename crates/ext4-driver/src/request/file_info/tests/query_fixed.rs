@@ -206,3 +206,44 @@ fn fixed_query_information_packers_clear_every_padding_byte() {
         ],
     );
 }
+
+/// # Panics
+///
+/// Panics if `FILE_ID_INFORMATION` disagrees with the internal file reference or the volume
+/// serial, or a short buffer receives a partial record.
+#[test]
+fn id_information_reuses_the_internal_reference_and_volume_serial() {
+    let metadata = test_metadata(super::FileMetadataKind::File);
+    let file_id = crate::metadata::WindowsFileId::from_u64(0x0000_0009_0000_0010);
+    assert!(metadata.is_some() && file_id.is_ok());
+    let (Some(mut metadata), Ok(file_id)) = (metadata, file_id) else {
+        return;
+    };
+    metadata.file_id = file_id;
+    let serial =
+        crate::state::VolumeSerialNumber::from_uuid(ext4_core::FilesystemUuid::from_bytes([
+            0x78, 0x56, 0x34, 0x12, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
+        ]));
+
+    let mut internal = [0xA5_u8; 8];
+    assert!(super::pack_internal_information(&mut internal, metadata).is_ok());
+    let mut output = [0xA5_u8; 32];
+    assert_eq!(
+        super::pack_id_information(&mut output, serial, metadata),
+        crate::irp::IrpCompletion::from_usize(24)
+    );
+    assert_eq!(
+        output.get(..8),
+        Some(0x1234_5678_u64.to_le_bytes().as_slice())
+    );
+    assert_eq!(output.get(8..16), Some(internal.as_slice()));
+    assert_eq!(output.get(16..24), Some([0_u8; 8].as_slice()));
+    assert_eq!(output.get(24..), Some([0xA5_u8; 8].as_slice()));
+
+    let mut short = [0xA5_u8; 23];
+    assert_eq!(
+        super::pack_id_information(&mut short, serial, metadata),
+        Err(DriverError::BufferTooSmall)
+    );
+    assert_eq!(short, [0xA5; 23]);
+}

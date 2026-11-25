@@ -28,15 +28,17 @@ pub(crate) fn set_purge_failure_mode(active: &mut ActiveIrp<'_>) -> DriverResult
     Ok(IrpCompletion::EMPTY)
 }
 
-/// Executes file information queries.
+/// Executes file information queries. `serial` is the volume serial also published by
+/// `FileFsVolumeInformation`.
 /// # Errors
 ///
 /// Returns an error when query stack decoding or information packing fails.
 pub(crate) fn query(
     request: PendingIrpLease<'_>,
     read: &mut impl CommittedReadPass,
+    serial: crate::state::VolumeSerialNumber,
 ) -> DriverResult<IrpCompletion> {
-    query_file_information(request, read)
+    query_file_information(request, read, serial)
 }
 
 /// Executes file information mutations.
