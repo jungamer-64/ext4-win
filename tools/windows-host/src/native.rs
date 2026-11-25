@@ -2564,7 +2564,10 @@ mod identity;
 pub use identity::*;
 
 mod directory;
-pub use directory::{DirectoryCasefoldError, query_directory_casefold, set_directory_casefold};
+pub use directory::{
+    DirectoryControlError, DirectoryControlState, query_directory_case_sensitivity,
+    query_directory_casefold, set_directory_case_sensitivity, set_directory_casefold,
+};
 mod short_names;
 pub use short_names::verify_short_name_lifecycle;
 

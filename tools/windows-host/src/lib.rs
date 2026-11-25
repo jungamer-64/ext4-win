@@ -16,3 +16,6 @@ extern crate alloc;
 mod native;
 #[cfg(windows)]
 pub use native::*;
+
+mod case_sensitivity;
+pub use case_sensitivity::DirectoryCaseSensitivity;

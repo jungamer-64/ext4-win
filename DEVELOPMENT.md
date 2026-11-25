@@ -163,6 +163,21 @@ cargo run -p ext4ctl -- casefold set <directory> off
 Changing comparison requires attribute-write access to the directory handle, a filesystem
 with a declared casefold encoding, and an empty directory.
 
+```console
+cargo run -p ext4ctl -- case-sensitive show <directory>
+cargo run -p ext4ctl -- case-sensitive set <directory> on
+cargo run -p ext4ctl -- case-sensitive set <directory> off
+```
+
+Windows per-directory case sensitivity (`FileCaseSensitiveInformation`) is Windows-only
+metadata in the `user.ext4win.case_sensitive` xattr. Without it, a Windows lookup first tries
+the exact ext4 spelling and, unless the request is case-sensitive, then a case-insensitive or
+short-name match. A marked directory accepts only the exact spelling. Changing the marker
+requires attribute-write access and an empty directory; directories created through Windows
+inherit it, and Linux neither honors nor inherits it. A casefold directory always reports case
+insensitivity, and the marker and casefold cannot be enabled together. A directory handle's
+search expression keeps the comparison observed by its first query.
+
 ### Declared filesystem features
 
 ```console

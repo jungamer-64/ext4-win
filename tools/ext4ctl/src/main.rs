@@ -39,7 +39,7 @@ fn replace_policy_fields(
 }
 
 /// User-visible grammar; replacements contain the entire desired table.
-const USAGE: &str = "ext4ctl volumes\next4ctl features <volume-path>\next4ctl trim <volume-path|ext4-uuid>\next4ctl whoami\next4ctl identity show <volume-path|ext4-uuid>\next4ctl identity replace <volume-path|ext4-uuid> [--user <account|SID> <UID>]... [--group <account|SID> <GID>]...\next4ctl identity clear <volume-path|ext4-uuid>\next4ctl policy show <volume-path|ext4-uuid>\next4ctl policy set <volume-path|ext4-uuid> [--access read-write|read-only] [--recovery replay|noload|memory] [--recovery-memory <bytes>]\next4ctl casefold show <directory>\next4ctl casefold set <directory> on|off";
+const USAGE: &str = "ext4ctl volumes\next4ctl features <volume-path>\next4ctl trim <volume-path|ext4-uuid>\next4ctl whoami\next4ctl identity show <volume-path|ext4-uuid>\next4ctl identity replace <volume-path|ext4-uuid> [--user <account|SID> <UID>]... [--group <account|SID> <GID>]...\next4ctl identity clear <volume-path|ext4-uuid>\next4ctl policy show <volume-path|ext4-uuid>\next4ctl policy set <volume-path|ext4-uuid> [--access read-write|read-only] [--recovery replay|noload|memory] [--recovery-memory <bytes>]\next4ctl casefold show <directory>\next4ctl casefold set <directory> on|off\next4ctl case-sensitive show <directory>\next4ctl case-sensitive set <directory> on|off";
 /// Fully parsed action before any replacement can be submitted.
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
@@ -57,6 +57,15 @@ enum Command {
         path: String,
         /// Complete requested comparison state.
         state: ext4_core::DirectoryCasefold,
+    },
+    /// Observe one opened directory's Windows case sensitivity.
+    CaseSensitiveShow(String),
+    /// Change an empty directory's Windows case sensitivity.
+    CaseSensitiveSet {
+        /// Directory path selected by the native handle.
+        path: String,
+        /// Requested Windows case sensitivity.
+        state: windows_host::DirectoryCaseSensitivity,
     },
     /// Effective token user and primary group.
     Whoami,
@@ -107,6 +116,22 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Command, String> {
                         _ => return Err(USAGE.to_owned()),
                     };
                     Command::CasefoldSet { path, state }
+                }
+                _ => return Err(USAGE.to_owned()),
+            }
+        }
+        "case-sensitive" => {
+            let action = args.next().ok_or_else(|| USAGE.to_owned())?;
+            let path = args.next().ok_or_else(|| USAGE.to_owned())?;
+            match action.as_str() {
+                "show" => Command::CaseSensitiveShow(path),
+                "set" => {
+                    let state = match args.next().as_deref() {
+                        Some("on") => windows_host::DirectoryCaseSensitivity::Enabled,
+                        Some("off") => windows_host::DirectoryCaseSensitivity::Disabled,
+                        _ => return Err(USAGE.to_owned()),
+                    };
+                    Command::CaseSensitiveSet { path, state }
                 }
                 _ => return Err(USAGE.to_owned()),
             }
@@ -226,13 +251,14 @@ fn uuid_text(uuid: ext4_core::FilesystemUuid) -> String {
 /// # Errors
 /// Reports the native outcome without retrying a possibly committed transition.
 #[cfg(windows)]
-fn casefold_reply(
-    result: Result<ext4_core::DirectoryCasefold, windows_host::DirectoryCasefoldError>,
-) -> Result<ext4_core::DirectoryCasefold, String> {
+fn directory_reply<S: windows_host::DirectoryControlState>(
+    result: Result<S, windows_host::DirectoryControlError<S>>,
+    show: impl FnOnce(S),
+) -> Result<S, String> {
     match result {
         Ok(state) => Ok(state),
-        Err(error @ windows_host::DirectoryCasefoldError::Release { state, .. }) => {
-            println!("casefold {}", casefold_text(state));
+        Err(error @ windows_host::DirectoryControlError::Release { state, .. }) => {
+            show(state);
             Err(error.to_string())
         }
         Err(error) => Err(error.to_string()),
@@ -311,13 +337,24 @@ fn trim_reply(
         }
     }
 }
-/// User-facing spelling shared by observed and acknowledged comparison states.
+/// Prints an observed or acknowledged ext4 comparison state.
 #[cfg(windows)]
-const fn casefold_text(state: ext4_core::DirectoryCasefold) -> &'static str {
-    match state {
+fn show_casefold(state: ext4_core::DirectoryCasefold) {
+    let text = match state {
         ext4_core::DirectoryCasefold::Disabled => "off",
         ext4_core::DirectoryCasefold::Enabled => "on",
-    }
+    };
+    println!("casefold {text}");
+}
+
+/// Prints an observed or acknowledged Windows case-sensitivity state.
+#[cfg(windows)]
+fn show_case_sensitivity(state: windows_host::DirectoryCaseSensitivity) {
+    let text = match state {
+        windows_host::DirectoryCaseSensitivity::Disabled => "off",
+        windows_host::DirectoryCaseSensitivity::Enabled => "on",
+    };
+    println!("case-sensitive {text}");
 }
 
 /// Resolves explicit UUIDs or mounted volumes, without guessing numeric identities.
@@ -425,19 +462,22 @@ fn execute(command: Command) -> Result<(), String> {
                 println!("{} {name}", uuid_text(uuid));
             }
         }
-        Command::CasefoldShow(path) => {
-            let state = casefold_reply(windows_host::query_directory_casefold(
-                std::path::Path::new(&path),
-            ))?;
-            println!("casefold {}", casefold_text(state));
-        }
-        Command::CasefoldSet { path, state } => {
-            let state = casefold_reply(windows_host::set_directory_casefold(
-                std::path::Path::new(&path),
-                state,
-            ))?;
-            println!("casefold {}", casefold_text(state));
-        }
+        Command::CasefoldShow(path) => show_casefold(directory_reply(
+            windows_host::query_directory_casefold(std::path::Path::new(&path)),
+            show_casefold,
+        )?),
+        Command::CasefoldSet { path, state } => show_casefold(directory_reply(
+            windows_host::set_directory_casefold(std::path::Path::new(&path), state),
+            show_casefold,
+        )?),
+        Command::CaseSensitiveShow(path) => show_case_sensitivity(directory_reply(
+            windows_host::query_directory_case_sensitivity(std::path::Path::new(&path)),
+            show_case_sensitivity,
+        )?),
+        Command::CaseSensitiveSet { path, state } => show_case_sensitivity(directory_reply(
+            windows_host::set_directory_case_sensitivity(std::path::Path::new(&path), state),
+            show_case_sensitivity,
+        )?),
         Command::Whoami => {
             let identity = windows_host::effective_identity().map_err(|error| error.to_string())?;
             println!(
@@ -713,10 +753,32 @@ mod tests {
             ),
             Ok(Command::CasefoldShow("X:/empty".to_owned()))
         );
+        assert_eq!(
+            parse(
+                ["case-sensitive", "set", "X:/empty", "on"]
+                    .into_iter()
+                    .map(str::to_owned)
+            ),
+            Ok(Command::CaseSensitiveSet {
+                path: "X:/empty".to_owned(),
+                state: windows_host::DirectoryCaseSensitivity::Enabled
+            })
+        );
+        assert_eq!(
+            parse(
+                ["case-sensitive", "show", "X:/empty"]
+                    .into_iter()
+                    .map(str::to_owned)
+            ),
+            Ok(Command::CaseSensitiveShow("X:/empty".to_owned()))
+        );
         for args in [
             vec!["casefold", "set", "X:/empty"],
             vec!["casefold", "set", "X:/empty", "yes"],
             vec!["casefold", "show", "X:/empty", "on"],
+            vec!["case-sensitive", "set", "X:/empty"],
+            vec!["case-sensitive", "set", "X:/empty", "yes"],
+            vec!["case-sensitive", "show", "X:/empty", "on"],
         ] {
             assert!(parse(args.into_iter().map(str::to_owned)).is_err());
         }
