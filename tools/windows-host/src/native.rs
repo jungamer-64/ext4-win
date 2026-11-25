@@ -689,6 +689,32 @@ pub enum Retirement {
     /// A prior request may have retired the endpoint; this does not prove driver unload.
     EndpointAbsent,
 }
+
+/// Closes mount intake and waits for the driver to acknowledge that no mounts remain in progress.
+/// # Errors
+/// Returns native control or handle-release failures. A busy reply means intake has closed and
+/// previously admitted mounts are still in progress. Other failures may leave intake closed.
+pub fn quiesce_mounts(path: &Path, code: u32) -> io::Result<()> {
+    empty_lifecycle_control(
+        FileHandle::open(path, 0x4000_0000, FILE_ATTRIBUTE_NORMAL)?,
+        code,
+    )
+}
+
+/// Sends a payload-free lifecycle request and observes handle release.
+/// # Errors
+/// Returns native control or release errors, or a protocol error on unexpected output.
+fn empty_lifecycle_control(file: FileHandle, code: u32) -> io::Result<()> {
+    let result = file.control(code, &mut []).and_then(|returned| {
+        if returned == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::other("lifecycle control returned a payload"))
+        }
+    });
+    completed(result, file.close())
+}
+
 /// Consumes the secured control endpoint's payload-free prepare-unload request.
 /// # Errors
 /// Returns native request/release or alias-withdrawal errors. The request may already have
@@ -701,14 +727,7 @@ pub fn prepare_unload(path: &Path, code: u32) -> io::Result<Retirement> {
         }
         Err(error) => return Err(error),
     };
-    let result = file.control(code, &mut []).and_then(|returned| {
-        if returned == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::other("control retirement returned a payload"))
-        }
-    });
-    completed(result, file.close())?;
+    empty_lifecycle_control(file, code)?;
     let path = path
         .as_os_str()
         .to_str()

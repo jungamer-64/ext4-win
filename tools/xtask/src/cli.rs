@@ -4,8 +4,8 @@ use crate::{
         fuzz_campaign, verify_driver, verify_fuzz_replay, verify_portable, verify_windows_host,
     },
     driver_load::{
-        check_hosted_driver_host, cleanup_driver_load_session, prepare_driver_unload,
-        resolve_driver_store_image, verify_hosted_driver_load,
+        UnloadRequest, check_hosted_driver_host, cleanup_driver_load_session,
+        resolve_driver_store_image, unload_requester, verify_hosted_driver_load,
     },
     interop::{
         verify_htree_interop, verify_journal_fixture_provenance, verify_journal_interop,
@@ -51,8 +51,8 @@ enum Task {
     VerifyHostedDriverLoad,
     /// Reconciles one interrupted DriverStore/service lifecycle session.
     CleanupDriverLoadSession,
-    /// Sends one secured retirement request from a separately supervised requester.
-    PrepareDriverUnload,
+    /// Sends a secured lifecycle request from a separately supervised requester.
+    UnloadDriver(UnloadRequest),
     /// Resolves an OEM package image in an isolated read-only SetupAPI requester.
     ResolveDriverStoreImage,
     /// Performs read-only validation of a dedicated live-driver host.
@@ -103,8 +103,10 @@ impl Task {
             Some(Self::VerifyHostedDriverLoad)
         } else if argument == "cleanup-driver-load-session" {
             Some(Self::CleanupDriverLoadSession)
-        } else if argument == "prepare-driver-unload" {
-            Some(Self::PrepareDriverUnload)
+        } else if argument == UnloadRequest::QuiesceMounts.command() {
+            Some(Self::UnloadDriver(UnloadRequest::QuiesceMounts))
+        } else if argument == UnloadRequest::PrepareUnload.command() {
+            Some(Self::UnloadDriver(UnloadRequest::PrepareUnload))
         } else if argument == "resolve-driver-store-image" {
             Some(Self::ResolveDriverStoreImage)
         } else if argument == "check-live-driver-host" {
@@ -156,9 +158,9 @@ fn execute() -> TaskResult<()> {
             let session_id = task_argument.as_deref().ok_or_else(usage_error)?;
             cleanup_driver_load_session(&repository_root, session_id)
         }
-        Task::PrepareDriverUnload => {
+        Task::UnloadDriver(request) => {
             let session_id = task_argument.as_deref().ok_or_else(usage_error)?;
-            prepare_driver_unload(&repository_root, session_id)
+            unload_requester(&repository_root, session_id, request)
         }
         Task::ResolveDriverStoreImage => {
             let oem = task_argument.as_deref().ok_or_else(usage_error)?;
@@ -220,7 +222,7 @@ fn execute() -> TaskResult<()> {
                 | Task::CleanupLiveVhdxSession
                 | Task::PrepareLiveVhdx
                 | Task::VerifyLiveVhdx
-                | Task::PrepareDriverUnload => {
+                | Task::UnloadDriver(_) => {
                     Err(io::Error::other("cleanup task lost its required argument").into())
                 }
                 Task::ResolveDriverStoreImage => {
@@ -237,7 +239,7 @@ fn execute() -> TaskResult<()> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: cargo xtask <verify-portable|verify-windows-host|verify-driver|verify-fuzz-replay|fuzz|verify-journal-interop|verify-ro-interop|verify-htree-interop|verify-journal-fixture-provenance|verify-production-driver|check-hosted-driver-host|verify-hosted-driver-load|cleanup-driver-load-session SESSION_ID|prepare-driver-unload SESSION_ID|resolve-driver-store-image OEM_INF|check-live-driver-host|prepare-live-vhdx SESSION_ID|verify-live-vhdx SESSION_ID|benchmark-multi-file|cleanup-live-vhdx-session SESSION_ID>",
+        "usage: cargo xtask <verify-portable|verify-windows-host|verify-driver|verify-fuzz-replay|fuzz|verify-journal-interop|verify-ro-interop|verify-htree-interop|verify-journal-fixture-provenance|verify-production-driver|check-hosted-driver-host|verify-hosted-driver-load|cleanup-driver-load-session SESSION_ID|quiesce-driver-mounts SESSION_ID|prepare-driver-unload SESSION_ID|resolve-driver-store-image OEM_INF|check-live-driver-host|prepare-live-vhdx SESSION_ID|verify-live-vhdx SESSION_ID|benchmark-multi-file|cleanup-live-vhdx-session SESSION_ID>",
     )
 }
 
@@ -300,7 +302,11 @@ mod tests {
         );
         assert_eq!(
             Task::parse(OsStr::new("prepare-driver-unload")),
-            Some(Task::PrepareDriverUnload)
+            Some(Task::UnloadDriver(UnloadRequest::PrepareUnload))
+        );
+        assert_eq!(
+            Task::parse(OsStr::new("quiesce-driver-mounts")),
+            Some(Task::UnloadDriver(UnloadRequest::QuiesceMounts))
         );
         assert_eq!(
             Task::parse(OsStr::new("resolve-driver-store-image")),

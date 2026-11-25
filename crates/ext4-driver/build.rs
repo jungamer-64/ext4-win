@@ -223,6 +223,7 @@ fn write_lifecycle_control_contract() -> Result<(), io::Error> {
     )?;
     let guid = parse_guid(required_record(&records, "device_class_guid")?)?;
     let ioctl = parse_hex_u32(required_record(&records, "prepare_unload_ioctl")?)?;
+    let quiesce = parse_hex_u32(required_record(&records, "quiesce_mounts_ioctl")?)?;
 
     let generated = format!(
         "{nt_device_name}\n{dos_device_name}\n{device_sddl}\n\
@@ -234,7 +235,9 @@ fn write_lifecycle_control_contract() -> Result<(), io::Error> {
              Data4: [{data4}],\n\
          }};\n\
          /// Write-authorized, payload-free request that consumes filesystem registration.\n\
-         pub(crate) const PREPARE_UNLOAD_IOCTL: wdk_sys::ULONG = 0x{ioctl:08X};\n",
+         pub(crate) const PREPARE_UNLOAD_IOCTL: wdk_sys::ULONG = 0x{ioctl:08X};\n\
+         /// Write-authorized, payload-free request that closes mount admission and observes its drain.\n\
+         pub(crate) const QUIESCE_MOUNTS_IOCTL: wdk_sys::ULONG = 0x{quiesce:08X};\n",
         data1 = guid.0,
         data2 = guid.1,
         data3 = guid.2,

@@ -1,5 +1,5 @@
 //! One typed owner for production package identity, install intent, SCM and cleanup authority.
-use super::inventory::Package;
+use super::{UnloadRequest, inventory::Package};
 use crate::{
     TaskResult,
     process::{combine_verification_and_cleanup, run_checked, run_checked_output, sha256_file},
@@ -14,7 +14,7 @@ use std::{
     ffi::OsStr,
     fs, io,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     thread,
     time::Instant,
 };
@@ -76,10 +76,10 @@ struct ControlContract {
     /// Payload-free prepare-unload request code.
     ioctl: u32,
 }
-/// Parses the checked-in lifecycle contract once at its native boundary.
+/// Reads the authoritative lifecycle ABI records.
 /// # Errors
-/// Returns malformed records or unsupported lifecycle control fields.
-fn control(root: &Path) -> TaskResult<ControlContract> {
+/// Returns duplicate, malformed or unreadable records.
+fn lifecycle_records(root: &Path) -> TaskResult<BTreeMap<String, String>> {
     let mut values = BTreeMap::new();
     for line in
         fs::read_to_string(root.join("crates/ext4-driver/lifecycle-control-v1.txt"))?.lines()
@@ -91,28 +91,50 @@ fn control(root: &Path) -> TaskResult<ControlContract> {
             return Err(io::Error::other("duplicate lifecycle contract record").into());
         }
     }
-    let get = |key: &str| {
-        values
-            .get(key)
-            .map(String::as_str)
-            .ok_or_else(|| io::Error::other(format!("lifecycle contract missing {key}")))
-    };
-    let path = get("win32_device_path")?;
+    Ok(values)
+}
+
+/// Returns a required lifecycle ABI field.
+/// # Errors
+/// Returns the name of a missing record.
+fn lifecycle_record<'records>(
+    records: &'records BTreeMap<String, String>,
+    key: &str,
+) -> io::Result<&'records str> {
+    records
+        .get(key)
+        .map(String::as_str)
+        .ok_or_else(|| io::Error::other(format!("lifecycle contract missing {key}")))
+}
+
+/// Parses an exact lifecycle IOCTL value from the checked-in contract.
+/// # Errors
+/// Returns a missing or malformed IOCTL record.
+fn lifecycle_ioctl(records: &BTreeMap<String, String>, key: &str) -> TaskResult<u32> {
+    let value = lifecycle_record(records, key)?
+        .strip_prefix("0x")
+        .filter(|value| value.len() == 8)
+        .ok_or_else(|| io::Error::other(format!("malformed lifecycle IOCTL {key}")))?;
+    Ok(u32::from_str_radix(value, 16)?)
+}
+
+/// Reads the secured endpoint and retirement ABI retained in session records.
+/// # Errors
+/// Returns malformed records or unsupported lifecycle control fields.
+fn control(root: &Path) -> TaskResult<ControlContract> {
+    let records = lifecycle_records(root)?;
+    let path = lifecycle_record(&records, "win32_device_path")?;
     let tail = path
         .strip_prefix("\\\\.\\")
         .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_alphanumeric()))
         .ok_or_else(|| io::Error::other("malformed lifecycle device path"))?;
     let _validated_tail = tail;
-    let ioctl = get("prepare_unload_ioctl")?
-        .strip_prefix("0x")
-        .filter(|value| value.len() == 8)
-        .ok_or_else(|| io::Error::other("malformed lifecycle IOCTL"))?;
-    if get("contract_version")? != "1" {
+    if lifecycle_record(&records, "contract_version")? != "1" {
         return Err(io::Error::other("unsupported lifecycle contract").into());
     }
     Ok(ControlContract {
         path: path.into(),
-        ioctl: u32::from_str_radix(ioctl, 16)?,
+        ioctl: lifecycle_ioctl(&records, "prepare_unload_ioctl")?,
     })
 }
 
@@ -584,15 +606,14 @@ pub(crate) fn start_session(
     Ok(session.state().bundle.artifact.clone())
 }
 
-/// Restarts the bound installed service and runs the storage transition while SCM is Stopped.
+/// A bound driver whose mount intake is closed until its next load. Dropping this authority
+/// leaves the durable session available for cleanup.
+pub(crate) struct QuiescedDriver(Session<DriverState>);
+
+/// Closes the bound driver's mount intake before the caller dismounts its volumes.
 /// # Errors
-/// Returns identity, retirement, stop, storage transition or start failure. A failed storage
-/// transition leaves the observed stop available to session cleanup.
-pub(crate) fn restart_session(
-    root: &Path,
-    id: &SessionId,
-    while_stopped: impl FnOnce() -> TaskResult<()>,
-) -> TaskResult<()> {
+/// Returns identity, Running-state or quiesce failures. A failed request may leave intake closed.
+pub(crate) fn quiesce_session(root: &Path, id: &SessionId) -> TaskResult<QuiescedDriver> {
     let mut session = recovered(root, id)?;
     bind_service(&mut session, PackagePresence::Present)?;
     if windows_host::service_state("ext4win")? != Some(4) {
@@ -601,28 +622,29 @@ pub(crate) fn restart_session(
         )
         .into());
     }
-    session.publish(Phase::Intent(Operation::PrepareUnload))?;
-    let mut request = Command::new(std::env::current_exe()?);
-    request.arg("prepare-driver-unload").arg(id.as_str());
-    let outcome = windows::bounded(request, Duration::from_secs(90))?;
-    if matches!(outcome, CommandOutcome::Uncertain { .. }) {
-        session.publish(Phase::Deferred(Operation::PrepareUnload))?;
+    request_unload(&mut session, UnloadRequest::QuiesceMounts)?;
+    Ok(QuiescedDriver(session))
+}
+
+impl QuiescedDriver {
+    /// Stops the driver after all dismounted volumes retire, then restarts it after the storage
+    /// transition. The supplied transition runs only while SCM is observed Stopped.
+    /// # Errors
+    /// Returns control retirement, SCM or storage transition failures. Cleanup uses the durable
+    /// session to reconcile the observed lifecycle progress.
+    pub(crate) fn restart(
+        mut self,
+        while_stopped: impl FnOnce() -> TaskResult<()>,
+    ) -> TaskResult<()> {
+        request_unload(&mut self.0, UnloadRequest::PrepareUnload)?;
+        scm(&mut self.0, Operation::StopDriver, "stop")?;
+        wait_stopped(Duration::from_secs(60))?;
+        self.0.publish(Phase::Observed(Operation::StopDriver))?;
+        while_stopped()?;
+        scm(&mut self.0, Operation::StartDriver, "start")?;
+        wait_state(4, Duration::from_secs(15))?;
+        self.0.publish(Phase::Observed(Operation::StartDriver))
     }
-    let output = String::from_utf8(windows::checked_outcome(
-        outcome,
-        "identity restoration driver retirement",
-    )?)?;
-    if !matches!(output.lines().last(), Some("Retired" | "EndpointAbsent")) {
-        return Err(io::Error::other("invalid retirement acknowledgement").into());
-    }
-    session.publish(Phase::Observed(Operation::PrepareUnload))?;
-    scm(&mut session, Operation::StopDriver, "stop")?;
-    wait_stopped(Duration::from_secs(60))?;
-    session.publish(Phase::Observed(Operation::StopDriver))?;
-    while_stopped()?;
-    scm(&mut session, Operation::StartDriver, "start")?;
-    wait_state(4, Duration::from_secs(15))?;
-    session.publish(Phase::Observed(Operation::StartDriver))
 }
 
 /// Acquires package identity only while a durable install intent authorizes reconciliation.
@@ -688,11 +710,67 @@ fn recovered(root: &Path, id: &SessionId) -> TaskResult<Session<DriverState>> {
     Ok(session)
 }
 
-/// Performs the control request in a bounded requester process after revalidating session identity.
+impl UnloadRequest {
+    /// Selects the durable phase for this lifecycle effect.
+    const fn operation(self) -> Operation {
+        match self {
+            Self::QuiesceMounts => Operation::QuiesceMounts,
+            Self::PrepareUnload => Operation::PrepareUnload,
+        }
+    }
+
+    /// Checks the acknowledgement emitted after the native effect and handle release.
+    fn acknowledged(self, output: &str) -> bool {
+        match self {
+            Self::QuiesceMounts => output.lines().last() == Some("Quiesced"),
+            Self::PrepareUnload => {
+                matches!(output.lines().last(), Some("Retired" | "EndpointAbsent"))
+            }
+        }
+    }
+}
+
+/// Publishes lifecycle intent before the supervised requester can affect the driver.
+/// # Errors
+/// Returns publication, requester, native control or acknowledgement failures. After intent,
+/// observed failures retain the possibility that the request already changed driver state.
+fn request_unload(session: &mut Session<DriverState>, request: UnloadRequest) -> TaskResult<()> {
+    let operation = request.operation();
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg(request.command())
+        .arg(session.id().as_str())
+        .stderr(Stdio::piped());
+    session.publish(Phase::Intent(operation))?;
+    let observed = (|| -> TaskResult<()> {
+        let output = String::from_utf8(windows::checked_outcome(
+            windows::bounded(command, Duration::from_secs(90))?,
+            request.command(),
+        )?)?;
+        if !request.acknowledged(&output) {
+            return Err(io::Error::other("invalid driver lifecycle acknowledgement").into());
+        }
+        Ok(())
+    })();
+    match observed {
+        Ok(()) => session.publish(Phase::Observed(operation)),
+        Err(error) => combine_verification_and_cleanup(
+            Err(error),
+            session.publish(Phase::Deferred(operation)),
+        ),
+    }
+}
+
+/// Performs the recorded lifecycle request after revalidating the bound driver identity.
 /// # Errors
 /// Returns native control/release failures or identity mismatch.
-pub(crate) fn prepare_driver_unload(root: &Path, id: &OsStr) -> TaskResult<()> {
+pub(crate) fn unload_requester(root: &Path, id: &OsStr, request: UnloadRequest) -> TaskResult<()> {
     let session = recovered(root, &SessionId::parse(id)?)?;
+    if session.phase() != Phase::Intent(request.operation()) {
+        return Err(
+            io::Error::other("driver lifecycle request lacks matching session intent").into(),
+        );
+    }
     let package = match &session.state().package {
         PackageState::Installed(package)
         | PackageState::Removing(package)
@@ -716,25 +794,41 @@ pub(crate) fn prepare_driver_unload(root: &Path, id: &OsStr) -> TaskResult<()> {
             PackagePresence::Present
         },
     )?;
-    // The driver refuses with ERROR_NOT_READY, before any retirement effect, while a mounted
-    // volume device is still live or retiring; dismounted volumes retire asynchronously.
+    let path = Path::new(&session.state().control.path);
+    match request {
+        UnloadRequest::QuiesceMounts => {
+            session.state().bundle.source.require_unchanged(root)?;
+            let ioctl = lifecycle_ioctl(&lifecycle_records(root)?, "quiesce_mounts_ioctl")?;
+            wait_lifecycle_drain(|| windows_host::quiesce_mounts(path, ioctl))?;
+            println!("Quiesced");
+        }
+        UnloadRequest::PrepareUnload => {
+            let outcome = wait_lifecycle_drain(|| {
+                windows_host::prepare_unload(path, session.state().control.ioctl)
+            })?;
+            println!("{outcome:?}");
+        }
+    }
+    Ok(())
+}
+
+/// Retries the explicit busy reply from an idempotent lifecycle drain.
+/// # Errors
+/// Returns any other native failure immediately, or the busy reply at the deadline.
+fn wait_lifecycle_drain<T>(mut request: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    const ERROR_NOT_READY: i32 = 21;
     let start = Instant::now();
-    let outcome = loop {
-        match windows_host::prepare_unload(
-            Path::new(&session.state().control.path),
-            session.state().control.ioctl,
-        ) {
+    loop {
+        match request() {
             Err(error)
-                if error.raw_os_error() == Some(21)
+                if error.raw_os_error() == Some(ERROR_NOT_READY)
                     && start.elapsed() < Duration::from_secs(60) =>
             {
                 thread::sleep(Duration::from_millis(500));
             }
-            result => break result?,
+            result => return result,
         }
-    };
-    println!("{outcome:?}");
-    Ok(())
+    }
 }
 
 /// Reconciles an interrupted session; pending initialization retains its service and image.
@@ -807,23 +901,7 @@ pub(crate) fn cleanup_driver_load_session(root: &Path, id: &OsStr) -> TaskResult
         }
         if state != 1 {
             if state != 3 {
-                session.publish(Phase::Intent(Operation::PrepareUnload))?;
-                let mut request = Command::new(std::env::current_exe()?);
-                request
-                    .arg("prepare-driver-unload")
-                    .arg(session.id().as_str());
-                let outcome = windows::bounded(request, Duration::from_secs(90))?;
-                if matches!(outcome, CommandOutcome::Uncertain { .. }) {
-                    session.publish(Phase::Deferred(Operation::PrepareUnload))?;
-                }
-                let output = windows::checked_outcome(outcome, "driver prepare-unload")?;
-                let output = String::from_utf8(output)?;
-                if !matches!(output.lines().last(), Some("Retired" | "EndpointAbsent")) {
-                    return Err(
-                        io::Error::other("invalid control retirement acknowledgement").into(),
-                    );
-                }
-                session.publish(Phase::Observed(Operation::PrepareUnload))?;
+                request_unload(&mut session, UnloadRequest::PrepareUnload)?;
                 scm(&mut session, Operation::StopDriver, "stop")?;
             }
             wait_stopped(Duration::from_secs(60))?;

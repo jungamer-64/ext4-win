@@ -70,6 +70,8 @@ pub(crate) enum Operation {
     BindService,
     /// SCM start.
     StartDriver,
+    /// Close mount intake and settle the admitted mounts before dismount.
+    QuiesceMounts,
     /// Secured control-device retirement.
     PrepareUnload,
     /// SCM stop and terminal completion observation.

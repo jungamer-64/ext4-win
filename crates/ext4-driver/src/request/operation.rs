@@ -287,6 +287,8 @@ struct ExclusiveExternalProbeContext {
 struct MountRequestOperation {
     /// Current consuming ownership phase.
     state: MountRequestState,
+    /// Mount admission retained across lower I/O until publication transfers census membership.
+    reservation: crate::state::MountReservation<'static>,
     /// Driver-lifetime event capability propagated into the mounted VCB and its streams.
     trace: OperationalTrace,
 }
@@ -295,21 +297,24 @@ impl MountRequestOperation {
     /// Allocates one mount state machine without dropping the IRP on allocation failure.
     /// # Errors
     ///
-    /// Returns the still-owned IRP when operation storage cannot be allocated.
+    /// Returns the still-owned IRP when mount intake is closed or resources are exhausted.
     fn try_new(
         owned: OwnedIrp,
         admission: MountAdmission,
         trace: OperationalTrace,
     ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
-        match memory::boxed_try_map((owned, admission, trace), |(owned, admission, trace)| {
-            Self {
-                state: MountRequestState::QueryLength { owned, admission },
-                trace,
-            }
+        let reservation = match crate::state::MOUNTED_VOLUMES.reserve_mount() {
+            Ok(reservation) => reservation,
+            Err(error) => return Err(AdmitOperationError::new(error, owned)),
+        };
+        match memory::boxed_try_map((owned, reservation), |(owned, reservation)| Self {
+            state: MountRequestState::QueryLength { owned, admission },
+            reservation,
+            trace,
         }) {
             Ok(operation) => Ok(operation),
             Err(error) => {
-                let (error, (owned, _admission, _trace)) = error.into_parts();
+                let (error, (owned, _reservation)) = error.into_parts();
                 Err(AdmitOperationError::new(error, owned))
             }
         }
@@ -457,8 +462,14 @@ impl MountRequestOperation {
                     STATUS_SUCCESS,
                     OperationalOutcome::Selected,
                 );
-                let published =
-                    Self::publish_mount(admission, devices, completed, self.trace, catalog);
+                let published = Self::publish_mount(
+                    admission,
+                    self.reservation,
+                    devices,
+                    completed,
+                    self.trace,
+                    catalog,
+                );
                 self.trace
                     .record_result(OperationalPath::MountPublication, &published);
                 match published {
@@ -639,6 +650,7 @@ impl MountRequestOperation {
     )]
     fn publish_mount(
         admission: MountAdmission,
+        reservation: crate::state::MountReservation<'static>,
         devices: MountedStorage,
         completed: Box<ext4_core::CompletedMount>,
         trace: OperationalTrace,
@@ -655,7 +667,6 @@ impl MountRequestOperation {
             catalog.identities,
         )?;
 
-        let admission_count = crate::state::MountedVolumeAdmission::acquire()?;
         let extension_size =
             wdk_sys::ULONG::try_from(core::mem::size_of::<MountedVolumeDeviceExtension>())
                 .map_err(|_| DriverError::InvalidParameter)?;
@@ -690,7 +701,7 @@ impl MountRequestOperation {
             admission.target_device(),
         ) {
             Ok(()) => {
-                admission_count.publish();
+                reservation.publish();
                 Ok(device)
             }
             Err(error) => {
@@ -7493,7 +7504,7 @@ impl_mounted_operation_adapter!(MutationRequestOperation);
 /// Allocates one completion-driven mount operation.
 /// # Errors
 ///
-/// Returns the still-owned IRP when mount operation allocation fails.
+/// Returns the still-owned IRP when mount intake is closed or resources are exhausted.
 pub(crate) fn mount(
     owned: OwnedIrp,
     admission: MountAdmission,

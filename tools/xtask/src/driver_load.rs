@@ -5,14 +5,33 @@ mod inventory;
 mod owner;
 #[cfg(windows)]
 pub(crate) use owner::{
-    check_hosted_driver_host, cleanup_driver_load_session, install_session, prepare_driver_unload,
-    resolve_driver_store_image, restart_session, start_session, verify_hosted_driver_load,
+    check_hosted_driver_host, cleanup_driver_load_session, install_session, quiesce_session,
+    resolve_driver_store_image, start_session, unload_requester, verify_hosted_driver_load,
 };
 
 #[cfg(not(windows))]
 use crate::TaskResult;
 #[cfg(not(windows))]
 use std::{ffi::OsStr, io, path::Path};
+
+/// Lifecycle request issued by a supervised requester against the session's bound driver.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UnloadRequest {
+    /// Close intake and wait for pending mounts to settle before dismount.
+    QuiesceMounts,
+    /// Retire the control device after mounted volumes drain.
+    PrepareUnload,
+}
+
+impl UnloadRequest {
+    /// Command line name of this requester.
+    pub(crate) const fn command(self) -> &'static str {
+        match self {
+            Self::QuiesceMounts => "quiesce-driver-mounts",
+            Self::PrepareUnload => "prepare-driver-unload",
+        }
+    }
+}
 
 /// Rejects a Windows kernel-load workflow on a portable host.
 /// # Errors
@@ -43,7 +62,11 @@ pub(crate) fn cleanup_driver_load_session(root: &Path, _id: &OsStr) -> TaskResul
 /// # Errors
 /// Always returns Unsupported on non-Windows hosts.
 #[cfg(not(windows))]
-pub(crate) fn prepare_driver_unload(root: &Path, _id: &OsStr) -> TaskResult<()> {
+pub(crate) fn unload_requester(
+    root: &Path,
+    _id: &OsStr,
+    _request: UnloadRequest,
+) -> TaskResult<()> {
     check_hosted_driver_host(root)
 }
 

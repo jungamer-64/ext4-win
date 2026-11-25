@@ -2400,7 +2400,7 @@ pub(crate) unsafe extern "C" fn driver_unload(driver: PDRIVER_OBJECT) {
     }
     .unwrap_or_else(|| KernelWideInconsistency::driver_device_teardown_corruption().bugcheck());
     let _driver = driver;
-    if !MountedVolumeAdmission::retired_for_unload() {
+    if !MOUNTED_VOLUMES.retired_for_unload() {
         KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
     }
     crate::kernel::operational_trace::unregister_published();

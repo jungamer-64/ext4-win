@@ -517,7 +517,7 @@ enum ImmediateDispatch {
     CleanupControl,
     /// Releases one control FILE_OBJECT; no driver context is attached.
     CloseControl,
-    /// Decodes the one private lifecycle request accepted by the control device.
+    /// Decodes private lifecycle requests accepted by the control device.
     ControlDeviceRequest,
     /// Completes an unsupported request without entering a device actor.
     Reject,
@@ -650,10 +650,15 @@ fn execute_immediate(mut received: ReceivedIrp, request: ImmediateDispatch) -> N
                 if !stack.is_payload_free() {
                     return Err(DriverError::InvalidParameter);
                 }
-                if stack.io_control_code() != crate::lifecycle_control::PREPARE_UNLOAD_IOCTL {
-                    return Err(DriverError::InvalidDeviceRequest);
+                match stack.io_control_code() {
+                    crate::lifecycle_control::QUIESCE_MOUNTS_IOCTL => {
+                        crate::state::MOUNTED_VOLUMES.quiesce_mounts()?;
+                    }
+                    crate::lifecycle_control::PREPARE_UNLOAD_IOCTL => {
+                        crate::state::ControlDevice::prepare_unload(received.device())?;
+                    }
+                    _ => return Err(DriverError::InvalidDeviceRequest),
                 }
-                crate::state::ControlDevice::prepare_unload(received.device())?;
                 Ok(IrpCompletion::EMPTY)
             })
         }

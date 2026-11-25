@@ -1681,6 +1681,8 @@ const MOUNTED_VOLUMES_CLOSED: usize = 1 << (usize::BITS - 1);
 
 /// Unit of the count of mounts still in progress.
 const MOUNT_IN_PROGRESS: usize = 1 << (usize::BITS / 2);
+/// Increment of both the pending and total counts when admitting a mount.
+const MOUNT_RESERVATION: usize = MOUNT_IN_PROGRESS + 1;
 /// Mask of the total number of pending mounts and published devices.
 const MOUNT_COUNT: usize = MOUNT_IN_PROGRESS - 1;
 /// Mask of the number of pending mounts.
@@ -1707,10 +1709,13 @@ impl MountedVolumeCensus {
     pub(crate) fn reserve_mount(&self) -> DriverResult<MountReservation<'_>> {
         self.0
             .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-                (state & MOUNTED_VOLUMES_CLOSED == 0
-                    && state & MOUNT_COUNT != MOUNT_COUNT
-                    && state & MOUNTS_PENDING != MOUNTS_PENDING)
-                    .then(|| state + MOUNT_IN_PROGRESS + 1)
+                if state & MOUNTED_VOLUMES_CLOSED != 0
+                    || state & MOUNT_COUNT == MOUNT_COUNT
+                    || state & MOUNTS_PENDING == MOUNTS_PENDING
+                {
+                    return None;
+                }
+                state.checked_add(MOUNT_RESERVATION)
             })
             .map_err(|state| {
                 if state & MOUNTED_VOLUMES_CLOSED != 0 {
@@ -1727,7 +1732,10 @@ impl MountedVolumeCensus {
         if self
             .0
             .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-                (state & MOUNTS_PENDING != 0).then(|| state - decrement)
+                if state & MOUNTS_PENDING == 0 {
+                    return None;
+                }
+                state.checked_sub(decrement)
             })
             .is_err()
         {
@@ -1742,7 +1750,10 @@ impl MountedVolumeCensus {
             .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
                 let total = state & MOUNT_COUNT;
                 let pending = (state & MOUNTS_PENDING) / MOUNT_IN_PROGRESS;
-                (total > pending).then(|| state - 1)
+                if total <= pending {
+                    return None;
+                }
+                state.checked_sub(1)
             })
             .is_err()
         {
@@ -1801,7 +1812,7 @@ impl MountReservation<'_> {
 
 impl Drop for MountReservation<'_> {
     fn drop(&mut self) {
-        self.census.finish_mount(MOUNT_IN_PROGRESS + 1);
+        self.census.finish_mount(MOUNT_RESERVATION);
     }
 }
 
@@ -1970,6 +1981,43 @@ fn write_vpb_label(vpb: &mut wdk_sys::VPB, label: &WindowsVolumeLabel) {
 mod tests {
     use super::*;
     use ext4_core::Ext4VolumeLabel;
+
+    /// Closing intake settles admitted mounts before dismount, while unload waits for device deletion.
+    /// # Errors
+    /// Returns failure to reserve either mount while intake is open.
+    /// # Panics
+    /// Fails if a new mount enters after quiesce, or unload succeeds before the published device retires.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fallible mount reservations precede lifecycle assertions"
+    )]
+    fn quiesce_drains_admitted_mounts_before_volume_retirement() -> DriverResult<()> {
+        let census = MountedVolumeCensus::new();
+        let publishing = census.reserve_mount()?;
+        let abandoning = census.reserve_mount()?;
+
+        assert_eq!(census.quiesce_mounts(), Err(DriverError::DeviceBusy));
+        assert!(matches!(
+            census.reserve_mount(),
+            Err(DriverError::InvalidDeviceRequest)
+        ));
+        publishing.publish();
+        assert_eq!(census.quiesce_mounts(), Err(DriverError::DeviceBusy));
+        drop(abandoning);
+
+        assert_eq!(census.quiesce_mounts(), Ok(()));
+        assert_eq!(census.close_for_unload(), Err(DriverError::DeviceBusy));
+        assert!(!census.retired_for_unload());
+        census.release_retired();
+        assert_eq!(census.close_for_unload(), Ok(()));
+        assert!(census.retired_for_unload());
+        assert!(matches!(
+            census.reserve_mount(),
+            Err(DriverError::InvalidDeviceRequest)
+        ));
+        Ok(())
+    }
 
     /// A mount notification may query the published volume before mount-IRP acknowledgment.
     /// # Errors

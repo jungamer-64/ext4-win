@@ -981,6 +981,7 @@ fn disk_availability(
 }
 
 /// Requires repeated offline/online discovery to preserve all assigned paths and durable content.
+/// Leaves the final online mount available for the attached-volume unload scenario.
 /// # Errors
 /// Returns lifecycle, changed volume GUID/path assignments or persisted-content failures.
 fn exercise_offline_online(session: &mut Session<LiveState>, payload: &[u8]) -> TaskResult<()> {
@@ -993,13 +994,13 @@ fn exercise_offline_online(session: &mut Session<LiveState>, payload: &[u8]) -> 
         .into_iter()
         .collect();
     for _ in 0..2 {
+        dismount_filesystem(session)?;
         disk_availability(session, DiskAvailability::Offline)?;
         disk_availability(session, DiskAvailability::Online)?;
         let mount = mount_namespace(session)?;
         if fs::read(mount.join("live-ci/alpha.bin"))? != payload {
             return Err(io::Error::other("online volume lost durable content").into());
         }
-        dismount_filesystem(session)?;
         remove_namespace(session)?;
         let observed: BTreeSet<_> = windows_host::volume_mount_paths(&volume)?
             .into_iter()
@@ -1090,15 +1091,15 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
     let released = windows_host::close_file(retained).map_err(Into::into);
     println!("live remount: old-handle close result={released:?}");
     combine_verification_and_cleanup(remount, released)?;
-    dismount_filesystem(session)?;
     remove_namespace(session)?;
     exercise_offline_online(session, &payload)?;
     storage::validate(&scope)?;
     observe_verifier(session)?;
     println!("live unload: stop the driver with the session VHDX still attached");
+    let driver = driver_load::quiesce_session(root, session.id())?;
+    dismount_filesystem(session)?;
     session.publish(Phase::Intent(Operation::StopDriver))?;
-    let id = session.id().clone();
-    driver_load::restart_session(root, &id, || {
+    driver.restart(|| {
         session.publish(Phase::Observed(Operation::StopDriver))?;
         storage::validate(&scope)?;
         attachment(session, false)?;
