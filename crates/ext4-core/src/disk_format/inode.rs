@@ -586,9 +586,11 @@ pub(crate) struct InodeRecordLayout {
 }
 
 impl InodeRecordLayout {
-    /// Validates the declared field span against the actual inode record.
+    /// Validates the declared field span against the actual inode record. The in-inode xattr
+    /// header and its entries are 4-byte aligned, so the span must be too.
     /// # Errors
-    /// Returns an invalid inode or truncated field for an out-of-record declaration.
+    /// Returns an invalid inode for an out-of-record or misaligned declaration, or a truncated
+    /// field error.
     pub(crate) fn parse(raw: &[u8]) -> Result<Self> {
         if raw.len() < 128 {
             return Err(Error::TruncatedStructure);
@@ -601,7 +603,7 @@ impl InodeRecordLayout {
         let extra_end = 128_usize
             .checked_add(extra)
             .ok_or(Error::ArithmeticOverflow)?;
-        if extra_end > raw.len() {
+        if extra_end > raw.len() || !extra.is_multiple_of(4) {
             return Err(Error::InvalidInode);
         }
         Ok(Self { extra_end })
@@ -2249,6 +2251,39 @@ mod tests {
     use crate::disk::block::BlockSize;
     use crate::disk::endian::{put_le_u16, put_le_u32};
     use crate::error::{Error, Result};
+
+    /// # Errors
+    /// Returns fixture encoding failure or an unexpected layout result.
+    /// # Panics
+    /// Fails if an unaligned or out-of-record extra span is admitted, or an aligned one rejected.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare independently chosen i_extra_isize values with layout admission"
+    )]
+    fn extra_field_span_is_word_aligned_within_the_record() -> Result<()> {
+        for (extra, admitted) in [
+            (0, true),
+            (4, true),
+            (32, true),
+            (128, true),
+            (2, false),
+            (6, false),
+            (30, false),
+            (132, false),
+        ] {
+            let mut raw = [0_u8; 256];
+            put_le_u16(&mut raw, super::disk_offset(128), extra)?;
+            let layout = super::InodeRecordLayout::parse(&raw);
+            assert_eq!(layout.is_ok(), admitted, "i_extra_isize {extra}");
+            if let Ok(layout) = layout {
+                assert_eq!(layout.xattr_offset(), 128 + usize::from(extra));
+            } else {
+                assert_eq!(layout.err(), Some(Error::InvalidInode));
+            }
+        }
+        Ok(())
+    }
 
     /// Builds the fixed inode id used by inode parser tests.
     /// # Errors

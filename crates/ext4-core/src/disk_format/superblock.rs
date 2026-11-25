@@ -235,8 +235,6 @@ const RO_COMPAT_PROJECT: u32 = 0x2000;
 const RO_COMPAT_VERITY: u32 = 0x8000;
 /// Read-only compatible feature bit indicating orphan cleanup is required.
 const RO_COMPAT_ORPHAN_PRESENT: u32 = 0x0001_0000;
-/// Descriptor size implied by ext4 64-bit group descriptors when not explicit.
-const DEFAULT_64BIT_DESCRIPTOR_SIZE: u16 = 64;
 
 /// Total number of inodes recorded by a validated superblock.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -652,12 +650,26 @@ impl ReservedGdtBlockCount {
 pub struct InodesPerGroup(u32);
 
 impl InodesPerGroup {
-    /// Creates an inodes-per-group value.
+    /// Creates an inodes-per-group value whose inode table fills whole blocks and whose inode
+    /// bitmap fits in one block with byte-aligned semantic bits.
     ///
     /// # Errors
-    /// Returns an error when the block group inode count is zero.
-    pub fn new(value: u32) -> Result<Self> {
-        if value == 0 {
+    /// Returns an error when the count is smaller than one inode-table block, exceeds the bits of
+    /// one bitmap block, or is not a multiple of eight and of the inodes stored per block.
+    pub fn new(value: u32, block_size: BlockSize, inode_size: InodeRecordSize) -> Result<Self> {
+        let per_block = block_size
+            .bytes()
+            .checked_div(u32::from(inode_size.as_u16()))
+            .ok_or(Error::InvalidSuperblock)?;
+        let bitmap_bits = block_size
+            .bytes()
+            .checked_mul(8)
+            .ok_or(Error::ArithmeticOverflow)?;
+        if value < per_block
+            || value > bitmap_bits
+            || !value.is_multiple_of(8)
+            || !value.is_multiple_of(per_block)
+        {
             Err(Error::InvalidSuperblock)
         } else {
             Ok(Self(value))
@@ -676,12 +688,14 @@ impl InodesPerGroup {
 pub struct InodeRecordSize(u16);
 
 impl InodeRecordSize {
-    /// Creates an inode record size.
+    /// Creates an inode record size. Inode tables pack whole records into each block, so a
+    /// power-of-two size is what makes the linear table offset equal the on-disk record slot.
     ///
     /// # Errors
-    /// Returns an error when the value cannot contain a v1-supported inode.
+    /// Returns an error when the value cannot contain a v1-supported inode, is not a power of two,
+    /// or exceeds one block.
     pub fn new(value: u16, block_size: BlockSize) -> Result<Self> {
-        if value < 128 || u32::from(value) > block_size.bytes() {
+        if value < 128 || !value.is_power_of_two() || u32::from(value) > block_size.bytes() {
             Err(Error::InvalidSuperblock)
         } else {
             Ok(Self(value))
@@ -700,15 +714,31 @@ impl InodeRecordSize {
 pub struct BlockGroupDescriptorSize(u16);
 
 impl BlockGroupDescriptorSize {
-    /// Creates a descriptor size.
+    /// Fixed descriptor size of a filesystem without the 64bit feature; `s_desc_size` is unused.
+    const STANDARD: Self = Self(32);
+    /// Smallest `s_desc_size` that contains every 64bit high field.
+    const MIN_SIXTY_FOUR_BIT: u16 = 64;
+    /// Largest `s_desc_size`; one descriptor never exceeds the minimum block size.
+    const MAX_SIXTY_FOUR_BIT: u16 = 1024;
+
+    /// Selects the descriptor size for a validated descriptor layout. A power-of-two size keeps
+    /// descriptors from straddling blocks, so the linear table offset equals the on-disk slot.
     ///
     /// # Errors
-    /// Returns an error when the descriptor cannot fit in one block.
-    pub fn new(value: u16, block_size: BlockSize) -> Result<Self> {
-        if value < 32 || u32::from(value) > block_size.bytes() {
-            Err(Error::InvalidSuperblock)
-        } else {
-            Ok(Self(value))
+    /// Returns an error when a 64bit layout declares a size outside 64..=1024 or not a power of
+    /// two.
+    pub(crate) fn for_layout(raw: u16, layout: BlockGroupDescriptorLayout) -> Result<Self> {
+        match layout {
+            BlockGroupDescriptorLayout::Standard32 => Ok(Self::STANDARD),
+            BlockGroupDescriptorLayout::SixtyFourBit => {
+                if !(Self::MIN_SIXTY_FOUR_BIT..=Self::MAX_SIXTY_FOUR_BIT).contains(&raw)
+                    || !raw.is_power_of_two()
+                {
+                    Err(Error::InvalidSuperblock)
+                } else {
+                    Ok(Self(raw))
+                }
+            }
         }
     }
 
@@ -1144,6 +1174,14 @@ impl ClusterGeometry {
             AllocationBitmapDomain::Clusters => {}
         }
         if raw.log_cluster_size < raw.log_block_size || raw.log_cluster_size > 31 {
+            return Err(Error::InvalidClusterGeometry);
+        }
+        // With 1 KiB blocks the primary superblock occupies block 1; only a bigalloc cluster may
+        // start the data domain at block 0 and contain it.
+        if raw.first_data_block.get() == 0
+            && raw.log_block_size == 0
+            && raw.log_cluster_size == raw.log_block_size
+        {
             return Err(Error::InvalidClusterGeometry);
         }
 
@@ -1969,9 +2007,10 @@ impl Superblock {
         let reserved_gdt_blocks =
             ReservedGdtBlockCount::new(le_u16(raw, disk_offset(RESERVED_GDT_BLOCKS_OFFSET))?);
         let raw_clusters_per_group = le_u32(raw, disk_offset(36))?;
-        let inodes_per_group = InodesPerGroup::new(le_u32(raw, disk_offset(40))?)?;
         let first_inode = InodeId::try_from(le_u32(raw, disk_offset(84))?)?;
         let inode_size = InodeRecordSize::new(le_u16(raw, disk_offset(88))?, block_size)?;
+        let inodes_per_group =
+            InodesPerGroup::new(le_u32(raw, disk_offset(40))?, block_size, inode_size)?;
         let features = validate_features(
             le_u32(raw, disk_offset(92))?,
             le_u32(raw, disk_offset(96))?,
@@ -1982,17 +2021,10 @@ impl Superblock {
         {
             return Err(Error::UnsupportedWriteFeature);
         }
-        let raw_descriptor_size = if features.has_64bit() {
-            let raw_size = le_u16(raw, disk_offset(254))?;
-            if raw_size == 0 {
-                DEFAULT_64BIT_DESCRIPTOR_SIZE
-            } else {
-                raw_size
-            }
-        } else {
-            32
-        };
-        let descriptor_size = BlockGroupDescriptorSize::new(raw_descriptor_size, block_size)?;
+        let descriptor_size = BlockGroupDescriptorSize::for_layout(
+            le_u16(raw, disk_offset(254))?,
+            features.descriptor_layout(),
+        )?;
         let block_count = BlockCount::new(
             u64::from(block_count_lo)
                 | if features.has_64bit() {
@@ -2012,6 +2044,19 @@ impl Superblock {
             clusters_per_group: raw_clusters_per_group,
             allocation_bitmap_domain: features.allocation_bitmap_domain(),
         })?;
+        // Every group owns a complete inode table, so group-local inode arithmetic has no
+        // partial final group.
+        let group_count = round_up_div(
+            geometry.cluster_count.as_u64(),
+            u64::from(geometry.clusters_per_group.as_u32()),
+        )?;
+        if group_count
+            .checked_mul(u64::from(inodes_per_group.as_u32()))
+            .ok_or(Error::ArithmeticOverflow)?
+            != u64::from(inode_count.as_u32())
+        {
+            return Err(Error::InvalidSuperblock);
+        }
         let free_clusters_count = free_blocks_count
             .into_free_cluster_count(geometry.blocks_per_cluster, geometry.cluster_count)?;
         let reserved_clusters_count = ReservedClusterCount::parse(
@@ -2783,6 +2828,124 @@ mod tests {
     use super::*;
     use crate::disk::endian::put_le_u16;
 
+    /// Parses one primary-fixture variant under both mount policies, requiring them to agree.
+    /// # Errors
+    /// Returns fixture encoding failure or the shared admission result.
+    fn admit_geometry(edit: impl Fn(&mut [u8; 1024]) -> Result<()>) -> Result<()> {
+        let mut raw = primary(false, false, false)?;
+        edit(&mut raw)?;
+        Superblock::refresh_checksum(&mut raw)?;
+        let read_only = Superblock::parse_read_only(&raw).map(|_| ());
+        let read_write = Superblock::parse_read_write(&raw).map(|_| ());
+        if read_only == read_write {
+            read_only
+        } else {
+            Err(Error::InvalidSuperblock)
+        }
+    }
+
+    /// # Errors
+    /// Returns fixture encoding failure or an unexpected admission result.
+    /// # Panics
+    /// Fails if a record, descriptor or inode-group geometry outside the ext4 layout is admitted,
+    /// or a conforming boundary value is rejected.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare independently chosen ext4 geometry boundaries with admission"
+    )]
+    fn table_geometry_requires_whole_block_record_slots() -> Result<()> {
+        // The fixture uses 1 KiB blocks, one 8192-block group and 256-byte inodes (4 per block).
+        for (size, admitted) in [
+            (128, true),
+            (256, true),
+            (1024, true),
+            (384, false),
+            (2048, false),
+        ] {
+            let inodes = 1024 / u32::from(size) * 32;
+            let result = admit_geometry(|raw| {
+                put_le_u16(raw, disk_offset(88), size)?;
+                put_le_u32(raw, disk_offset(40), inodes)?;
+                put_le_u32(raw, disk_offset(0), inodes)
+            });
+            assert_eq!(result.is_ok(), admitted, "inode size {size}");
+        }
+        for (raw_size, admitted) in [
+            (64, true),
+            (128, true),
+            (1024, true),
+            (0, false),
+            (32, false),
+            (48, false),
+            (96, false),
+            (2048, false),
+        ] {
+            let result = admit_geometry(|raw| {
+                put_le_u32(
+                    raw,
+                    disk_offset(96),
+                    INCOMPAT_EXTENTS | INCOMPAT_FILETYPE | INCOMPAT_64BIT,
+                )?;
+                put_le_u16(raw, disk_offset(254), raw_size)
+            });
+            assert_eq!(result.is_ok(), admitted, "descriptor size {raw_size}");
+        }
+        // Without 64bit the descriptor is 32 bytes whatever `s_desc_size` holds.
+        admit_geometry(|raw| put_le_u16(raw, disk_offset(254), 48))?;
+        for (per_group, admitted) in [
+            (8, true),
+            (8192, true),
+            (4, false),
+            (12, false),
+            (8200, false),
+        ] {
+            let result = admit_geometry(|raw| {
+                put_le_u32(raw, disk_offset(40), per_group)?;
+                put_le_u32(raw, disk_offset(0), per_group)
+            });
+            assert_eq!(result.is_ok(), admitted, "inodes per group {per_group}");
+        }
+        // With 128 inodes per group, 8194 blocks after block 1 span two groups and 256 inodes.
+        for (blocks, inodes, admitted) in [
+            (4096, 128, true),
+            (8194, 256, true),
+            (4096, 120, false),
+            (4096, 256, false),
+            (8194, 128, false),
+        ] {
+            let result = admit_geometry(|raw| {
+                put_le_u32(raw, disk_offset(4), blocks)?;
+                put_le_u32(raw, disk_offset(0), inodes)
+            });
+            assert_eq!(result.is_ok(), admitted, "{blocks} blocks, {inodes} inodes");
+        }
+        Ok(())
+    }
+
+    /// # Errors
+    /// Returns fixture encoding failure or an unexpected admission result.
+    /// # Panics
+    /// Fails if a 1 KiB non-bigalloc data domain may start at the primary superblock's block.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare the 1 KiB superblock placement with admission"
+    )]
+    fn one_kib_block_groups_start_after_the_boot_block() -> Result<()> {
+        assert_eq!(
+            admit_geometry(|raw| put_le_u32(raw, disk_offset(20), 0)),
+            Err(Error::InvalidClusterGeometry)
+        );
+        // With 4 KiB blocks the superblock lies inside block 0, which starts the data domain.
+        admit_geometry(|raw| {
+            put_le_u32(raw, disk_offset(20), 0)?;
+            put_le_u32(raw, disk_offset(24), 2)?;
+            put_le_u32(raw, disk_offset(28), 2)?;
+            put_le_u32(raw, disk_offset(4), 1024)
+        })
+    }
+
     /// # Errors
     /// Returns independent field encoding or superblock validation failure.
     /// # Panics
@@ -2796,6 +2959,8 @@ mod tests {
         for wide in [false, true] {
             let mut raw = primary(false, false, false)?;
             for (offset, value) in [
+                // The 64bit image spans 1_048_577 groups of 8192 blocks, each with 128 inodes.
+                (0, if wide { 1_048_577 * 128 } else { 128 }),
                 (4, 64),
                 (8, 3),
                 (12, 32),
@@ -2809,6 +2974,7 @@ mod tests {
             ] {
                 put_le_u32(&mut raw, disk_offset(offset), value)?;
             }
+            put_le_u16(&mut raw, disk_offset(254), 64)?;
             Superblock::refresh_checksum(&mut raw)?;
             for parsed in [
                 Superblock::parse_read_only(&raw)?,

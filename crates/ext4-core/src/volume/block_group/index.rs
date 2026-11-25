@@ -362,7 +362,7 @@ impl AllocationIndexBuild {
                         self.phase = IndexPhase::Xattrs { inventory, next: 0 };
                         return Ok(None);
                     };
-                    let count = inode_count_in_group(superblock, snapshot.group)?;
+                    let count = superblock.inodes_per_group().as_u32();
                     while *bit < count {
                         let position = InodeBitmapPosition::new(snapshot.group, *bit);
                         if inode_bitmap_bit_state(&snapshot.inode_bitmap, position)?
@@ -591,7 +591,7 @@ fn append_static_ranges(
         }
         ranges.try_push(AllocationRange::new(
             group.descriptor.inode_table(),
-            inode_table_blocks(superblock, group.group)?,
+            inode_table_blocks(superblock)?,
             BlockOwnership::Exclusive,
         )?)?;
     }
@@ -833,7 +833,7 @@ fn read_group_inode_record<'table>(
     position: InodeBitmapPosition,
     table: &'table mut Option<InodeTableWindow>,
 ) -> Result<RawInodeRecord<&'table [u8]>> {
-    let count = inode_count_in_group(superblock, group.group)?;
+    let count = superblock.inodes_per_group().as_u32();
     if position.group() != group.group || position.bit() >= count {
         return Err(Error::InvalidInode);
     }

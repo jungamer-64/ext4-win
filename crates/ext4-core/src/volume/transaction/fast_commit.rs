@@ -476,7 +476,7 @@ impl MetadataMutation<'_, '_> {
             let descriptor =
                 BlockGroupDescriptor::read_from(&mut self.volume.device, &superblock, group)?;
             let bitmap = self.ensure_inode_bitmap_update(group, &descriptor)?;
-            for bit in 0..crate::volume::block_group::inode_count_in_group(&superblock, group)? {
+            for bit in 0..superblock.inodes_per_group().as_u32() {
                 let position = InodeBitmapPosition::new(group, bit);
                 let id = position.inode_id(&superblock)?;
                 if superblock.require_namespace_inode(id).is_err() || orphans.contains(id) {

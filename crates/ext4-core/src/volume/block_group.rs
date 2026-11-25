@@ -91,7 +91,7 @@ pub(super) fn materialize_uninitialized_block_bitmap(
             superblock,
             group,
             layout.inode_table,
-            inode_table_blocks(superblock, layout.group)?,
+            inode_table_blocks(superblock)?,
         )?;
     }
     Ok(bytes)
@@ -106,7 +106,7 @@ pub(super) fn materialize_uninitialized_inode_bitmap(
     group: BlockGroupId,
 ) -> Result<Vec<u8>> {
     let mut bytes = empty_allocation_bitmap(superblock)?;
-    let inodes_in_group = inode_count_in_group(superblock, group)?;
+    let inodes_in_group = superblock.inodes_per_group().as_u32();
     reserve_bitmap_padding(&mut bytes, inodes_in_group)?;
     if group.as_u32() == 0 {
         let reserved = superblock
@@ -489,33 +489,17 @@ pub(super) fn descriptor_table_blocks(superblock: &Superblock) -> Result<u64> {
     round_up_div(descriptor_bytes, u64::from(superblock.block_size().bytes()))
 }
 
-/// Returns the inode count actually present in a possibly partial group.
+/// Returns the number of blocks occupied by every group's inode table; superblock admission
+/// makes the table an exact multiple of whole blocks.
 /// # Errors
 ///
-/// Returns an error when the group start is past the inode count or group inode arithmetic
-/// overflows.
-pub(super) fn inode_count_in_group(superblock: &Superblock, group: BlockGroupId) -> Result<u32> {
-    let group_start = u64::from(group.as_u32())
-        .checked_mul(u64::from(superblock.inodes_per_group().as_u32()))
-        .ok_or(Error::ArithmeticOverflow)?;
-    let remaining = u64::from(superblock.inode_count().as_u32())
-        .checked_sub(group_start)
-        .ok_or(Error::InvalidSuperblock)?;
-    Ok(core::cmp::min(
-        superblock.inodes_per_group().as_u32(),
-        u32::try_from(remaining).unwrap_or(u32::MAX),
-    ))
-}
-
-/// Returns the number of blocks occupied by a group's inode table.
-/// # Errors
-///
-/// Returns an error when inode count, inode size, or rounded block division arithmetic fails.
-pub(super) fn inode_table_blocks(superblock: &Superblock, group: BlockGroupId) -> Result<u64> {
-    let inode_bytes = u64::from(inode_count_in_group(superblock, group)?)
+/// Returns an error when inode-table byte arithmetic overflows.
+pub(super) fn inode_table_blocks(superblock: &Superblock) -> Result<u64> {
+    u64::from(superblock.inodes_per_group().as_u32())
         .checked_mul(u64::from(superblock.inode_size().as_u16()))
-        .ok_or(Error::ArithmeticOverflow)?;
-    round_up_div(inode_bytes, u64::from(superblock.block_size().bytes()))
+        .ok_or(Error::ArithmeticOverflow)?
+        .checked_div(u64::from(superblock.block_size().bytes()))
+        .ok_or(Error::ArithmeticOverflow)
 }
 
 /// Computes the absolute device offset of an inode record.
