@@ -335,7 +335,7 @@ fn query_hard_link_information(
     read: &mut impl CommittedReadPass,
 ) -> DriverResult<IrpCompletion> {
     let links = read.read_hard_links(target)?;
-    let links = WindowsHardLinks::try_from_ext4(&links)?;
+    let links = WindowsHardLinks::try_from_ext4(&links, read)?;
     let mut packed = DriverVec::try_repeated_copy(0_u8, length.as_usize())?;
     let result = pack_hard_link_information(packed.as_mut_slice(), &links)?;
     request.with_active(|active| {
@@ -362,11 +362,12 @@ struct WindowsHardLinks {
 
 impl WindowsHardLinks {
     /// Projects ext4 names without allowing an unrepresentable component to contaminate the
-    /// Windows domain.
+    /// Windows domain. Parent references come from the same committed pass as the names.
     /// # Errors
     ///
-    /// Returns an error when allocation fails or no ext4 link can be represented by Windows.
-    fn try_from_ext4(links: &HardLinks) -> DriverResult<Self> {
+    /// Returns an error when allocation or a parent inode read fails, or no ext4 link can be
+    /// represented by Windows.
+    fn try_from_ext4(links: &HardLinks, read: &mut impl CommittedReadPass) -> DriverResult<Self> {
         let mut entries = DriverVec::try_with_capacity(links.entries().len())?;
         for link in links.entries() {
             let name = match WindowsName::from_ext4(link.name()) {
@@ -374,8 +375,9 @@ impl WindowsHardLinks {
                 Err(DriverError::InvalidName) => continue,
                 Err(error) => return Err(error),
             };
+            let parent = read.load_node_metadata(NodeId::Directory(link.parent()))?;
             let entry = WindowsHardLinkEntry {
-                parent_file_id: u64::from(NodeId::Directory(link.parent()).file_index()),
+                parent_file_id: crate::metadata::WindowsFileId::of(parent).as_u64(),
                 name,
             };
             entries
@@ -583,8 +585,8 @@ fn pack_hard_link_record(
 /// File metadata needed by fixed-size Windows information classes.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct FileMetadata {
-    /// Stable ext4 inode id encoded for Windows file-index payloads.
-    pub(super) file_index: u32,
+    /// Windows reference to the observed inode allocation.
+    pub(super) file_id: crate::metadata::WindowsFileId,
     /// Open node kind.
     pub(super) kind: FileMetadataKind,
     /// Payload size in bytes.
@@ -680,7 +682,7 @@ impl From<WindowsNodeMetadata> for FileMetadata {
             WindowsReparsePoint::SymbolicLink => FileMetadataReparsePoint::SymbolicLink,
         };
         Self {
-            file_index: snapshot.node().file_index(),
+            file_id: snapshot.file_id(),
             kind,
             size: snapshot.size(),
             allocation_size: snapshot.allocation_size(),
@@ -803,12 +805,12 @@ fn pack_internal_information(
 ) -> DriverResult<IrpCompletion> {
     let size = core::mem::size_of::<wdk_sys::FILE_INTERNAL_INFORMATION>();
     let mut writer = fixed_record_writer(output, size)?;
-    writer.write_i64(
+    writer.write_u64(
         WireOffset::new(core::mem::offset_of!(
             wdk_sys::FILE_INTERNAL_INFORMATION,
             IndexNumber
         )),
-        i64::from(metadata.file_index),
+        metadata.file_id.as_u64(),
     )?;
     IrpCompletion::from_usize(size)
 }
@@ -921,7 +923,7 @@ fn volume_relative_name(
                 .map_err(|error| error.into_parts().0)?;
             directory_relative_name(read, *parent, components)
         }
-        OpenedLocation::FileReference => node_relative_name(read, node),
+        OpenedLocation::FileReference(_) => node_relative_name(read, node),
     }
 }
 

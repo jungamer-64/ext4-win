@@ -326,7 +326,7 @@ pub(crate) fn read_alias(
     };
     stored_alias(
         value.bytes(),
-        NodeId::Directory(parent).file_index(),
+        NodeId::Directory(parent).inode().as_u32(),
         metadata.generation().as_u32(),
         name.bytes(),
     )
@@ -467,7 +467,7 @@ pub(crate) fn store(
     let mut bytes = DriverVec::try_copied_from_slice(&VERSION)?;
     if let Some(value) = xattrs.get(&key) {
         records(value.bytes(), |record| {
-            if record.parent != NodeId::Directory(parent).file_index()
+            if record.parent != NodeId::Directory(parent).inode().as_u32()
                 || record.generation != prepared.generation
                 || record.name != name.bytes()
             {
@@ -487,7 +487,7 @@ pub(crate) fn store(
     {
         return Ok(());
     }
-    bytes.try_extend_from_copy_slice(&NodeId::Directory(parent).file_index().to_le_bytes())?;
+    bytes.try_extend_from_copy_slice(&NodeId::Directory(parent).inode().as_u32().to_le_bytes())?;
     bytes.try_extend_from_copy_slice(&prepared.generation.to_le_bytes())?;
     bytes.try_extend_from_copy_slice(
         &u16::try_from(name.bytes().len())
@@ -521,7 +521,9 @@ pub(crate) fn forget(
     let mut bytes = DriverVec::try_copied_from_slice(&VERSION)?;
     let mut removed = false;
     records(value.bytes(), |record| {
-        if record.parent == NodeId::Directory(parent).file_index() && record.name == name.bytes() {
+        if record.parent == NodeId::Directory(parent).inode().as_u32()
+            && record.name == name.bytes()
+        {
             removed = true;
         } else {
             bytes.try_extend_from_copy_slice(record.encoded)?;

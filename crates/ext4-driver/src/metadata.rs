@@ -5,9 +5,60 @@ use crate::memory;
 use crate::request::DriverMutationPass;
 use ext4_core::{
     CommittedReadPass, Ext4LinkCount, Ext4Security, Ext4Times, FileAllocationSize, FileSize,
-    NodeDataPolicy, NodeId, SymlinkTarget, TransactionNode, XattrName, XattrNamespace, XattrSet,
-    XattrValue,
+    InodeGeneration, InodeId, NodeDataPolicy, NodeId, SymlinkTarget, TransactionNode, XattrName,
+    XattrNamespace, XattrSet, XattrValue,
 };
+
+/// Windows file reference naming one ext4 inode allocation.
+///
+/// The low 32 bits carry the inode number and the high 32 bits its `i_generation`. A reference
+/// retained across deletion therefore names no file once the inode number is reused, instead of
+/// opening the new allocation. `FILE_ID_128` carries the same value with a zero high half.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WindowsFileId {
+    /// Reusable inode number.
+    inode: InodeId,
+    /// Allocation incarnation of `inode`.
+    generation: InodeGeneration,
+}
+
+impl WindowsFileId {
+    /// Identifies the allocation observed by one coherent inode snapshot.
+    pub(crate) const fn of(inode: ext4_core::NodeMetadataSnapshot) -> Self {
+        Self {
+            inode: inode.node().inode(),
+            generation: inode.generation(),
+        }
+    }
+
+    /// Decodes an 8-byte Windows file reference.
+    /// # Errors
+    /// Returns invalid parameter when the inode field is zero, which no ext4 inode uses.
+    pub(crate) fn from_u64(reference: u64) -> DriverResult<Self> {
+        let [i0, i1, i2, i3, g0, g1, g2, g3] = reference.to_le_bytes();
+        Ok(Self {
+            inode: InodeId::try_from(u32::from_le_bytes([i0, i1, i2, i3]))
+                .map_err(|_| DriverError::InvalidParameter)?,
+            generation: InodeGeneration::from_u32(u32::from_le_bytes([g0, g1, g2, g3])),
+        })
+    }
+
+    /// Inode whose current allocation must still carry this generation.
+    pub(crate) const fn inode(self) -> InodeId {
+        self.inode
+    }
+
+    /// 64-bit file reference used by `LARGE_INTEGER` and `ULONGLONG` file-id fields.
+    pub(crate) fn as_u64(self) -> u64 {
+        (u64::from(self.generation.as_u32()) << 32) | u64::from(self.inode.as_u32())
+    }
+
+    /// Little-endian `FILE_ID_128` bytes.
+    pub(crate) fn to_file_id_128(self) -> [u8; 16] {
+        let [b0, b1, b2, b3, b4, b5, b6, b7] = self.as_u64().to_le_bytes();
+        [b0, b1, b2, b3, b4, b5, b6, b7, 0, 0, 0, 0, 0, 0, 0, 0]
+    }
+}
 
 /// Windows interpretation of one coherent ext4 inode/xattr observation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,6 +118,11 @@ impl WindowsNodeMetadata {
     /// Ext4 identity whose observation established this projection.
     pub(crate) const fn node(self) -> NodeId {
         self.inode.node()
+    }
+
+    /// Windows reference to the observed inode allocation.
+    pub(crate) const fn file_id(self) -> WindowsFileId {
+        WindowsFileId::of(self.inode)
     }
     /// Ext4 payload eligibility paired with the projected attributes.
     pub(crate) const fn data_policy(self) -> NodeDataPolicy {

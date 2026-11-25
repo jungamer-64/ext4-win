@@ -6,6 +6,7 @@ use core::ffi::c_void;
 use core::num::NonZeroU32;
 use core::ptr::NonNull;
 
+use crate::metadata::WindowsFileId;
 use crate::namespace::WindowsName;
 use ext4_core::{ChildLookup, CommittedReadPass, DirectoryNodeId, Ext4Name, Ext4Security, NodeId};
 #[cfg(test)]
@@ -955,47 +956,40 @@ impl CreateFileObjectFlags {
 
 /// File reference decoded from FILE_OPEN_BY_FILE_ID input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CreateFileReference {
-    /// Windows-facing stable file index.
-    file_index: u32,
-}
+struct CreateFileReference(WindowsFileId);
 
 impl CreateFileReference {
-    /// Decodes an 8-byte Windows file reference captured from the create name.
+    /// Decodes an 8-byte file reference or a 16-byte `FILE_ID_128` captured from the create name.
+    /// ext4 has no object identifiers, so a 16-byte name is always a `FILE_ID_128`.
     /// # Errors
     ///
-    /// Returns an error when the create name is absent, malformed, or uses an unsupported
-    /// object-id/prefixed file-reference form.
+    /// Returns invalid parameter for an empty name or a zero inode field, object-name-not-found
+    /// for a `FILE_ID_128` outside the published 64-bit domain, and not-supported for other
+    /// lengths.
     fn decode(bytes: &[u8]) -> DriverResult<Self> {
-        let byte_len = bytes.len();
-        if byte_len == 0 {
-            return Err(DriverError::InvalidParameter);
-        }
-        match byte_len {
-            8 => Self::from_wire_file_reference(
-                <[u8; 8]>::try_from(bytes).map_err(|_| DriverError::InvalidParameter)?,
-            ),
-            16 => Err(DriverError::NotSupported),
-            _ => Err(DriverError::NotSupported),
-        }
+        let low = match bytes.len() {
+            0 => return Err(DriverError::InvalidParameter),
+            8 => bytes,
+            16 => {
+                let (low, high) = bytes
+                    .split_at_checked(8)
+                    .ok_or(DriverError::InternalInvariantViolation)?;
+                if high.iter().any(|byte| *byte != 0) {
+                    return Err(DriverError::ObjectNameNotFound);
+                }
+                low
+            }
+            _ => return Err(DriverError::NotSupported),
+        };
+        let reference = <[u8; 8]>::try_from(low).map_err(|_| DriverError::InvalidParameter)?;
+        Ok(Self(WindowsFileId::from_u64(u64::from_le_bytes(
+            reference,
+        ))?))
     }
 
-    /// Builds a file reference from the Windows wire file reference.
-    /// # Errors
-    ///
-    /// Returns an error when the file reference cannot fit the ext4win file-index domain.
-    fn from_wire_file_reference(reference: [u8; 8]) -> DriverResult<Self> {
-        let file_index = u32::try_from(u64::from_le_bytes(reference))
-            .map_err(|_| DriverError::InvalidParameter)?;
-        if file_index == 0 {
-            return Err(DriverError::InvalidParameter);
-        }
-        Ok(Self { file_index })
-    }
-
-    /// Returns the referenced file index.
-    const fn file_index(self) -> u32 {
-        self.file_index
+    /// Returns the referenced inode allocation.
+    const fn file_id(self) -> WindowsFileId {
+        self.0
     }
 }
 
@@ -1732,8 +1726,9 @@ fn revalidate_existing_open(
                 ChildLookup::Found(child) if *child.node() == pending.node
             )
         }
-        OpenedLocation::FileReference => {
-            read.load_node_by_file_index(pending.node.file_index())? == pending.node
+        OpenedLocation::FileReference(file_id) => {
+            let current = read.load_inode_metadata(file_id.inode())?;
+            current.node() == pending.node && WindowsFileId::of(current) == *file_id
         }
     };
     let current_mode = if NodeSymlinkReparsePoint::load(read, pending.node)?.is_some() {
@@ -2306,22 +2301,27 @@ fn validate_file_reference_create(disposition: CreateDisposition) -> DriverResul
     Ok(())
 }
 
-/// Resolves an 8-byte file reference to an existing typed node.
+/// Resolves a file reference to the inode allocation it names.
 /// # Errors
 ///
-/// Returns an error when the file-reference name is malformed or no live inode exists for it.
+/// Returns object-name-not-found when no live namespace inode carries the reference's inode
+/// number and generation, or the inode read error.
 fn resolve_file_reference(
     reference: CreateFileReference,
     read: &mut impl CommittedReadPass,
     reparse_point_mode: CreateReparsePointMode,
 ) -> DriverResult<CreateTargetLookup> {
-    let node = read
-        .load_node_by_file_index(reference.file_index())
+    let file_id = reference.file_id();
+    let current = read
+        .load_inode_metadata(file_id.inode())
         .map_err(file_reference_lookup_error)?;
+    if WindowsFileId::of(current) != file_id {
+        return Err(DriverError::ObjectNameNotFound);
+    }
     resolve_final_node(
         read,
-        node,
-        OpenedLocation::FileReference,
+        current.node(),
+        OpenedLocation::FileReference(file_id),
         reparse_point_mode,
         UnparsedPathLength::ZERO,
     )
@@ -3159,13 +3159,22 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn create_file_reference_decodes_eight_byte_file_index() {
-        let reference = u64::from(3_u32).to_le_bytes();
-
+    fn create_file_reference_decodes_inode_and_generation() {
+        let reference = 0x0000_0007_0000_0003_u64;
+        let decoded =
+            CreateFileReference::decode(&reference.to_le_bytes()).map(CreateFileReference::file_id);
         assert_eq!(
-            CreateFileReference::decode(&reference).map(CreateFileReference::file_index),
-            Ok(3)
+            decoded.map(|id| (id.inode().as_u32(), id.as_u64())),
+            Ok((3, reference))
         );
+        let low = reference.to_le_bytes();
+        let file_id_128: [u8; 16] =
+            core::array::from_fn(|index| low.get(index).copied().unwrap_or(0));
+        assert_eq!(
+            CreateFileReference::decode(&file_id_128).map(CreateFileReference::file_id),
+            decoded
+        );
+        assert_eq!(decoded.map(WindowsFileId::to_file_id_128), Ok(file_id_128));
     }
 
     /// # Panics
@@ -3173,21 +3182,29 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn create_file_reference_rejects_invalid_or_unsupported_wire_forms() {
-        let zero = 0_u64.to_le_bytes();
+        let zero_inode = (u64::from(u32::MAX) + 1).to_le_bytes();
         assert_eq!(
-            CreateFileReference::decode(&zero),
+            CreateFileReference::decode(&zero_inode),
+            Err(DriverError::InvalidParameter)
+        );
+        assert_eq!(
+            CreateFileReference::decode(&[0_u8; 16]),
             Err(DriverError::InvalidParameter)
         );
 
-        let too_large = (u64::from(u32::MAX) + 1).to_le_bytes();
+        let mut beyond_published = [0_u8; 16];
+        beyond_published[0] = 3;
+        beyond_published[15] = 1;
         assert_eq!(
-            CreateFileReference::decode(&too_large),
+            CreateFileReference::decode(&beyond_published),
+            Err(DriverError::ObjectNameNotFound)
+        );
+        assert_eq!(
+            CreateFileReference::decode(&[]),
             Err(DriverError::InvalidParameter)
         );
-
-        let object_id = [0_u8; 16];
         assert_eq!(
-            CreateFileReference::decode(&object_id),
+            CreateFileReference::decode(&[1_u8; 12]),
             Err(DriverError::NotSupported)
         );
     }

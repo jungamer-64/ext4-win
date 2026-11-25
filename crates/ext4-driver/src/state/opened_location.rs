@@ -768,7 +768,9 @@ mod tests {
     fn deferred_links_survive_named_handle_close_until_the_inode_cleanup_collects_them()
     -> DriverResult<()> {
         let mut links = OpenedLocations::new();
-        let inode = links.acquire(OpenedLocation::FileReference)?;
+        let inode = links.acquire(OpenedLocation::FileReference(
+            crate::metadata::WindowsFileId::from_u64(16)?,
+        ))?;
         let handles = [
             links.acquire(location(b"a")?)?,
             links.acquire(location(b"b")?)?,

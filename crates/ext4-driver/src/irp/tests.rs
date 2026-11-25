@@ -3564,6 +3564,11 @@ fn reserve_filter_oplock_requires_exact_access_and_sharing() {
 fn normalized_names_retain_create_time_traversal_authority() {
     use crate::state::{NormalizedNameAccess, OpenedLocation};
 
+    let file_id = crate::metadata::WindowsFileId::from_u64(16);
+    assert!(file_id.is_ok());
+    let Ok(file_id) = file_id else {
+        return;
+    };
     let metadata_only = super::GrantedAccess::from_authorized(
         wdk_sys::FILE_READ_ATTRIBUTES,
         super::ValidDataLengthAccess::Denied,
@@ -3573,7 +3578,8 @@ fn normalized_names_retain_create_time_traversal_authority() {
         Ok(())
     );
     assert_eq!(
-        NormalizedNameAccess::for_open(&OpenedLocation::FileReference, metadata_only).require(),
+        NormalizedNameAccess::for_open(&OpenedLocation::FileReference(file_id), metadata_only)
+            .require(),
         Err(DriverError::AccessDenied)
     );
     let traverse = super::GrantedAccess::from_authorized(
@@ -3581,7 +3587,7 @@ fn normalized_names_retain_create_time_traversal_authority() {
         super::ValidDataLengthAccess::Denied,
     );
     assert_eq!(
-        NormalizedNameAccess::for_open(&OpenedLocation::FileReference, traverse).require(),
+        NormalizedNameAccess::for_open(&OpenedLocation::FileReference(file_id), traverse).require(),
         Ok(())
     );
 }

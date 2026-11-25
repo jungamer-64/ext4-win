@@ -103,7 +103,7 @@ impl DirectoryInformationClass {
 enum DirectoryFileIdLayout {
     /// Eight-byte `LARGE_INTEGER` identity.
     U64(usize),
-    /// Sixteen-byte `FILE_ID_128` identity whose high half remains zero.
+    /// Sixteen-byte `FILE_ID_128` identity.
     U128(usize),
 }
 
@@ -385,19 +385,14 @@ fn pack_directory_record(
             DirectoryFileIdLayout::U64(offset) => {
                 LittleEndianOutput::new(buffer).write_u64(
                     record_field_offset(start, offset)?,
-                    u64::from(metadata.file_index),
+                    metadata.file_id.as_u64(),
                 )?;
             }
             DirectoryFileIdLayout::U128(offset) => {
-                let high_offset = offset
-                    .checked_add(core::mem::size_of::<u64>())
-                    .ok_or(DriverError::InvalidParameter)?;
-                LittleEndianOutput::new(buffer).write_u64(
+                LittleEndianOutput::new(buffer).write_bytes(
                     record_field_offset(start, offset)?,
-                    u64::from(metadata.file_index),
+                    &metadata.file_id.to_file_id_128(),
                 )?;
-                LittleEndianOutput::new(buffer)
-                    .write_u64(record_field_offset(start, high_offset)?, 0)?;
             }
         }
     }

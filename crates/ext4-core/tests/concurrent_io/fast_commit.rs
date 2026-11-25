@@ -55,7 +55,7 @@ fn record(block: &mut [u8], at: &mut usize, tag: u16, value: &[u8]) -> Result<()
 /// # Errors
 /// Returns fixture geometry, checksum, TLV or data-range construction failure.
 fn inject_range(fixture: &mut Fixture, physical: u32) -> Result<u32> {
-    let inode = NodeId::File(fixture.a).file_index();
+    let inode = NodeId::File(fixture.a).inode().as_u32();
     let offset = fixture_inode_offset(&fixture.disk, NodeId::File(fixture.a))?;
     let end = offset.checked_add(256).ok_or(Error::DeviceRange)?;
     let mut raw = fixture
@@ -344,7 +344,7 @@ fn inject_binding(
     from: &[u8],
     to: &[u8],
 ) -> Result<()> {
-    let inode = NodeId::File(target).file_index();
+    let inode = NodeId::File(target).inode().as_u32();
     let offset = fixture_inode_offset(&fixture.disk, NodeId::File(target))?;
     let raw = fixture
         .disk
@@ -363,7 +363,8 @@ fn inject_binding(
     image.extend_from_slice(raw.get(..prefix).ok_or(Error::DeviceRange)?);
     let binding = |name: &[u8]| -> Vec<u8> {
         let mut value = NodeId::Directory(parent)
-            .file_index()
+            .inode()
+            .as_u32()
             .to_le_bytes()
             .to_vec();
         value.extend_from_slice(&inode.to_le_bytes());
@@ -576,7 +577,7 @@ fn new_file_creation_claims_the_logged_inode_once() -> Result<()> {
         else {
             return Err(Error::DirectoryEntryNotFound);
         };
-        assert_eq!(child.node().file_index(), 64);
+        assert_eq!(child.node().inode().as_u32(), 64);
         let NodeId::File(file) = *child.node() else {
             return Err(Error::WrongInodeKind);
         };
@@ -622,7 +623,7 @@ fn creation_rejects_root_and_unretired_occupied_generations() -> Result<()> {
         let id = if root {
             2
         } else {
-            NodeId::File(fixture.a).file_index()
+            NodeId::File(fixture.a).inode().as_u32()
         };
         inject_creation(&mut fixture, id)?;
         fixture.disk.storage_effects = 0;
@@ -662,7 +663,7 @@ fn inode_operand(disk: &Disk, node: NodeId) -> Result<Vec<u8>> {
     } else {
         prefix
     };
-    let mut value = node.file_index().to_le_bytes().to_vec();
+    let mut value = node.inode().as_u32().to_le_bytes().to_vec();
     value.extend_from_slice(raw.get(..prefix).ok_or(Error::DeviceRange)?);
     Ok(value)
 }
@@ -670,10 +671,11 @@ fn inode_operand(disk: &Disk, node: NodeId) -> Result<Vec<u8>> {
 /// Encodes one raw namespace component without performing an ordinary mutation.
 fn namespace_operand(parent: DirectoryNodeId, child: NodeId, name: &[u8]) -> Vec<u8> {
     let mut value = NodeId::Directory(parent)
-        .file_index()
+        .inode()
+        .as_u32()
         .to_le_bytes()
         .to_vec();
-    value.extend_from_slice(&child.file_index().to_le_bytes());
+    value.extend_from_slice(&child.inode().as_u32().to_le_bytes());
     value.extend_from_slice(name);
     value
 }
@@ -972,7 +974,7 @@ fn inode_allocated(disk: &Disk, inode: u32) -> Result<bool> {
 )]
 fn terminal_unlink_without_inode_metadata_retires_allocation_once() -> Result<()> {
     let mut fixture = Fixture::new()?;
-    let id = NodeId::File(fixture.a).file_index();
+    let id = NodeId::File(fixture.a).inode().as_u32();
     let inode = fixture_inode_offset(&fixture.disk, NodeId::File(fixture.a))?;
     let block = fixture_u32(
         &fixture.disk.filesystem,
@@ -1057,7 +1059,7 @@ fn unlink_census_preserves_a_hard_link_in_an_unchanged_parent() -> Result<()> {
         assert_eq!(fixture_u32(&fixture.disk.filesystem, 1036)?, free_blocks);
         assert!(inode_allocated(
             &fixture.disk,
-            NodeId::File(file).file_index()
+            NodeId::File(file).inode().as_u32()
         )?);
     }
     Ok(())
@@ -1111,7 +1113,7 @@ fn nested_directory_unlinks_release_bodies_and_parent_counts_once() -> Result<()
             NodeId::Directory(inner),
             NodeId::File(file),
         ] {
-            assert!(!inode_allocated(&fixture.disk, node.file_index())?);
+            assert!(!inode_allocated(&fixture.disk, node.inode().as_u32())?);
         }
         assert_eq!(
             fixture_u32(&fixture.disk.filesystem, 1040)?,
@@ -1193,7 +1195,7 @@ fn later_unlink_supersedes_an_earlier_positive_inode_count() -> Result<()> {
     for _ in 0..2 {
         install_delta(&mut fixture, &[(6, &image), (5, &unlink)])?;
         fixture.remount()?;
-        assert!(!inode_allocated(&fixture.disk, file.file_index())?);
+        assert!(!inode_allocated(&fixture.disk, file.inode().as_u32())?);
         assert_eq!(
             fixture_u32(&fixture.disk.filesystem, 1040)?,
             free_inodes.checked_add(1).ok_or(Error::InvalidSuperblock)?
@@ -1275,17 +1277,17 @@ fn terminal_unlink_consumes_range_assignments_without_a_final_inode_image() -> R
     let free_inodes = fixture_u32(&fixture.disk.filesystem, 1040)?;
     let unlink = namespace_operand(DirectoryNodeId::ROOT, file, b"concurrent-a");
     let mut add = [0; 16];
-    put(&mut add, 0, &file.file_index().to_le_bytes())?;
+    put(&mut add, 0, &file.inode().as_u32().to_le_bytes())?;
     put(&mut add, 8, &1_u16.to_le_bytes())?;
     put(&mut add, 12, &1000_u32.to_le_bytes())?;
     let mut del = [0; 12];
-    put(&mut del, 0, &file.file_index().to_le_bytes())?;
+    put(&mut del, 0, &file.inode().as_u32().to_le_bytes())?;
     put(&mut del, 4, &1_u32.to_le_bytes())?;
     put(&mut del, 8, &u32::MAX.to_le_bytes())?;
     for _ in 0..2 {
         install_delta(&mut fixture, &[(1, &add), (2, &del), (5, &unlink)])?;
         fixture.remount()?;
-        assert!(!inode_allocated(&fixture.disk, file.file_index())?);
+        assert!(!inode_allocated(&fixture.disk, file.inode().as_u32())?);
         assert!(!allocated(&fixture.disk, 1000)?);
         assert_eq!(
             fixture_u32(&fixture.disk.filesystem, 1036)?,
@@ -1335,7 +1337,7 @@ fn interrupted_terminal_checkpoint_recovers_one_complete_retirement() -> Result<
     assert_eq!(outcome.map(|_| ()), Err(Error::DeviceIo));
     assert_eq!(homes, 2);
     fixture.remount()?;
-    assert!(!inode_allocated(&fixture.disk, file.file_index())?);
+    assert!(!inode_allocated(&fixture.disk, file.inode().as_u32())?);
     assert!(matches!(
         fixture.read(
             |pass| pass.lookup_child(DirectoryNodeId::ROOT, &Ext4Name::new(b"concurrent-a")?)
@@ -1525,7 +1527,7 @@ fn inline_records_restore_full_payload_and_preserve_attribute_bindings() -> Resu
         let payload = [0x59; 80];
         let image = inline_file_operand(
             &fixture,
-            NodeId::File(file).file_index(),
+            NodeId::File(file).inode().as_u32(),
             &payload,
             Some(b"kept"),
         )?;
@@ -1591,7 +1593,7 @@ fn inline_records_reject_changed_attributes_and_missing_bodies_before_effects() 
         })?;
         let mut image = inline_file_operand(
             &fixture,
-            NodeId::File(file).file_index(),
+            NodeId::File(file).inode().as_u32(),
             &[0x59; 80],
             Some(if variant == 0 { b"evil" } else { b"kept" }),
         )?;

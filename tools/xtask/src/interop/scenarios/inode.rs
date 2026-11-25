@@ -491,7 +491,7 @@ pub(super) fn verify_metadata_inode_isolation(image: &Path) -> TaskResult<()> {
     drive_internal_core_read(image, |pass| {
         pass.load_directory(ext4_core::DirectoryNodeId::ROOT)?;
         for inode in [journal, orphan].into_iter().filter(|inode| *inode != 0) {
-            match pass.load_node_by_file_index(inode) {
+            match pass.load_inode_metadata(ext4_core::InodeId::try_from(inode)?) {
                 Err(ext4_core::Error::InvalidInode) => {}
                 Err(error) => return Err(error),
                 Ok(_) => return Err(ext4_core::Error::InvalidInode),

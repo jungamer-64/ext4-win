@@ -494,13 +494,19 @@ impl EpochReadView<'_, '_> {
         Ok(LoadedNode::from_inode(self.read_inode_record(inode_id)?))
     }
 
-    /// Loads and classifies one Windows-facing file index as a typed node identity.
+    /// Reads complete metadata of one namespace inode whose node kind is not yet known.
     ///
     /// # Errors
-    /// Returns an error when the file index cannot represent a live ext4 inode.
-    pub(super) fn load_node_by_file_index(&mut self, file_index: u32) -> Result<NodeId> {
-        let inode_id = InodeId::try_from(file_index)?;
-        Ok(self.load_inode_node(inode_id)?.id())
+    /// Returns an error when the inode belongs to filesystem metadata, is outside the volume,
+    /// or its record cannot be read and authenticated.
+    pub(super) fn load_inode_metadata(
+        &mut self,
+        inode_id: InodeId,
+    ) -> Result<NodeMetadataSnapshot> {
+        self.superblock.require_namespace_inode(inode_id)?;
+        Ok(NodeMetadataSnapshot::from_inode(
+            &self.read_inode_record(inode_id)?,
+        ))
     }
 
     /// Loads an inode through a previously validated public identity.

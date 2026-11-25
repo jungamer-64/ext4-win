@@ -84,7 +84,7 @@ impl TunnelRemoval {
 
 /// Parent identity includes its allocation generation so inode reuse cannot restore old names.
 pub(crate) fn directory_key(metadata: ext4_core::NodeMetadataSnapshot) -> u64 {
-    (u64::from(metadata.generation().as_u32()) << 32) | u64::from(metadata.node().file_index())
+    crate::metadata::WindowsFileId::of(metadata).as_u64()
 }
 
 impl NameTunnel {

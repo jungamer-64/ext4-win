@@ -168,8 +168,8 @@ pub(crate) enum OpenedLocation {
         /// Exact ext4 directory entry name.
         name: Ext4Name,
     },
-    /// Opened by stable file reference without a directory-entry location.
-    FileReference,
+    /// Opened by a file reference, which names the inode allocation but no directory entry.
+    FileReference(crate::metadata::WindowsFileId),
 }
 
 impl OpenedLocation {
@@ -195,7 +195,7 @@ impl OpenedLocation {
         match self {
             Self::Root => Ok(Self::Root),
             Self::DirectoryEntry { parent, name } => Self::try_directory_entry(*parent, name),
-            Self::FileReference => Ok(Self::FileReference),
+            Self::FileReference(file_id) => Ok(Self::FileReference(*file_id)),
         }
     }
 }
@@ -215,7 +215,7 @@ pub(crate) enum NormalizedNameAccess {
 impl NormalizedNameAccess {
     /// Attenuates successful create rights to normalized-name disclosure authority.
     pub(crate) const fn for_open(location: &OpenedLocation, access: GrantedAccess) -> Self {
-        if matches!(location, OpenedLocation::FileReference)
+        if matches!(location, OpenedLocation::FileReference(_))
             && access.as_raw() & wdk_sys::FILE_TRAVERSE == 0
         {
             Self::Denied

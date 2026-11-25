@@ -2243,7 +2243,7 @@ mod tests {
         record.set_encoded_allocation_size(record.raw.encoding.encode_allocation_size(charge)?)?;
         let inode = record.parse()?;
         let snapshot = NodeMetadataSnapshot::from_inode(&inode);
-        assert_eq!(snapshot.node().file_index(), 16);
+        assert_eq!(snapshot.node().inode().as_u32(), 16);
         assert_eq!(snapshot.size(), eof);
         assert_eq!(snapshot.allocation_size(), charge);
         assert_eq!(snapshot.security(), inode.security());

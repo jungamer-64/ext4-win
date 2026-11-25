@@ -567,7 +567,7 @@ impl DirectoryNotificationDirectoryName {
         if let Some(first) = slots.next() {
             *first = DIRECTORY_NOTIFICATION_SEPARATOR;
         }
-        for (slot, byte) in slots.zip(NodeId::Directory(directory).file_index().to_be_bytes()) {
+        for (slot, byte) in slots.zip(NodeId::Directory(directory).inode().as_u32().to_be_bytes()) {
             *slot = DIRECTORY_NOTIFICATION_INODE_MARKER | u16::from(byte);
         }
         units

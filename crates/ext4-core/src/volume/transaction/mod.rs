@@ -1312,8 +1312,8 @@ impl super::CommittedReadPass for MutationResolvePass<'_, '_, '_> {
         self.mutation.volume.load_symlink(id)
     }
 
-    fn load_node_by_file_index(&mut self, file_index: u32) -> Result<NodeId> {
-        self.mutation.volume.load_node_by_file_index(file_index)
+    fn load_inode_metadata(&mut self, inode: InodeId) -> Result<NodeMetadataSnapshot> {
+        self.mutation.volume.load_inode_metadata(inode)
     }
 
     fn read_xattrs(&mut self, node: NodeId) -> Result<XattrSet> {

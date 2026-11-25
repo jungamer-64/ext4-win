@@ -27,7 +27,7 @@ pub(super) fn test_metadata_with_permissions(
         file_attributes = wdk_sys::FILE_ATTRIBUTE_NORMAL;
     }
     Some(super::FileMetadata {
-        file_index: 1,
+        file_id: crate::metadata::WindowsFileId::from_u64(1).ok()?,
         kind,
         size: FileSize::from_bytes(0),
         allocation_size: FileAllocationSize::from_bytes(0),

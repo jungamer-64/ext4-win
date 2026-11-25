@@ -680,7 +680,7 @@ impl StreamSizeChangePlan {
             .remaining
             .iter()
             .enumerate()
-            .max_by_key(|(_index, lease)| lease.node.file_index())
+            .max_by_key(|(_index, lease)| lease.node.inode().as_u32())
             .map(|(index, _lease)| index)?;
         self.remaining.swap_remove(index)
     }

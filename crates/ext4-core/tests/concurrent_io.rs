@@ -1086,7 +1086,7 @@ fn attribute_value_inodes_replace_delete_and_preserve_inline_payload() -> Result
         assert_ne!(value_inode, 0);
         assert_eq!(
             fixture
-                .read(|pass| pass.load_node_by_file_index(value_inode))
+                .read(|pass| pass.load_inode_metadata(ext4_core::InodeId::try_from(value_inode)?))
                 .err(),
             Some(Error::InvalidInode)
         );
@@ -1587,7 +1587,7 @@ fn inline_directories_enumerate_move_grow_and_delete() -> Result<()> {
             &fixture.disk.filesystem,
             offset.checked_add(40).ok_or(Error::ArithmeticOverflow)?
         )?,
-        NodeId::Directory(other).file_index()
+        NodeId::Directory(other).inode().as_u32()
     );
     fixture.mutate(|pass| {
         let directory = pass.directory(directory)?;
@@ -1910,7 +1910,7 @@ fn ro_orphan_cleanup_uses_selected_persistence_and_physical_access() -> Result<(
                 .get_mut(1256..1260)
                 .ok_or(Error::DeviceRange)?
                 .iter_mut()
-                .zip(node.file_index().to_le_bytes())
+                .zip(node.inode().as_u32().to_le_bytes())
             {
                 *target = byte;
             }
@@ -3345,7 +3345,7 @@ impl Disk {
     /// # Errors
     /// Returns an invalid fixture layout or an out-of-range encoded field.
     fn encode_inode(&mut self, node: NodeId, flags: u32, context: Option<&[u8; 40]>) -> Result<()> {
-        self.encode_inode_number(node.file_index(), flags, context)
+        self.encode_inode_number(node.inode().as_u32(), flags, context)
     }
 
     /// Seals independently edited namespace or attribute inode fields.
@@ -5974,7 +5974,8 @@ fn fixture_inode_offset(disk: &Disk, node: NodeId) -> Result<usize> {
     let table = usize::try_from(fixture_u32(&disk.filesystem, 4104)?)
         .map_err(|_| Error::ArithmeticOverflow)?;
     let slot = usize::try_from(
-        node.file_index()
+        node.inode()
+            .as_u32()
             .checked_sub(1)
             .ok_or(Error::InvalidInode)?,
     )
@@ -6421,7 +6422,8 @@ fn persisted_metadata_checksums_precede_mount_authority() -> Result<()> {
         .ok_or(Error::ArithmeticOverflow)?;
     let slot = usize::try_from(
         NodeId::File(fixture.a)
-            .file_index()
+            .inode()
+            .as_u32()
             .checked_sub(1)
             .ok_or(Error::InvalidInode)?,
     )

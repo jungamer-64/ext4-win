@@ -176,7 +176,12 @@ fn identity_directory_records_preserve_exact_windows_layouts() {
     let Some(mut metadata) = metadata else {
         return;
     };
-    metadata.file_index = 0x1234_5678;
+    let file_id = crate::metadata::WindowsFileId::from_u64(0x0000_0009_1234_5678);
+    assert!(file_id.is_ok());
+    let Ok(file_id) = file_id else {
+        return;
+    };
+    metadata.file_id = file_id;
 
     for (class, name_offset, file_id_offset, file_id_width, reparse_offset, short_offset) in [
         (
@@ -251,10 +256,7 @@ fn identity_directory_records_preserve_exact_windows_layouts() {
             )
             .is_ok()
         );
-        assert_eq!(
-            le_u64(&buffer, file_id_offset),
-            Some(u64::from(metadata.file_index))
-        );
+        assert_eq!(le_u64(&buffer, file_id_offset), Some(0x0000_0009_1234_5678));
         if file_id_width == 16 {
             assert_eq!(
                 buffer.get(file_id_offset + 8..file_id_offset + 16),

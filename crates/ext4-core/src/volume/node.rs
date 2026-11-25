@@ -96,12 +96,6 @@ impl NodeId {
             Self::Symlink(symlink) => symlink.inode(),
         }
     }
-
-    /// Stable file index exposed to the Windows file-information boundary.
-    #[must_use]
-    pub const fn file_index(self) -> u32 {
-        self.inode().as_u32()
-    }
 }
 
 /// Complete live-inode metadata snapshot prepared from one coherent ext4 view.

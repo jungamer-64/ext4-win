@@ -1255,7 +1255,7 @@ impl HardLinkMutation {
         let source_parent = match &*opened_file.location() {
             OpenedLocation::DirectoryEntry { parent, .. } => *parent,
             OpenedLocation::Root => return Err(DriverError::FileIsDirectory),
-            OpenedLocation::FileReference => return Err(DriverError::NotSupported),
+            OpenedLocation::FileReference(_) => return Err(DriverError::NotSupported),
         };
         let input = active.buffered_input(stack.length())?;
         let target_collision = format.target_collision(input)?;
@@ -1696,7 +1696,7 @@ impl RenameMutation {
             OpenedLocation::Root => {
                 return Err(DriverError::from(ext4_core::Error::CannotRemoveRoot));
             }
-            OpenedLocation::FileReference => return Err(DriverError::NotSupported),
+            OpenedLocation::FileReference(_) => return Err(DriverError::NotSupported),
         };
         let input = active.buffered_input(stack.length())?;
         let target_collision = format.target_collision(input)?;

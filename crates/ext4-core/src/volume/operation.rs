@@ -74,11 +74,11 @@ pub trait CommittedReadPass {
     ///
     /// Returns an error when the inode cannot be read or does not describe a symbolic link.
     fn load_symlink(&mut self, id: SymlinkNodeId) -> Result<SymlinkNode>;
-    /// Loads and classifies one Windows-facing file index.
+    /// Reads complete metadata of one namespace inode whose node kind is not yet known.
     /// # Errors
     ///
-    /// Returns an error when the index is invalid or its inode cannot be loaded and classified.
-    fn load_node_by_file_index(&mut self, file_index: u32) -> Result<NodeId>;
+    /// Returns an error when the inode is not a live namespace inode or cannot be loaded.
+    fn load_inode_metadata(&mut self, inode: InodeId) -> Result<super::NodeMetadataSnapshot>;
     /// Reads every extended attribute attached to a typed node.
     /// # Errors
     ///
@@ -209,12 +209,12 @@ impl EpochReadPass<'_, '_, '_> {
         self.view.load_symlink(id)
     }
 
-    /// Loads and classifies one Windows-facing file index.
+    /// Reads complete metadata of one namespace inode whose node kind is not yet known.
     /// # Errors
     ///
-    /// Returns an error when the index does not identify a live inode.
-    pub fn load_node_by_file_index(&mut self, file_index: u32) -> Result<NodeId> {
-        self.view.load_node_by_file_index(file_index)
+    /// Returns an error when the inode does not identify a live namespace inode.
+    pub fn load_inode_metadata(&mut self, inode: InodeId) -> Result<super::NodeMetadataSnapshot> {
+        self.view.load_inode_metadata(inode)
     }
 
     /// Reads every extended attribute attached to one typed node.
@@ -313,8 +313,8 @@ impl CommittedReadPass for EpochReadPass<'_, '_, '_> {
         self.load_symlink(id)
     }
 
-    fn load_node_by_file_index(&mut self, file_index: u32) -> Result<NodeId> {
-        self.load_node_by_file_index(file_index)
+    fn load_inode_metadata(&mut self, inode: InodeId) -> Result<super::NodeMetadataSnapshot> {
+        self.load_inode_metadata(inode)
     }
 
     fn read_xattrs(&mut self, node: NodeId) -> Result<XattrSet> {

@@ -2327,7 +2327,11 @@ fn pending_file_deletion_requires_a_namespace_link() {
         Err(DriverError::CannotDelete)
     );
     assert_eq!(
-        super::PendingFileDeletion::try_from_disposition(&OpenedLocation::FileReference),
+        crate::metadata::WindowsFileId::from_u64(16).and_then(|file_id| {
+            super::PendingFileDeletion::try_from_disposition(&OpenedLocation::FileReference(
+                file_id,
+            ))
+        }),
         Err(DriverError::CannotDelete)
     );
 }
