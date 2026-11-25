@@ -41,10 +41,9 @@ pub(crate) struct MountedVolumeDeviceExtension {
     /// Timer DPC whose only effect is queueing the retirement work item.
     #[cfg(not(test))]
     retirement_dpc: UnsafeCell<wdk_sys::KDPC>,
-    /// Teardown awaiting the last native VPB reference. Only the retirement work item accesses
-    /// it, and each invocation is queued by the previous one's timer, so access is sequential.
+    /// Retirement transfers this slot exclusively through thread and work-item publication.
     #[cfg(not(test))]
-    pending_retirement: UnsafeCell<Option<PendingRetirement>>,
+    pending_retirement: UnsafeCell<Option<RetirementWork>>,
     /// Captured before actor publication; usable only under the header's live dispatch lease.
     storage: crate::kernel::stream::VolumeStorageAccess,
     /// PnP-only publication authority; storage workers retain only the narrower access view.
@@ -468,7 +467,9 @@ impl MountedVolumeDevice {
         };
         unsafe {
             // SAFETY: The caller owns this uninitialized field before publication.
-            pending.write(UnsafeCell::new(None));
+            pending.write(UnsafeCell::new(Some(RetirementWork::Start(
+                RetirementRetryDelay::FIRST,
+            ))));
         }
         unsafe {
             // SAFETY: The caller owns this uninitialized field before publication.
@@ -493,18 +494,9 @@ impl MountedVolumeDevice {
         }
     }
 
-    /// Advances physical retirement once; releases actor, VPB, and VCB resources only after the
-    /// original VPB's last native reference has drained.
-    ///
-    /// The first invocation joins the actor and withdraws routing. While I/O Manager references
-    /// remain, the teardown is parked in the extension and a one-shot timer re-queues the same
-    /// work item, so no system worker thread is held while references drain. Arming that timer
-    /// is this invocation's final access to the extension.
+    /// Starts retirement or polls its detached VPB after the blocking handoff finishes.
     /// # Safety
-    ///
-    /// The queued retirement work item must retain the device. Every FILE_OBJECT must have
-    /// completed Close; the first invocation drains dispatch and actor callbacks before any
-    /// resource is released.
+    /// The queued work item must retain this device and exclusively own the published stage.
     #[cfg(not(test))]
     #[expect(
         unsafe_code,
@@ -517,16 +509,29 @@ impl MountedVolumeDevice {
             extension.cast::<MountedVolumeDeviceExtension>().as_ref()
         }
         .unwrap_or_else(|| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
-        let parked = unsafe {
-            // SAFETY: Only the sequential retirement work-item invocations access this slot.
-            &mut *extension.pending_retirement.get()
+        let work = unsafe {
+            // SAFETY: Queue publication transferred this sole stage to the callback.
+            (&mut *extension.pending_retirement.get()).take()
         }
-        .take();
-        let resumed = parked.is_some();
-        let pending = parked.unwrap_or_else(|| unsafe {
-            // SAFETY: This first invocation uniquely owns terminal teardown of the joined actor.
-            Self::begin_release(device, extension)
-        });
+        .unwrap_or_else(|| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
+        let pending = match work {
+            RetirementWork::Start(retry) => {
+                let started = unsafe {
+                    // SAFETY: The work item pins the device until the newly created thread takes
+                    // its own reference. Starting it transfers exclusive first-stage ownership.
+                    crate::kernel::volume_verify::start_verification_thread(
+                        device,
+                        Some(begin_volume_retirement),
+                        device.as_ptr().cast(),
+                    )
+                };
+                if started.is_err() {
+                    Self::retry_retirement(extension, RetirementWork::Start(retry.next()), retry);
+                }
+                return RetirementStep::Retained;
+            }
+            RetirementWork::Finish(pending) => pending,
+        };
         let PendingRetirement {
             vpb,
             binding,
@@ -548,7 +553,7 @@ impl MountedVolumeDevice {
                     STATUS_SUCCESS,
                     OperationalOutcome::Completed,
                 );
-                RetirementStep::Released { resumed }
+                RetirementStep::Released
             }
             Err((retained, references)) => {
                 if reported != Some(references) {
@@ -557,39 +562,52 @@ impl MountedVolumeDevice {
                 if reported.is_none() {
                     trace.record_status(OperationalPath::VpbRetirement, wdk_sys::STATUS_PENDING);
                 }
-                unsafe {
-                    // SAFETY: The slot was emptied above and no other invocation is queued.
-                    *extension.pending_retirement.get() = Some(PendingRetirement {
-                        vpb: retained,
-                        binding,
-                        reported: Some(references),
-                        retry: retry.next(),
-                    });
-                }
-                let timer = extension.retirement_timer.get();
-                let dpc = extension.retirement_dpc.get();
-                let already_armed = unsafe {
-                    // SAFETY: The idle one-shot timer and its DPC live in the retained extension.
-                    // Once set, the DPC may start the next invocation; nothing below touches it.
-                    ffi::KeSetTimer(
-                        timer,
-                        LARGE_INTEGER {
-                            QuadPart: retry.relative_due_time(),
-                        },
-                        dpc,
-                    )
-                };
-                if already_armed != 0 {
-                    KernelWideInconsistency::mounted_volume_state_corruption().bugcheck();
-                }
+                let work = RetirementWork::Finish(PendingRetirement {
+                    vpb: retained,
+                    binding,
+                    reported: Some(references),
+                    retry: retry.next(),
+                });
+                Self::retry_retirement(extension, work, retry);
                 RetirementStep::Retained
             }
         }
     }
 
-    /// Joins the actor and closes future routing for the first retirement invocation.
+    /// Parks the stage before the timer transfers it to the next work-item invocation.
+    #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "the dequeued work item owns the stage and idle timer"
+    )]
+    fn retry_retirement(
+        extension: &MountedVolumeDeviceExtension,
+        work: RetirementWork,
+        retry: RetirementRetryDelay,
+    ) {
+        unsafe {
+            // SAFETY: The current work item consumed the previous stage; no successor is queued.
+            *extension.pending_retirement.get() = Some(work);
+        }
+        let already_armed = unsafe {
+            // SAFETY: The retained extension owns the idle timer and DPC through publication.
+            // No subsequent code accesses the extension after the timer can queue its successor.
+            ffi::KeSetTimer(
+                extension.retirement_timer.get(),
+                LARGE_INTEGER {
+                    QuadPart: retry.relative_due_time(),
+                },
+                extension.retirement_dpc.get(),
+            )
+        };
+        if already_armed != 0 {
+            KernelWideInconsistency::mounted_volume_state_corruption().bugcheck();
+        }
+    }
+
+    /// Joins the actor and closes future routing on the dedicated retirement thread.
     /// # Safety
-    /// The caller must be the first retirement work-item invocation for this mounted extension.
+    /// The caller must own the mounted device's unique first retirement stage.
     #[cfg(not(test))]
     #[expect(
         unsafe_code,
@@ -1577,7 +1595,40 @@ impl Drop for VpbSpinLock {
     }
 }
 
-/// PASSIVE_LEVEL work-item callback that joins the retiring actor and deletes its device.
+/// Runs the blocking actor drain and I/O Manager join on a device-referenced thread.
+/// # Safety
+/// `context` must be the mounted device whose unique start stage was transferred to this thread.
+#[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "the I/O Manager pins the retiring device until this routine returns"
+)]
+unsafe extern "C" fn begin_volume_retirement(context: wdk_sys::PVOID) {
+    let device = unsafe {
+        // SAFETY: Successful thread creation holds the native reference on this mounted device.
+        KernelDevice::from_raw(context.cast())
+    }
+    .unwrap_or_else(|| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
+    let extension = unsafe {
+        // SAFETY: This is the retained device's mounted extension, initialized before scheduling.
+        device
+            .extension_address()
+            .cast::<MountedVolumeDeviceExtension>()
+            .as_ref()
+    }
+    .unwrap_or_else(|| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
+    let pending = unsafe {
+        // SAFETY: This is the unique retirement owner until it publishes the detached VPB.
+        MountedVolumeDevice::begin_release(device, extension)
+    };
+    unsafe {
+        // SAFETY: The work item transferred its consumed start stage to this thread.
+        *extension.pending_retirement.get() = Some(RetirementWork::Finish(pending));
+    }
+    queue_retirement_work_item(MountedVolumeDevice::retirement_work_item(device));
+}
+
+/// PASSIVE_LEVEL work-item callback that advances retirement and deletes the drained device.
 /// # Safety
 ///
 /// `device` and `context` must be the unique pair queued by
@@ -1604,16 +1655,13 @@ unsafe extern "C" fn mounted_volume_retirement(device: PDEVICE_OBJECT, context: 
         // actor, and either parks the teardown or destroys extension-owned resources.
         MountedVolumeDevice::advance_release(device)
     };
-    let RetirementStep::Released { resumed } = step else {
-        // The retry timer now owns the next invocation; this one must not touch the extension.
+    let RetirementStep::Released = step else {
         return;
     };
-    if resumed {
-        unsafe {
-            // SAFETY: PASSIVE_LEVEL wait until the DPC that queued this invocation has returned,
-            // so no DPC executes against the extension storage freed by device deletion.
-            ffi::KeFlushQueuedDpcs();
-        }
+    unsafe {
+        // SAFETY: A prior retry timer may still be returning from its final queue publication.
+        // Drain that DPC before deleting the extension containing its storage.
+        ffi::KeFlushQueuedDpcs();
     }
     unsafe {
         // SAFETY: All extension resources are gone and the work item still pins this device.
@@ -1766,16 +1814,22 @@ struct PendingRetirement {
     retry: RetirementRetryDelay,
 }
 
+/// Exclusive retirement stage passed between the work item and the blocking producer.
+#[cfg(not(test))]
+enum RetirementWork {
+    /// Start the dedicated thread, retaining backoff on thread-creation failure.
+    Start(RetirementRetryDelay),
+    /// Actor and native verify joined. Poll the detached VPB's remaining references.
+    Finish(PendingRetirement),
+}
+
 /// Outcome of one retirement work-item invocation.
 #[cfg(not(test))]
 enum RetirementStep {
-    /// Native references remain; the armed timer owns the next invocation.
+    /// The thread or timer owns the next invocation.
     Retained,
     /// Extension resources are released and the device may be deleted.
-    Released {
-        /// A timer DPC queued this invocation and must be flushed before deletion.
-        resumed: bool,
-    },
+    Released,
 }
 
 /// Queues one retirement invocation; the I/O Manager pins the device until its callback returns.
