@@ -856,52 +856,6 @@ struct PoolVpb {
 }
 
 impl PoolVpb {
-    /// Prepares one initialized replacement before any mount or dismount publication.
-    /// # Errors
-    /// Returns allocation failure or an unrepresentable native VPB layout.
-    #[cfg_attr(
-        not(test),
-        expect(
-            unsafe_code,
-            reason = "the unpublished native allocation is initialized once and transfers only through the VPB lock boundary"
-        )
-    )]
-    fn try_new() -> DriverResult<Self> {
-        let value = wdk_sys::VPB {
-            Type: wdk_sys::IO_TYPE_VPB
-                .try_into()
-                .map_err(|_| DriverError::InvalidParameter)?,
-            Size: core::mem::size_of::<wdk_sys::VPB>()
-                .try_into()
-                .map_err(|_| DriverError::InvalidParameter)?,
-            ..Default::default()
-        };
-        #[cfg(not(test))]
-        let allocation = {
-            let storage = unsafe {
-                // SAFETY: Nonzero native VPB size and tag request nonpaged, non-executable pool.
-                wdk_sys::ntddk::ExAllocatePool2(
-                    wdk_sys::POOL_FLAG_NON_PAGED,
-                    core::mem::size_of::<wdk_sys::VPB>()
-                        .try_into()
-                        .map_err(|_| DriverError::InvalidParameter)?,
-                    u32::from_le_bytes(*b"E4vp"),
-                )
-            };
-            let allocation = NonNull::new(storage.cast::<wdk_sys::VPB>())
-                .ok_or(DriverError::InsufficientResources)?;
-            unsafe {
-                // SAFETY: The allocation is exclusive, aligned native storage of exactly VPB size.
-                allocation.as_ptr().write(value);
-            }
-            allocation
-        };
-        #[cfg(test)]
-        let allocation = NonNull::new(Box::into_raw(memory::boxed_try_with(|| Ok(value))?))
-            .ok_or(DriverError::InternalInvariantViolation)?;
-        Ok(Self { allocation })
-    }
-
     /// Transfers destruction to the current native device association.
     fn into_raw(self) -> NonNull<wdk_sys::VPB> {
         core::mem::ManuallyDrop::new(self).allocation
