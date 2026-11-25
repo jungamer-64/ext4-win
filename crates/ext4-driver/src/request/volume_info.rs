@@ -268,24 +268,7 @@ pub(crate) fn set(
     mutation: &mut DriverMutationPass<'_, '_, '_>,
 ) -> DriverResult<SetVolumeResolution> {
     let (device, label) = request.with_active(|active| {
-        let current = active.current_stack()?;
-        let opened = OpenedVolume::decode(current.file_object()?).map_err(|error| match error {
-            DriverError::ObjectTypeMismatch => DriverError::AccessDenied,
-            error => error,
-        })?;
-        if !operations.owns_volume(opened.volume()) {
-            return Err(DriverError::InvalidDeviceRequest);
-        }
-        operations.authorize_handle(opened.file_object())?;
-        opened.require_data_write()?;
-        let stack = current.set_volume()?;
-        let label = match stack.information_class() {
-            SetVolumeInformationClass::Label => {
-                let input = active.buffered_input(stack.length())?;
-                volume_label_from_file_fs_label(input)?
-            }
-        };
-        Ok::<_, DriverError>((active.device(), label))
+        prepare_label_change(active, operations).map(|label| (active.device(), label))
     })?;
     if operations.volume_identity().label() == label {
         return Ok(SetVolumeResolution::Complete(IrpCompletion::EMPTY));
@@ -295,6 +278,31 @@ pub(crate) fn set(
     Ok(SetVolumeResolution::Mutation(
         PreparedVolumeLabelPublication { publication },
     ))
+}
+
+/// Authorizes the direct-volume handle before interpreting any label bytes.
+/// # Errors
+/// Returns a handle, mount admission, write access or native input failure.
+fn prepare_label_change(
+    active: &crate::irp::ActiveIrp<'_>,
+    operations: &MountedVolumeAccess<'_>,
+) -> DriverResult<Ext4VolumeLabel> {
+    let current = active.current_stack()?;
+    let opened = OpenedVolume::decode(current.file_object()?).map_err(|error| match error {
+        DriverError::ObjectTypeMismatch => DriverError::AccessDenied,
+        error => error,
+    })?;
+    if !operations.owns_volume(opened.volume()) {
+        return Err(DriverError::InvalidDeviceRequest);
+    }
+    operations.authorize_handle(opened.file_object())?;
+    opened.require_data_write()?;
+    let stack = current.set_volume()?;
+    match stack.information_class() {
+        SetVolumeInformationClass::Label => {
+            volume_label_from_file_fs_label(active.buffered_input(stack.length())?)
+        }
+    }
 }
 
 /// Result of one restartable volume-label resolve pass.
@@ -716,10 +724,10 @@ mod tests {
         ))
     }
 
-    /// Obtains volume geometry through the production mount boundary of the external fixture.
+    /// Mounts the independent filesystem fixture using the ordinary read-only path.
     /// # Errors
-    /// Returns read-only mount, storage or geometry validation failure.
-    fn fixture_geometry(filesystem: &[u8]) -> Result<ext4_core::VolumeGeometry, DriverError> {
+    /// Returns read-only mount or storage validation failure.
+    fn mount_fixture(filesystem: &[u8]) -> Result<Box<ext4_core::CompletedMount>, DriverError> {
         use ext4_core::*;
         let length = DeviceLength::from_bytes(
             u64::try_from(filesystem.len()).map_err(|_| DriverError::InvalidParameter)?,
@@ -753,12 +761,106 @@ mod tests {
                     OperationEvent::StorageCompleted(complete_geometry_read(request, filesystem)?),
                     now,
                 ),
-                MountTransition::Complete(result) => {
-                    return Ok(result.map_err(DriverError::from)?.into_parts().1.geometry());
-                }
+                MountTransition::Complete(result) => return result.map_err(DriverError::from),
                 _ => return Err(DriverError::InternalInvariantViolation),
             };
         }
+    }
+
+    /// # Errors
+    /// Returns mount-fixture or native request construction failure.
+    /// # Panics
+    /// Fails if a label request interprets input before checking the open and its granted access.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the native fixtures and pinned volume outlive each synchronous IRP view"
+    )]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fallible native fixtures surround volume-label admission assertions"
+    )]
+    fn label_change_requires_a_writable_direct_volume_open() -> Result<(), DriverError> {
+        use crate::kernel::storage::{LowerStorageDevice, MountedStorage};
+        use crate::state::{
+            KernelDevice, MountedVolumeBinding, OpenedVolumeHandle, RawVolumeAccess,
+        };
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/xtask/fixtures/journal/external-4k-v3-64.filesystem.img");
+        let filesystem = std::fs::read(path).map_err(|_| DriverError::InvalidParameter)?;
+        let mut device = wdk_sys::DEVICE_OBJECT {
+            SectorSize: 512,
+            Flags: wdk_sys::DO_DIRECT_IO,
+            ..Default::default()
+        };
+        // SAFETY: The local device outlives the mounted binding and every request using it.
+        let target = unsafe { KernelDevice::from_raw(&raw mut device) }
+            .ok_or(DriverError::InvalidParameter)?;
+        let length = ext4_core::DeviceLength::from_bytes(
+            u64::try_from(filesystem.len()).map_err(|_| DriverError::InvalidParameter)?,
+        );
+        let mut catalog = crate::identity::IdentityCatalog::empty();
+        let mut binding = MountedVolumeBinding::from_completed_mount(
+            *mount_fixture(&filesystem)?,
+            MountedStorage::primary(target, LowerStorageDevice::from_device(target, length)?),
+            crate::kernel::operational_trace::OperationalTrace::host_test(),
+            catalog.directory_mut(),
+        )?;
+        binding.with_access(|access| {
+            let owner = access.file_object_owner();
+            // SAFETY: The mounted access retains this exact pinned volume and its stream.
+            let volume = unsafe { owner.as_ref() };
+            let mut input = label_information_bytes(b"EXT4");
+            let label = Ext4VolumeLabel::new(b"EXT4")?;
+            for (flags, rights, expected) in [
+                (0, RawVolumeAccess::Write, Err(DriverError::AccessDenied)),
+                (
+                    wdk_sys::FO_VOLUME_OPEN,
+                    RawVolumeAccess::Read,
+                    Err(DriverError::AccessDenied),
+                ),
+                (wdk_sys::FO_VOLUME_OPEN, RawVolumeAccess::Write, Ok(label)),
+            ] {
+                let mut handle = OpenedVolumeHandle::new(rights);
+                let mut file = wdk_sys::FILE_OBJECT {
+                    FsContext: volume.stream_header().as_ptr(),
+                    FsContext2: (&raw mut handle).cast(),
+                    SectionObjectPointer: volume.stream_section_objects()?.as_ptr(),
+                    Flags: flags,
+                    ..Default::default()
+                };
+                let mut stack = wdk_sys::IO_STACK_LOCATION {
+                    MajorFunction: wdk_sys::IRP_MJ_SET_VOLUME_INFORMATION
+                        .try_into()
+                        .map_err(|_| DriverError::InvalidParameter)?,
+                    FileObject: &raw mut file,
+                    ..Default::default()
+                };
+                stack.Parameters.SetVolume =
+                    wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_14 {
+                        Length: u32::try_from(input.len())
+                            .map_err(|_| DriverError::InvalidParameter)?,
+                        FsInformationClass: wdk_sys::_FSINFOCLASS::FileFsLabelInformation,
+                        ..Default::default()
+                    };
+                let mut irp = wdk_sys::IRP::default();
+                irp.AssociatedIrp.SystemBuffer = input.as_mut_ptr().cast();
+                irp.Tail
+                    .Overlay
+                    .__bindgen_anon_2
+                    .__bindgen_anon_1
+                    .CurrentStackLocation = &raw mut stack;
+                // SAFETY: The IRP, FILE_OBJECT, buffer and native stack remain live for the test.
+                let mut received =
+                    unsafe { crate::irp::ReceivedIrp::decode(target.as_ptr(), &raw mut irp) }?;
+                assert_eq!(
+                    received.with_active(|active| super::prepare_label_change(active, access)),
+                    expected
+                );
+            }
+            Ok(())
+        })
     }
 
     /// # Errors
@@ -784,7 +886,7 @@ mod tests {
             .checked_sub(reserved)
             .ok_or(DriverError::InvalidParameter)?;
         assert!(reserved > 0);
-        let geometry = fixture_geometry(&filesystem)?;
+        let geometry = mount_fixture(&filesystem)?.into_parts().1.geometry();
         assert_eq!(geometry.cluster_size().bytes(), 4096);
         let sector = crate::state::TransferSectorSize::from_bytes(512)?;
         let mut size = [0xA5; 24];
