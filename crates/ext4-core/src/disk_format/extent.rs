@@ -818,6 +818,64 @@ struct PendingExtentNode {
     block: BlockAddress,
     /// Depth required by the parent index entry.
     expected_depth: u16,
+    /// Logical interval the parent index routes to this child.
+    route: NodeRoute,
+}
+
+/// Logical-block interval that the parent index routes to one extent-tree node.
+///
+/// Lookup descends through the last index entry whose `ei_block` does not exceed the target,
+/// so a child is reachable only for `[ei_block, next ei_block)`, bounded by its own parent. A
+/// node whose entries leave that interval, or whose first entry does not begin at `ei_block`,
+/// maps blocks differently from routed lookup and is malformed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct NodeRoute {
+    /// Required first entry key; the inode root has none.
+    start: Option<u32>,
+    /// Exclusive logical end inherited from the next sibling or an ancestor.
+    end: u64,
+}
+
+impl NodeRoute {
+    /// The inode-resident root covers every payload block.
+    pub(super) const ROOT: Self = Self {
+        start: None,
+        end: LOGICAL_BLOCK_EXCLUSIVE_END,
+    };
+
+    /// Interval routed by an index entry keyed at `start`.
+    pub(super) const fn indexed(start: u32, end: u64) -> Self {
+        Self {
+            start: Some(start),
+            end,
+        }
+    }
+
+    /// Exclusive logical end of this interval.
+    pub(super) const fn end(self) -> u64 {
+        self.end
+    }
+
+    /// Interval of the child selected by entry `index` of an index node already validated
+    /// against this route.
+    /// # Errors
+    /// Returns an error when `index` is not a live entry.
+    pub(super) fn child(self, raw: &[u8], index: usize) -> Result<Self> {
+        let entries = header_entries(raw)?;
+        if index >= entries {
+            return Err(Error::InvalidExtentTree);
+        }
+        let next = index.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+        let end = if next < entries {
+            u64::from(le_u32(raw, disk_offset(entry_offset(next)?))?)
+        } else {
+            self.end
+        };
+        Ok(Self::indexed(
+            le_u32(raw, disk_offset(entry_offset(index)?))?,
+            end,
+        ))
+    }
 }
 
 /// Walks an extent node and all index children, collecting leaf extents.
@@ -833,12 +891,14 @@ fn load_external_extent_nodes(
     extents: &mut Vec<Extent>,
     metadata_blocks: &mut Vec<BlockAddress>,
 ) -> Result<()> {
-    let depth = parse_node(raw, None, |extent| extents.try_push(extent))?;
+    let depth = parse_node(raw, None, NodeRoute::ROOT, |extent| {
+        extents.try_push(extent)
+    })?;
     if depth == 0 {
         return Ok(());
     }
     let mut pending = Vec::new();
-    push_index_children(raw, depth, &mut pending)?;
+    push_index_children(raw, depth, NodeRoute::ROOT, &mut pending)?;
     while let Some(child) = pending.pop() {
         if metadata_blocks.contains(&child.block) {
             return Err(Error::InvalidExtentTree);
@@ -850,56 +910,80 @@ fn load_external_extent_nodes(
         )?;
         reader.read_extent_bytes(block_size.offset_of(child.block)?, &mut bytes)?;
         verify_external_extent_block_checksum(context, bytes.as_slice())?;
-        let child_depth = parse_node(bytes.as_slice(), Some(child.expected_depth), |extent| {
-            extents.try_push(extent)
-        })?;
+        let child_depth = parse_node(
+            bytes.as_slice(),
+            Some(child.expected_depth),
+            child.route,
+            |extent| extents.try_push(extent),
+        )?;
         if child_depth > 0 {
-            push_index_children(bytes.as_slice(), child_depth, &mut pending)?;
+            push_index_children(bytes.as_slice(), child_depth, child.route, &mut pending)?;
         }
     }
     Ok(())
 }
 
-/// Pushes an index node's children in reverse so stack traversal preserves disk order.
+/// Pushes a validated index node's children in reverse so stack traversal preserves disk order.
 /// # Errors
 ///
-/// Returns an error when an index entry is truncated or its parent depth cannot select a child.
-fn push_index_children(raw: &[u8], depth: u16, pending: &mut Vec<PendingExtentNode>) -> Result<()> {
+/// Returns an error when an index entry is truncated, its child pointer is zero, or its parent
+/// depth cannot select a child.
+fn push_index_children(
+    raw: &[u8],
+    depth: u16,
+    route: NodeRoute,
+    pending: &mut Vec<PendingExtentNode>,
+) -> Result<()> {
     let entries = header_entries(raw)?;
     let expected_depth = depth.checked_sub(1).ok_or(Error::InvalidExtentTree)?;
     for entry_index in (0..entries).rev() {
-        let offset = entry_offset(entry_index)?;
-        let end = offset
-            .checked_add(EXTENT_ENTRY_SIZE)
-            .ok_or(Error::ArithmeticOverflow)?;
-        if end > raw.len() {
-            return Err(Error::InvalidExtentTree);
-        }
-        let leaf_lo = u64::from(le_u32(
-            raw,
-            disk_offset(offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?),
-        )?);
-        let leaf_hi = u64::from(le_u16(
-            raw,
-            disk_offset(offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?),
-        )?);
-        let leaf = BlockAddress::new((leaf_hi << 32) | leaf_lo);
         pending.try_push(PendingExtentNode {
-            block: leaf,
+            block: index_child(raw, entry_index)?,
             expected_depth,
+            route: route.child(raw, entry_index)?,
         })?;
     }
     Ok(())
 }
 
-/// Parses one extent tree node, delivering leaf entries directly to their consumer.
+/// Reads one index entry's external child block.
+/// # Errors
+/// Rejects a missing entry, a truncated address, or the zero block.
+pub(super) fn index_child(raw: &[u8], index: usize) -> Result<BlockAddress> {
+    if index >= header_entries(raw)? {
+        return Err(Error::InvalidExtentTree);
+    }
+    let offset = entry_offset(index)?;
+    let low = u64::from(le_u32(
+        raw,
+        disk_offset(offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?),
+    )?);
+    let high = u64::from(le_u16(
+        raw,
+        disk_offset(offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?),
+    )?);
+    let block = BlockAddress::new((high << 32) | low);
+    if block.get() == 0 {
+        return Err(Error::InvalidExtentTree);
+    }
+    Ok(block)
+}
+
+/// Parses one extent tree node against the interval its parent routes to it, delivering leaf
+/// entries directly to their consumer.
+///
+/// Capacity is the number of entries the node storage holds: four in the inode root and
+/// `(block - header) / entry` in an external block. Entries are ordered without overlap and
+/// lie in the routed interval, and a non-root node begins exactly at its index key.
 /// # Errors
 ///
-/// Returns an error when the header magic is wrong, the depth or entry count is unsupported, the
-/// expected depth does not match, or a leaf entry is truncated or invalid.
+/// Returns an error when the header magic is wrong, the depth is unsupported or differs from the
+/// parent, the capacity or entry count is outside the node, an index node is empty, entries are
+/// unordered or leave the routed interval, or a leaf entry is invalid.
 fn parse_node(
     raw: &[u8],
     expected_depth: Option<u16>,
+    route: NodeRoute,
     mut visit: impl FnMut(Extent) -> Result<()>,
 ) -> Result<u16> {
     if le_u16(raw, disk_offset(0))? != EXTENT_MAGIC {
@@ -916,21 +1000,41 @@ fn parse_node(
     {
         return Err(Error::InvalidExtentTree);
     }
-    if entries > max_entries {
+    let capacity = raw
+        .len()
+        .checked_sub(EXTENT_HEADER_SIZE)
+        .ok_or(Error::InvalidExtentTree)?
+        .checked_div(EXTENT_ENTRY_SIZE)
+        .ok_or(Error::ArithmeticOverflow)?;
+    if max_entries == 0 || max_entries > capacity || entries > max_entries {
         return Err(Error::InvalidExtentTree);
     }
-    if depth != 0 {
-        return Ok(depth);
+    if depth != 0 && entries == 0 {
+        return Err(Error::InvalidExtentTree);
     }
+    // First logical block the next entry may claim.
+    let mut admissible = route.start.map_or(0, u64::from);
     for entry_index in 0..entries {
         let offset = entry_offset(entry_index)?;
-        let end = offset
-            .checked_add(EXTENT_ENTRY_SIZE)
-            .ok_or(Error::ArithmeticOverflow)?;
-        if end > raw.len() {
+        let start = le_u32(raw, disk_offset(offset))?;
+        if entry_index == 0 && route.start.is_some_and(|required| required != start) {
             return Err(Error::InvalidExtentTree);
         }
-        visit(parse_extent(raw, offset)?)?;
+        if u64::from(start) < admissible || u64::from(start) >= route.end {
+            return Err(Error::InvalidExtentTree);
+        }
+        if depth == 0 {
+            let extent = parse_extent(raw, offset)?;
+            if extent.end_logical() > route.end {
+                return Err(Error::InvalidExtentTree);
+            }
+            admissible = extent.end_logical();
+            visit(extent)?;
+        } else {
+            admissible = u64::from(start)
+                .checked_add(1)
+                .ok_or(Error::ArithmeticOverflow)?;
+        }
     }
     Ok(depth)
 }
@@ -1390,8 +1494,169 @@ mod tests {
         parse_extent_length, refresh_external_extent_block_checksum,
         verify_external_extent_block_checksum,
     };
-    use crate::disk_format::inode::InodeId;
+    use crate::disk::block::{BlockAddress, BlockSize, ByteOffset};
+    use crate::disk::endian::{put_le_u16, put_le_u32};
+    use crate::disk_format::inode::{InodeExtentRoot, InodeId};
     use crate::error::Error;
+
+    /// Independently encoded 1 KiB external leaves at blocks 10 and 11.
+    struct ExternalNodes {
+        /// Block 10.
+        left: [u8; 1024],
+        /// Block 11.
+        right: [u8; 1024],
+    }
+
+    impl super::ExtentNodeReader for ExternalNodes {
+        fn read_extent_bytes(&mut self, offset: ByteOffset, out: &mut [u8]) -> crate::Result<()> {
+            match offset.get() {
+                10_240 => crate::memory::copy_exact(out, &self.left),
+                11_264 => crate::memory::copy_exact(out, &self.right),
+                _ => Err(Error::DeviceIo),
+            }
+        }
+    }
+
+    /// Writes `eh_magic`, `eh_entries`, `eh_max` and `eh_depth`.
+    /// # Errors
+    /// Returns an error when the header does not fit in `raw`.
+    fn put_header(raw: &mut [u8], entries: u16, max: u16, depth: u16) -> crate::Result<()> {
+        put_le_u16(raw, super::disk_offset(0), 0xf30a)?;
+        put_le_u16(raw, super::disk_offset(2), entries)?;
+        put_le_u16(raw, super::disk_offset(4), max)?;
+        put_le_u16(raw, super::disk_offset(6), depth)
+    }
+
+    /// Writes an initialized leaf entry: `ee_block`, `ee_len`, `ee_start_hi` zero, `ee_start_lo`.
+    /// # Errors
+    /// Returns an error when the entry does not fit in `raw`.
+    fn put_leaf(
+        raw: &mut [u8],
+        index: usize,
+        logical: u32,
+        len: u16,
+        physical: u32,
+    ) -> crate::Result<()> {
+        let offset = super::disk_offset(super::entry_offset(index)?);
+        put_le_u32(raw, offset, logical)?;
+        put_le_u16(raw, offset.checked_add_bytes(4)?, len)?;
+        put_le_u32(raw, offset.checked_add_bytes(8)?, physical)
+    }
+
+    /// Writes an index entry: `ei_block`, then `ei_leaf_lo` with a zero high half.
+    /// # Errors
+    /// Returns an error when the entry does not fit in `raw`.
+    fn put_index(raw: &mut [u8], index: usize, logical: u32, child: u32) -> crate::Result<()> {
+        let offset = super::disk_offset(super::entry_offset(index)?);
+        put_le_u32(raw, offset, logical)?;
+        put_le_u32(raw, offset.checked_add_bytes(4)?, child)
+    }
+
+    /// A depth-one tree routing `[0, 50)` to block 10 and `[50, end)` to block 11.
+    /// # Errors
+    /// Returns fixture encoding failures.
+    fn routed_tree() -> crate::Result<([u8; 60], ExternalNodes)> {
+        let mut root = [0_u8; 60];
+        put_header(&mut root, 2, 4, 1)?;
+        put_index(&mut root, 0, 0, 10)?;
+        put_index(&mut root, 1, 50, 11)?;
+        let mut left = [0_u8; 1024];
+        put_header(&mut left, 1, 84, 0)?;
+        put_leaf(&mut left, 0, 0, 5, 100)?;
+        let mut right = [0_u8; 1024];
+        put_header(&mut right, 1, 84, 0)?;
+        put_leaf(&mut right, 0, 50, 5, 200)?;
+        Ok((root, ExternalNodes { left, right }))
+    }
+
+    /// Loads `root` through the allocation walk and the whole-tree reader.
+    fn load_both(
+        root: [u8; 60],
+        block_size: BlockSize,
+        mut nodes: ExternalNodes,
+    ) -> (crate::Result<()>, crate::Result<super::ExtentTree>) {
+        let root = InodeExtentRoot::from_bytes(root);
+        let walked = super::visit_allocations(
+            &root,
+            block_size,
+            &mut nodes,
+            ExtentTreeContext::none(),
+            |_| Ok(()),
+        );
+        let loaded = super::ExtentTree::load_inode_tree(
+            &root,
+            block_size,
+            &mut nodes,
+            ExtentTreeContext::none(),
+        );
+        (walked, loaded)
+    }
+
+    /// # Errors
+    /// Returns fixture encoding failures.
+    /// # Panics
+    /// Fails if a node whose entries disagree with its routed `ei_block` interval, or whose
+    /// header exceeds node capacity, is admitted.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fixture encoding is fallible; assertions compare admission outcomes"
+    )]
+    fn extent_nodes_must_match_their_routed_interval() -> crate::Result<()> {
+        let block_size = BlockSize::from_superblock_log(0)?;
+        let (root, nodes) = routed_tree()?;
+        let (walked, loaded) = load_both(root, block_size, nodes);
+        assert_eq!(walked, Ok(()));
+        let tree = loaded?;
+        assert_eq!(
+            super::map_extents(tree.extents(), super::LogicalBlock::from_u32(52)),
+            super::BlockMapping::Physical(BlockAddress::new(202))
+        );
+        assert_eq!(
+            super::map_extents(tree.extents(), super::LogicalBlock::from_u32(7)),
+            super::BlockMapping::Hole
+        );
+
+        type Corruption = fn(&mut [u8; 60], &mut [u8; 1024], &mut [u8; 1024]) -> crate::Result<()>;
+        let corruptions: [(&str, Corruption); 9] = [
+            ("children swapped across routes", |_, left, right| {
+                put_leaf(left, 0, 100, 5, 100)?;
+                put_leaf(right, 0, 0, 5, 200)
+            }),
+            ("child begins after its key", |_, left, _| {
+                put_leaf(left, 0, 1, 5, 100)
+            }),
+            ("child crosses the next key", |_, left, _| {
+                put_leaf(left, 0, 0, 51, 100)
+            }),
+            ("overlapping leaf entries", |_, _, right| {
+                put_header(right, 2, 84, 0)?;
+                put_leaf(right, 1, 54, 3, 300)
+            }),
+            ("repeated index key", |root, _, right| {
+                put_index(root, 1, 0, 11)?;
+                put_leaf(right, 0, 0, 5, 200)
+            }),
+            ("empty index node", |root, _, _| put_header(root, 0, 4, 1)),
+            ("root capacity above four", |root, _, _| {
+                put_header(root, 2, 5, 1)
+            }),
+            ("zero external capacity", |_, left, _| {
+                put_header(left, 0, 0, 0)
+            }),
+            ("external capacity above block", |_, left, _| {
+                put_header(left, 1, 85, 0)
+            }),
+        ];
+        for (case, corrupt) in corruptions {
+            let (mut root, mut nodes) = routed_tree()?;
+            corrupt(&mut root, &mut nodes.left, &mut nodes.right)?;
+            let (walked, loaded) = load_both(root, block_size, nodes);
+            assert_eq!(walked, Err(Error::InvalidExtentTree), "{case}");
+            assert_eq!(loaded.err(), Some(Error::InvalidExtentTree), "{case}");
+        }
+        Ok(())
+    }
 
     /// # Errors
     /// Returns fixed extent-vector decoding or allocation failure.

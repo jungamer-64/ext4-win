@@ -17,75 +17,33 @@ struct PathNode {
     block: Option<BlockAddress>,
     /// Complete on-disk node image.
     bytes: Vec<u8>,
+    /// Logical interval the parent routes to this node.
+    route: NodeRoute,
     /// Next entry for bounded depth-first traversal.
     next: usize,
 }
 
 impl PathNode {
-    /// Checks entry capacity, local ordering, and depth before interpreting an entry.
+    /// Checks capacity, depth, ordering and the routed interval before interpreting an entry.
     /// # Errors
-    /// Returns an error for malformed node geometry, entries, or child pointers.
+    /// Returns an error for malformed node geometry, entries, or routing.
     fn validate(&self, expected: Option<u16>) -> Result<u16> {
-        validate_path_node(&self.bytes, expected)
+        parse_node(&self.bytes, expected, self.route, |_extent| Ok(()))
     }
 
     /// Reads a validated index entry's external block address.
     /// # Errors
     /// Returns an error for an absent entry or zero pointer.
     fn child(&self, index: usize) -> Result<BlockAddress> {
-        path_node_child(&self.bytes, index)
+        index_child(&self.bytes, index)
     }
-}
 
-/// Checks fixed and external node images without allocating a throwaway extent list.
-/// # Errors
-/// Rejects malformed capacity, depth, ordering or encoded leaf entries.
-fn validate_path_node(bytes: &[u8], expected: Option<u16>) -> Result<u16> {
-    let depth = parse_node(bytes, expected, |_extent| Ok(()))?;
-    let capacity = usize::from(le_u16(bytes, disk_offset(4))?);
-    let available = bytes
-        .len()
-        .checked_sub(EXTENT_HEADER_SIZE)
-        .ok_or(Error::InvalidExtentTree)?;
-    if capacity == 0 || capacity > available / EXTENT_ENTRY_SIZE {
-        return Err(Error::InvalidExtentTree);
+    /// Interval routed to the child of a validated index entry.
+    /// # Errors
+    /// Returns an error for an absent entry.
+    fn child_route(&self, index: usize) -> Result<NodeRoute> {
+        self.route.child(&self.bytes, index)
     }
-    let entries = header_entries(bytes)?;
-    if depth > 0 && entries == 0 {
-        return Err(Error::InvalidExtentTree);
-    }
-    let mut previous = None;
-    for index in 0..entries {
-        let key = le_u32(bytes, disk_offset(entry_offset(index)?))?;
-        if previous.is_some_and(|previous| key <= previous) {
-            return Err(Error::InvalidExtentTree);
-        }
-        previous = Some(key);
-    }
-    Ok(depth)
-}
-
-/// Reads a validated index entry from either inode or external-node storage.
-/// # Errors
-/// Rejects missing entries, truncated addresses and zero child pointers.
-fn path_node_child(bytes: &[u8], index: usize) -> Result<BlockAddress> {
-    if index >= header_entries(bytes)? {
-        return Err(Error::InvalidExtentTree);
-    }
-    let offset = entry_offset(index)?;
-    let low = u64::from(le_u32(
-        bytes,
-        disk_offset(offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?),
-    )?);
-    let high = u64::from(le_u16(
-        bytes,
-        disk_offset(offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?),
-    )?);
-    let block = BlockAddress::new(low | high << 32);
-    if block.get() == 0 {
-        return Err(Error::InvalidExtentTree);
-    }
-    Ok(block)
 }
 
 /// Loads one child while retaining at most one node per tree depth.
@@ -95,6 +53,7 @@ fn load_child(
     path: &[PathNode],
     block: BlockAddress,
     depth: u16,
+    route: NodeRoute,
     block_size: BlockSize,
     reader: &mut impl ExtentNodeReader,
     context: ExtentTreeContext,
@@ -113,6 +72,7 @@ fn load_child(
     let node = PathNode {
         block: Some(block),
         bytes,
+        route,
         next: 0,
     };
     node.validate(Some(depth))?;
@@ -256,13 +216,13 @@ mod cursor_tests {
                 Err(Error::OperationSuspended)
             ));
             complete_leaf(&mut transcript, second_logical)?;
-            assert!(
-                matches!(cursor.next(&mut OperationDevice::new(&mut transcript))?, Some(ExtentAllocation::Metadata(block)) if block == BlockAddress::new(11))
-            );
             let result = cursor.next(&mut OperationDevice::new(&mut transcript));
             if second_logical == 8 {
                 assert!(
-                    matches!(result?, Some(ExtentAllocation::Data(extent)) if extent.logical_start().as_u32() == 8)
+                    matches!(result?, Some(ExtentAllocation::Metadata(block)) if block == BlockAddress::new(11))
+                );
+                assert!(
+                    matches!(cursor.next(&mut OperationDevice::new(&mut transcript))?, Some(ExtentAllocation::Data(extent)) if extent.logical_start().as_u32() == 8)
                 );
                 assert!(
                     cursor
@@ -270,6 +230,7 @@ mod cursor_tests {
                         .is_none()
                 );
             } else {
+                // A leaf that does not begin at its index key is rejected before it is yielded.
                 assert!(matches!(result, Err(Error::InvalidExtentTree)));
             }
         }
@@ -350,8 +311,6 @@ pub(crate) struct ExtentAllocationCursor {
     root_next: usize,
     /// Only external nodes need variable-sized images, bounded by the format's depth.
     external_path: Vec<PathNode>,
-    /// End of the preceding data extent, including across leaf boundaries.
-    previous_end: u64,
     /// Geometry and checksum identity cannot change while the walk is suspended.
     block_size: BlockSize,
     /// Checksum identity of this inode's external nodes.
@@ -367,12 +326,11 @@ impl ExtentAllocationCursor {
         block_size: BlockSize,
         context: ExtentTreeContext,
     ) -> Result<Self> {
-        validate_path_node(root.bytes(), None)?;
+        parse_node(root.bytes(), None, NodeRoute::ROOT, |_extent| Ok(()))?;
         Ok(Self {
             root: root.clone(),
             root_next: 0,
             external_path: Vec::new(),
-            previous_end: 0,
             block_size,
             context,
         })
@@ -387,12 +345,14 @@ impl ExtentAllocationCursor {
         reader: &mut impl ExtentNodeReader,
     ) -> Result<Option<ExtentAllocation>> {
         loop {
-            let (bytes, index) = self
-                .external_path
-                .last()
-                .map_or((self.root.bytes().as_slice(), self.root_next), |node| {
-                    (node.bytes.as_slice(), node.next)
-                });
+            let (bytes, route, index) = self.external_path.last().map_or(
+                (
+                    self.root.bytes().as_slice(),
+                    NodeRoute::ROOT,
+                    self.root_next,
+                ),
+                |node| (node.bytes.as_slice(), node.route, node.next),
+            );
             if index == header_entries(bytes)? {
                 if self.external_path.pop().is_some() {
                     continue;
@@ -402,19 +362,17 @@ impl ExtentAllocationCursor {
             let next = index.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
             let depth = le_u16(bytes, disk_offset(6))?;
             if depth == 0 {
+                // Ordering across leaves follows from each node's validated routed interval.
                 let extent = parse_extent(bytes, entry_offset(index)?)?;
-                if extent.logical_start().as_u64() < self.previous_end {
-                    return Err(Error::InvalidExtentTree);
-                }
-                self.previous_end = extent.end_logical();
                 self.advance_entry(next);
                 return Ok(Some(ExtentAllocation::Data(extent)));
             }
-            let block = path_node_child(bytes, index)?;
+            let block = index_child(bytes, index)?;
             let child = load_child(
                 &self.external_path,
                 block,
                 depth.checked_sub(1).ok_or(Error::InvalidExtentTree)?,
+                route.child(bytes, index)?,
                 self.block_size,
                 reader,
                 self.context,
@@ -474,6 +432,7 @@ impl ExtentTail {
         let root = PathNode {
             block: None,
             bytes: memory::copied_slice(root.bytes())?,
+            route: NodeRoute::ROOT,
             next: 0,
         };
         let mut depth = root.validate(None)?;
@@ -485,8 +444,9 @@ impl ExtentTail {
                 .checked_sub(1)
                 .ok_or(Error::InvalidExtentTree)?;
             let block = node.child(last)?;
+            let route = node.child_route(last)?;
             depth = depth.checked_sub(1).ok_or(Error::InvalidExtentTree)?;
-            let child = load_child(&path, block, depth, block_size, reader, context)?;
+            let child = load_child(&path, block, depth, route, block_size, reader, context)?;
             path.try_push(child)?;
         }
         Ok(Self { path, context })
@@ -764,29 +724,22 @@ impl MappingNode {
     /// Establishes interval validity before discarding the raw image.
     /// # Errors
     /// Returns malformed-node, parent-range, or allocation failures.
-    fn decode(node: PathNode, depth: Option<u16>, lower: u64, upper: u64) -> Result<Self> {
-        let depth = node.validate(depth)?;
-        let mut branches = Vec::new();
+    fn decode(node: PathNode, depth: Option<u16>) -> Result<Self> {
         let mut leaves = Vec::new();
-        for index in 0..header_entries(&node.bytes)? {
-            let key = le_u32(&node.bytes, disk_offset(entry_offset(index)?))?;
-            if u64::from(key) < lower || u64::from(key) >= upper {
-                return Err(Error::InvalidExtentTree);
-            }
-            if depth == 0 {
-                let extent = parse_extent(&node.bytes, entry_offset(index)?)?;
-                if extent.end_logical() > upper {
-                    return Err(Error::InvalidExtentTree);
-                }
-                leaves.try_push(extent)?;
-            } else {
+        let depth = parse_node(&node.bytes, depth, node.route, |extent| {
+            leaves.try_push(extent)
+        })?;
+        let mut branches = Vec::new();
+        if depth != 0 {
+            for index in 0..header_entries(&node.bytes)? {
+                let key = le_u32(&node.bytes, disk_offset(entry_offset(index)?))?;
                 branches.try_push((key, node.child(index)?))?;
             }
         }
         Ok(Self {
             block: node.block,
             depth,
-            upper,
+            upper: node.route.end(),
             entries: if depth == 0 {
                 MappingEntries::Leaf(leaves)
             } else {
@@ -820,11 +773,10 @@ impl ExtentMappingCursor {
             PathNode {
                 block: None,
                 bytes: memory::copied_slice(root.bytes())?,
+                route: NodeRoute::ROOT,
                 next: 0,
             },
             None,
-            0,
-            LOGICAL_BLOCK_EXCLUSIVE_END,
         )?;
         let mut path = Vec::new();
         path.try_push(root)?;
@@ -978,11 +930,10 @@ impl ExtentMappingCursor {
                     PathNode {
                         block: Some(block),
                         bytes,
+                        route: NodeRoute::indexed(lower, upper),
                         next: 0,
                     },
                     Some(depth),
-                    u64::from(lower),
-                    upper,
                 )?;
                 self.path.try_push(child)?;
             }
