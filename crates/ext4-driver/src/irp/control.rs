@@ -600,6 +600,8 @@ pub(crate) enum QueryFileInformationClass {
     AttributeTag,
     /// Windows `FileIdInformation`.
     Id,
+    /// Windows `FileCaseSensitiveInformation`, for directory handles.
+    CaseSensitive,
 }
 
 impl QueryFileInformationClass {
@@ -628,6 +630,9 @@ impl QueryFileInformationClass {
             }
             wdk_sys::_FILE_INFORMATION_CLASS::FileAttributeTagInformation => Ok(Self::AttributeTag),
             wdk_sys::_FILE_INFORMATION_CLASS::FileIdInformation => Ok(Self::Id),
+            wdk_sys::_FILE_INFORMATION_CLASS::FileCaseSensitiveInformation => {
+                Ok(Self::CaseSensitive)
+            }
             _ => Err(DriverError::InvalidInfoClass),
         }
     }

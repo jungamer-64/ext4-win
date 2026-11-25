@@ -270,3 +270,29 @@ fn basic_timestamp_sentinels_keep_values_and_select_handle_policy() {
         Err(DriverError::InvalidParameter)
     );
 }
+
+/// # Panics
+///
+/// Panics when case-sensitivity input accepts a truncated record or an undefined flag.
+#[test]
+fn case_sensitive_set_input_is_length_bounded_and_flag_checked() {
+    assert_eq!(
+        super::decode_case_sensitive_record(&[1, 0, 0]),
+        Err(DriverError::BufferTooSmall)
+    );
+    assert_eq!(
+        super::decode_case_sensitive_record(&[1, 0, 0, 0, 0xA5]),
+        Ok(1)
+    );
+    assert_eq!(super::decode_case_sensitive_flags(0), Ok(None));
+    assert_eq!(
+        super::decode_case_sensitive_flags(wdk_sys::FILE_CS_FLAG_CASE_SENSITIVE_DIR),
+        Ok(Some(crate::metadata::WindowsCaseSensitiveDirectory))
+    );
+    for flags in [2, 3, u32::MAX] {
+        assert_eq!(
+            super::decode_case_sensitive_flags(flags),
+            Err(DriverError::InvalidParameter)
+        );
+    }
+}

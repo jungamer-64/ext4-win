@@ -52,6 +52,13 @@ enum QueryFilePlan {
         /// Coherent Windows size authority, not a projection from ext4 query metadata.
         stream_sizes: crate::kernel::stream::StreamSizes,
     },
+    /// Observe one directory's Windows comparison.
+    CaseSensitive {
+        /// Caller output capacity.
+        length: IrpBufferLength,
+        /// Directory selected by the handle.
+        directory: DirectoryNodeId,
+    },
     /// Traverse the ext4 namespace for every name of one hard-linkable inode.
     HardLinks {
         /// Caller output capacity.
@@ -145,6 +152,10 @@ pub(super) fn query_file_information(
                     .map_err(|_| DriverError::FileIsDirectory)?;
                 return Ok(QueryFilePlan::HardLinks { length, target });
             }
+            QueryFileInformationClass::CaseSensitive => {
+                let directory = OpenedDirectory::decode(file_object)?.id();
+                return Ok(QueryFilePlan::CaseSensitive { length, directory });
+            }
             QueryFileInformationClass::Basic
             | QueryFileInformationClass::Stream
             | QueryFileInformationClass::Ea
@@ -184,6 +195,12 @@ pub(super) fn query_file_information(
         }
         QueryFilePlan::HardLinks { length, target } => {
             return query_hard_link_information(request, length, target, read);
+        }
+        QueryFilePlan::CaseSensitive { length, directory } => {
+            let comparison = crate::metadata::DirectoryNameComparison::load(read, directory)?;
+            return request.with_active(|active| {
+                pack_case_sensitive_information(active.buffered_output(length)?, comparison)
+            });
         }
         QueryFilePlan::Name {
             length,
@@ -278,7 +295,10 @@ pub(super) fn query_file_information(
             | QueryFileInformationClass::Name
             | QueryFileInformationClass::NormalizedName
             | QueryFileInformationClass::AlternateName
-            | QueryFileInformationClass::HardLink => Err(DriverError::InternalInvariantViolation),
+            | QueryFileInformationClass::HardLink
+            | QueryFileInformationClass::CaseSensitive => {
+                Err(DriverError::InternalInvariantViolation)
+            }
         }
     })
 }
@@ -840,6 +860,33 @@ fn pack_id_information(
     writer.write_bytes(
         WireOffset::new(core::mem::offset_of!(wdk_sys::FILE_ID_INFORMATION, FileId)),
         &metadata.file_id.to_file_id_128(),
+    )?;
+    IrpCompletion::from_usize(size)
+}
+
+/// Packs FILE_CASE_SENSITIVE_INFORMATION. Only a directory marked case-sensitive reports the flag;
+/// casefold and caller-selected directories both accept case-insensitive Windows requests.
+/// # Errors
+///
+/// Returns an error when the output buffer is too small for `FILE_CASE_SENSITIVE_INFORMATION`.
+fn pack_case_sensitive_information(
+    output: &mut [u8],
+    comparison: crate::metadata::DirectoryNameComparison,
+) -> DriverResult<IrpCompletion> {
+    let size = core::mem::size_of::<wdk_sys::FILE_CASE_SENSITIVE_INFORMATION>();
+    let flags = match comparison {
+        crate::metadata::DirectoryNameComparison::CaseSensitive => {
+            wdk_sys::FILE_CS_FLAG_CASE_SENSITIVE_DIR
+        }
+        crate::metadata::DirectoryNameComparison::Casefold
+        | crate::metadata::DirectoryNameComparison::CallerSelected => 0,
+    };
+    fixed_record_writer(output, size)?.write_u32(
+        WireOffset::new(core::mem::offset_of!(
+            wdk_sys::FILE_CASE_SENSITIVE_INFORMATION,
+            Flags
+        )),
+        flags,
     )?;
     IrpCompletion::from_usize(size)
 }

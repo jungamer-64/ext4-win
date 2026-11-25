@@ -132,6 +132,13 @@ enum OrdinarySetFilePlan {
         /// Caller-independent hard-link domain values.
         mutation: HardLinkMutation,
     },
+    /// Mark or unmark one empty directory as case-sensitive for Windows lookups.
+    CaseSensitivity {
+        /// Directory selected by the handle.
+        directory: DirectoryNodeId,
+        /// Requested marker; absence restores caller-selected comparison.
+        marker: Option<crate::metadata::WindowsCaseSensitiveDirectory>,
+    },
 }
 
 #[cfg(test)]
@@ -394,6 +401,19 @@ fn decode_set_file_plan(request: &mut PendingIrpLease<'_>) -> DriverResult<SetFi
                 set_position_information(active, stack, &mut opened_file)?;
                 OrdinarySetFilePlan::Complete
             }
+            SetFileOperation::CaseSensitive => {
+                if opened_file.file_attributes_write_access() != FileAttributesWriteAccess::Granted
+                {
+                    return Err(DriverError::AccessDenied);
+                }
+                OrdinarySetFilePlan::CaseSensitivity {
+                    directory: OpenedDirectory::decode(file_object)?.id(),
+                    marker: decode_case_sensitive_flags(read_case_sensitive_input(
+                        active,
+                        stack.length(),
+                    )?)?,
+                }
+            }
             SetFileOperation::Resize => {
                 let end_of_file = read_end_of_file_input(active, stack.length())?;
                 let regular_file = OpenedRegularFile::decode(file_object)?;
@@ -555,6 +575,9 @@ fn apply_set_file_plan(
 ) -> DriverResult<SetFileResolution> {
     let resolution = match plan {
         OrdinarySetFilePlan::Complete => SetFileResolution::Complete(IrpCompletion::EMPTY),
+        OrdinarySetFilePlan::CaseSensitivity { directory, marker } => {
+            set_directory_case_sensitivity(mutation, directory, marker)?
+        }
         OrdinarySetFilePlan::Basic {
             times,
             policy,
@@ -1213,14 +1236,57 @@ pub(crate) fn validate_pending_deletion(
     let metadata = metadata_from_node(read, node)?;
     readonly.validate_attributes(metadata.file_attributes)?;
     if let NodeId::Directory(directory_id) = node {
-        let mut reader = ext4_core::DirectoryReader::new(directory_id, DirectoryCursor::start());
-        while let Some(entry) = read.next_directory_entry(&mut reader)? {
-            if !matches!(entry.entry().name().bytes(), b"." | b"..") {
-                return Err(DriverError::from(ext4_core::Error::DirectoryNotEmpty));
-            }
+        require_empty_directory(read, directory_id)?;
+    }
+    Ok(())
+}
+
+/// Requires a directory to hold no entry other than its dot entries.
+/// # Errors
+/// Returns directory-not-empty or the underlying read error.
+fn require_empty_directory(
+    read: &mut impl CommittedReadPass,
+    directory: DirectoryNodeId,
+) -> DriverResult<()> {
+    let mut reader = ext4_core::DirectoryReader::new(directory, DirectoryCursor::start());
+    while let Some(entry) = read.next_directory_entry(&mut reader)? {
+        if !matches!(entry.entry().name().bytes(), b"." | b"..") {
+            return Err(DriverError::from(ext4_core::Error::DirectoryNotEmpty));
         }
     }
     Ok(())
+}
+
+/// Changes one directory's Windows case-sensitivity marker inside the mutation pass.
+///
+/// A request for the current state completes without staging. A change requires an empty
+/// directory, as Windows does, and a casefold directory cannot become case-sensitive because ext4
+/// casefold defines its comparison.
+/// # Errors
+/// Returns not-supported for a casefold directory, directory-not-empty, malformed marker, read or
+/// staging failure.
+fn set_directory_case_sensitivity(
+    mutation: &mut DriverMutationPass<'_, '_, '_>,
+    directory: DirectoryNodeId,
+    marker: Option<crate::metadata::WindowsCaseSensitiveDirectory>,
+) -> DriverResult<SetFileResolution> {
+    use crate::metadata::DirectoryNameComparison;
+    match (DirectoryNameComparison::load(mutation, directory)?, marker) {
+        (DirectoryNameComparison::CaseSensitive, Some(_))
+        | (DirectoryNameComparison::Casefold | DirectoryNameComparison::CallerSelected, None) => {
+            return Ok(SetFileResolution::Complete(IrpCompletion::EMPTY));
+        }
+        (DirectoryNameComparison::Casefold, Some(_)) => return Err(DriverError::NotSupported),
+        (DirectoryNameComparison::CallerSelected, Some(_))
+        | (DirectoryNameComparison::CaseSensitive, None) => {}
+    }
+    require_empty_directory(mutation, directory)?;
+    let node = mutation.node(NodeId::Directory(directory))?;
+    match marker {
+        Some(marker) => marker.store(mutation, node)?,
+        None => crate::metadata::WindowsCaseSensitiveDirectory::remove(mutation, node)?,
+    }
+    Ok(SetFileResolution::Mutation(SetFilePublication::None))
 }
 
 /// Owned hard-link mutation decoded completely before the first suspension.
@@ -2324,6 +2390,47 @@ fn decode_extended_disposition_record(bytes: &[u8]) -> DriverResult<u32> {
             )))
         },
     )
+}
+
+/// Decodes `FILE_CASE_SENSITIVE_INFORMATION` without interpreting its flags.
+/// # Errors
+///
+/// Returns an error when the declared input is shorter than the fixed record.
+fn read_case_sensitive_input(active: &ActiveIrp<'_>, length: IrpBufferLength) -> DriverResult<u32> {
+    decode_file_information_input(active, length, decode_case_sensitive_record)
+}
+
+/// Decodes a complete `FILE_CASE_SENSITIVE_INFORMATION` record.
+/// # Errors
+///
+/// Returns an error when `bytes` is shorter than the complete fixed record.
+fn decode_case_sensitive_record(bytes: &[u8]) -> DriverResult<u32> {
+    decode_fixed_file_information(
+        bytes,
+        core::mem::size_of::<wdk_sys::FILE_CASE_SENSITIVE_INFORMATION>(),
+        |input| {
+            input.read_u32(WireOffset::new(core::mem::offset_of!(
+                wdk_sys::FILE_CASE_SENSITIVE_INFORMATION,
+                Flags
+            )))
+        },
+    )
+}
+
+/// Maps the defined case-sensitivity flags to the requested marker.
+/// # Errors
+///
+/// Returns invalid parameter for undefined flags.
+fn decode_case_sensitive_flags(
+    flags: u32,
+) -> DriverResult<Option<crate::metadata::WindowsCaseSensitiveDirectory>> {
+    match flags {
+        0 => Ok(None),
+        wdk_sys::FILE_CS_FLAG_CASE_SENSITIVE_DIR => {
+            Ok(Some(crate::metadata::WindowsCaseSensitiveDirectory))
+        }
+        _ => Err(DriverError::InvalidParameter),
+    }
 }
 
 /// Decoded variable-length namespace destination shared by rename and hard-link information.

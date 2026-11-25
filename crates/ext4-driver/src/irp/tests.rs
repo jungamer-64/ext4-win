@@ -2948,6 +2948,14 @@ fn query_file_stack_decodes_name_attribute_tag_and_link_classes() {
             wdk_sys::_FILE_INFORMATION_CLASS::FileHardLinkInformation,
             QueryFileInformationClass::HardLink,
         ),
+        (
+            wdk_sys::_FILE_INFORMATION_CLASS::FileIdInformation,
+            QueryFileInformationClass::Id,
+        ),
+        (
+            wdk_sys::_FILE_INFORMATION_CLASS::FileCaseSensitiveInformation,
+            QueryFileInformationClass::CaseSensitive,
+        ),
     ] {
         let mut stack = wdk_sys::IO_STACK_LOCATION {
             FileObject: file_object.as_ptr(),
@@ -3046,6 +3054,11 @@ fn set_file_stack_retains_eof_protocol_and_namespace_parent() {
             wdk_sys::_FILE_INFORMATION_CLASS::FileLinkInformationEx,
             0,
             SetFileOperation::LinkEx(super::NamespaceParent::SourceDirectory),
+        ),
+        (
+            wdk_sys::_FILE_INFORMATION_CLASS::FileCaseSensitiveInformation,
+            0,
+            SetFileOperation::CaseSensitive,
         ),
     ] {
         let mut stack = wdk_sys::IO_STACK_LOCATION {

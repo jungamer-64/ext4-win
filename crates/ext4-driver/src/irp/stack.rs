@@ -200,6 +200,8 @@ pub(crate) enum SetFileOperation<'owner> {
     Rename(NamespaceParent<'owner>),
     /// Flag-based rename replacement with resolved parent authority.
     RenameEx(NamespaceParent<'owner>),
+    /// Directory case-sensitivity marker change.
+    CaseSensitive,
 }
 
 /// Decoded query-directory stack parameters.

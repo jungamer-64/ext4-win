@@ -5102,6 +5102,12 @@ impl MutationRequestOperation {
                     &mut request,
                     operations,
                 )?;
+                if *state == ext4_core::DirectoryCasefold::Enabled
+                    && crate::metadata::DirectoryNameComparison::load(mutation, *directory)?
+                        == crate::metadata::DirectoryNameComparison::CaseSensitive
+                {
+                    return Err(DriverError::NotSupported);
+                }
                 let directory = mutation.directory(*directory)?;
                 mutation.set_directory_casefold(directory, *state)?;
                 Ok(DriverResolveDisposition::Mutation(

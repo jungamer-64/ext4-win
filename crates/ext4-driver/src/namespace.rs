@@ -1,5 +1,6 @@
 //! Windows component representation and namespace comparison policy.
 
+use crate::kernel::name_expression::NameCase;
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
 use core::{char, str};
@@ -7,8 +8,9 @@ use ext4_core::{
     ChildLookup, CommittedReadPass, DirectoryNodeId, DirectoryReader, DirectoryScanCursor, Ext4Name,
 };
 
-/// Resolves exact ext4 spelling before applying the caller's Windows comparison policy.
-/// Both paths use one restart-local read pass; no name or candidate survives an epoch change.
+/// Resolves exact ext4 spelling before applying the caller's Windows comparison policy. A
+/// case-sensitive directory admits only that exact spelling, whatever the caller requested.
+/// Every path uses one restart-local read pass; no name or candidate survives an epoch change.
 /// # Errors
 /// Returns encoding, ext4 traversal, allocation or ambiguous-name failures.
 pub(crate) fn lookup_child(
@@ -18,6 +20,11 @@ pub(crate) fn lookup_child(
 ) -> DriverResult<ChildLookup> {
     let exact = read.lookup_child(parent, &lookup.name().to_ext4()?)?;
     if matches!(exact, ChildLookup::Found(_)) || matches!(lookup, WindowsNameLookup::Exact(_)) {
+        return Ok(exact);
+    }
+    if crate::metadata::DirectoryNameComparison::load(read, parent)?.select(NameCase::Insensitive)
+        == NameCase::Exact
+    {
         return Ok(exact);
     }
     let mut found = None;

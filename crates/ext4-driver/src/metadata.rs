@@ -1,12 +1,13 @@
 //! Windows inode projections and the private xattr encoding boundary.
 
+use crate::kernel::name_expression::NameCase;
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory;
 use crate::request::DriverMutationPass;
 use ext4_core::{
-    CommittedReadPass, Ext4LinkCount, Ext4Security, Ext4Times, FileAllocationSize, FileSize,
-    InodeGeneration, InodeId, NodeDataPolicy, NodeId, SymlinkTarget, TransactionNode, XattrName,
-    XattrNamespace, XattrSet, XattrValue,
+    CommittedReadPass, DirectoryNodeId, Ext4LinkCount, Ext4Security, Ext4Times, FileAllocationSize,
+    FileSize, InodeGeneration, InodeId, NodeDataPolicy, NodeId, SymlinkTarget, TransactionNode,
+    XattrName, XattrNamespace, XattrSet, XattrValue,
 };
 
 /// Windows file reference naming one ext4 inode allocation.
@@ -501,6 +502,155 @@ impl WindowsSymlinkReparsePoint {
     }
 }
 
+/// Windows comparison applied to names resolved inside one directory.
+///
+/// ext4 casefold is authoritative when present, including when Linux also left the Windows
+/// marker on the inode. Otherwise the `user.ext4win.case_sensitive` marker selects strict
+/// comparison; unmarked directories let each request choose.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirectoryNameComparison {
+    /// ext4 compares names with the mounted encoding's case folding.
+    Casefold,
+    /// `FileCaseSensitiveInformation` marked the directory: Windows lookups never fall back to a
+    /// case-insensitive or short-name match, whatever the request asked for.
+    CaseSensitive,
+    /// An exact ext4 spelling is tried first; a request without `SL_CASE_SENSITIVE` may then match
+    /// case-insensitively or by short name.
+    CallerSelected,
+}
+
+impl DirectoryNameComparison {
+    /// Combines the ext4 comparison with the Windows marker read from the same inode.
+    pub(crate) const fn from_parts(
+        casefold: ext4_core::DirectoryCasefold,
+        marker: Option<WindowsCaseSensitiveDirectory>,
+    ) -> Self {
+        match (casefold, marker) {
+            (ext4_core::DirectoryCasefold::Enabled, _) => Self::Casefold,
+            (ext4_core::DirectoryCasefold::Disabled, Some(WindowsCaseSensitiveDirectory)) => {
+                Self::CaseSensitive
+            }
+            (ext4_core::DirectoryCasefold::Disabled, None) => Self::CallerSelected,
+        }
+    }
+
+    /// Reads the inode facts that select one directory's comparison, without interpreting them.
+    /// # Errors
+    /// Returns directory load or xattr read failures.
+    pub(crate) fn observe(
+        read: &mut impl CommittedReadPass,
+        directory: DirectoryNodeId,
+    ) -> ext4_core::Result<(ext4_core::DirectoryCasefold, Option<XattrValue>)> {
+        let casefold = read.load_directory(directory)?.casefold();
+        let marker = read.read_xattr(
+            NodeId::Directory(directory),
+            &XattrName::new(
+                XattrNamespace::User,
+                WindowsCaseSensitiveDirectory::XATTR_LOCAL_NAME,
+            )?,
+        )?;
+        Ok((casefold, marker))
+    }
+
+    /// Interprets facts returned by [`Self::observe`].
+    /// # Errors
+    /// Returns invalid Windows metadata for a malformed marker.
+    pub(crate) fn decode(
+        casefold: ext4_core::DirectoryCasefold,
+        marker: Option<&XattrValue>,
+    ) -> DriverResult<Self> {
+        let marker = marker
+            .map(WindowsCaseSensitiveDirectory::parse)
+            .transpose()?;
+        Ok(Self::from_parts(casefold, marker))
+    }
+
+    /// Observes and interprets one directory's comparison from a single read pass.
+    /// # Errors
+    /// Returns directory load, xattr read or malformed marker failures.
+    pub(crate) fn load(
+        read: &mut impl CommittedReadPass,
+        directory: DirectoryNodeId,
+    ) -> DriverResult<Self> {
+        let (casefold, marker) = Self::observe(read, directory)?;
+        Self::decode(casefold, marker.as_ref())
+    }
+
+    /// Comparison actually applied to a request that asked for `requested`.
+    pub(crate) const fn select(self, requested: NameCase) -> NameCase {
+        match self {
+            Self::CaseSensitive => NameCase::Exact,
+            Self::Casefold | Self::CallerSelected => requested,
+        }
+    }
+}
+
+/// Marker recording that `FileCaseSensitiveInformation` made a directory case-sensitive.
+///
+/// The marker is Windows-only metadata in `user.ext4win.case_sensitive`; Linux neither honors nor
+/// inherits it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WindowsCaseSensitiveDirectory;
+
+impl WindowsCaseSensitiveDirectory {
+    /// Version of the marker payload.
+    const VERSION: u32 = 1;
+    /// Local name of the marker in the `user` xattr namespace.
+    const XATTR_LOCAL_NAME: &'static [u8] = b"ext4win.case_sensitive";
+
+    /// Returns the xattr name storing the marker.
+    /// # Errors
+    /// Returns an error only if the fixed domain name is invalid.
+    pub(crate) fn xattr_name() -> DriverResult<XattrName> {
+        Ok(XattrName::new(
+            XattrNamespace::User,
+            Self::XATTR_LOCAL_NAME,
+        )?)
+    }
+
+    /// Serializes the marker payload.
+    /// # Errors
+    /// Returns an error when the value cannot be represented as an xattr.
+    pub(crate) fn to_xattr_value(self) -> DriverResult<XattrValue> {
+        Ok(XattrValue::new(&Self::VERSION.to_le_bytes())?)
+    }
+
+    /// Parses the marker payload.
+    /// # Errors
+    /// Returns invalid Windows metadata for any length or version other than the current one.
+    pub(crate) fn parse(value: &XattrValue) -> DriverResult<Self> {
+        let bytes = value.bytes();
+        if bytes.len() != core::mem::size_of::<u32>()
+            || decode_xattr_u32(bytes, 0)? != Self::VERSION
+        {
+            return Err(DriverError::InvalidWindowsMetadata);
+        }
+        Ok(Self)
+    }
+
+    /// Marks a staged directory.
+    /// # Errors
+    /// Returns serialization, allocation or ext4 mutation failures before commit.
+    pub(crate) fn store(
+        self,
+        mutation: &mut DriverMutationPass<'_, '_, '_>,
+        node: TransactionNode,
+    ) -> DriverResult<()> {
+        Ok(mutation.set_xattr(node, Self::xattr_name()?, self.to_xattr_value()?)?)
+    }
+
+    /// Removes the marker from a staged directory.
+    /// # Errors
+    /// Returns ext4 mutation failures before commit.
+    pub(crate) fn remove(
+        mutation: &mut DriverMutationPass<'_, '_, '_>,
+        node: TransactionNode,
+    ) -> DriverResult<()> {
+        mutation.remove_xattr(node, &Self::xattr_name()?)?;
+        Ok(())
+    }
+}
+
 /// Decodes one fixed-width little-endian field from a reparse xattr payload.
 /// # Errors
 ///
@@ -527,7 +677,79 @@ mod tests {
     use ext4_core::SymlinkTarget;
     use ext4_core::XattrValue;
 
-    use super::{WindowsAttributes, WindowsOverlay, WindowsSymlinkReparsePoint};
+    use super::{
+        DirectoryNameComparison, WindowsAttributes, WindowsCaseSensitiveDirectory, WindowsOverlay,
+        WindowsSymlinkReparsePoint,
+    };
+    use crate::kernel::name_expression::NameCase;
+    use ext4_core::DirectoryCasefold;
+
+    /// # Panics
+    ///
+    /// Panics when the marker payload changes or a malformed payload is accepted.
+    #[test]
+    fn case_sensitive_marker_round_trips_and_rejects_other_payloads() {
+        let value = WindowsCaseSensitiveDirectory.to_xattr_value();
+        assert_eq!(
+            value.as_ref().map(XattrValue::bytes),
+            Ok([1_u8, 0, 0, 0].as_slice())
+        );
+        if let Ok(value) = value {
+            assert_eq!(
+                WindowsCaseSensitiveDirectory::parse(&value),
+                Ok(WindowsCaseSensitiveDirectory)
+            );
+        }
+        for bytes in [
+            &[][..],
+            &[1, 0, 0][..],
+            &[2, 0, 0, 0][..],
+            &[1, 0, 0, 0, 0][..],
+        ] {
+            let value = XattrValue::new(bytes);
+            assert!(value.is_ok());
+            if let Ok(value) = value {
+                assert_eq!(
+                    WindowsCaseSensitiveDirectory::parse(&value),
+                    Err(DriverError::InvalidWindowsMetadata)
+                );
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when casefold stops taking precedence or the marker stops forcing exact matching.
+    #[test]
+    fn directory_comparison_prefers_casefold_and_marks_strict_directories() {
+        let marker = Some(WindowsCaseSensitiveDirectory);
+        assert_eq!(
+            DirectoryNameComparison::from_parts(DirectoryCasefold::Enabled, marker),
+            DirectoryNameComparison::Casefold
+        );
+        assert_eq!(
+            DirectoryNameComparison::from_parts(DirectoryCasefold::Disabled, marker),
+            DirectoryNameComparison::CaseSensitive
+        );
+        assert_eq!(
+            DirectoryNameComparison::from_parts(DirectoryCasefold::Disabled, None),
+            DirectoryNameComparison::CallerSelected
+        );
+        for requested in [NameCase::Exact, NameCase::Insensitive] {
+            assert_eq!(
+                DirectoryNameComparison::CaseSensitive.select(requested),
+                NameCase::Exact
+            );
+            assert_eq!(
+                DirectoryNameComparison::Casefold.select(requested),
+                requested
+            );
+            assert_eq!(
+                DirectoryNameComparison::CallerSelected.select(requested),
+                requested
+            );
+        }
+    }
 
     /// # Panics
     ///

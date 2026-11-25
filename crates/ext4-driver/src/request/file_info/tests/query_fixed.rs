@@ -209,6 +209,37 @@ fn fixed_query_information_packers_clear_every_padding_byte() {
 
 /// # Panics
 ///
+/// Panics if only a marked directory stops reporting the case-sensitive flag, or a short buffer
+/// receives a partial record.
+#[test]
+fn case_sensitive_information_reports_only_marked_directories() {
+    use crate::metadata::DirectoryNameComparison;
+    for (comparison, flags) in [
+        (
+            DirectoryNameComparison::CaseSensitive,
+            wdk_sys::FILE_CS_FLAG_CASE_SENSITIVE_DIR,
+        ),
+        (DirectoryNameComparison::Casefold, 0),
+        (DirectoryNameComparison::CallerSelected, 0),
+    ] {
+        let mut output = [0xA5_u8; 8];
+        assert_eq!(
+            super::pack_case_sensitive_information(&mut output, comparison),
+            crate::irp::IrpCompletion::from_usize(4)
+        );
+        assert_eq!(output.get(..4), Some(flags.to_le_bytes().as_slice()));
+        assert_eq!(output.get(4..), Some([0xA5_u8; 4].as_slice()));
+    }
+    let mut short = [0xA5_u8; 3];
+    assert_eq!(
+        super::pack_case_sensitive_information(&mut short, DirectoryNameComparison::CaseSensitive),
+        Err(DriverError::BufferTooSmall)
+    );
+    assert_eq!(short, [0xA5; 3]);
+}
+
+/// # Panics
+///
 /// Panics if `FILE_ID_INFORMATION` disagrees with the internal file reference or the volume
 /// serial, or a short buffer receives a partial record.
 #[test]

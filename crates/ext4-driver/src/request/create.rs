@@ -2143,7 +2143,8 @@ fn create_missing_node(
     };
     let target = child_creation_target(parameters.target_requirement(), security);
     let parent_metadata = mutation.load_node_metadata(NodeId::Directory(parent))?;
-    let tunneled = if matches!(parameters.name_case(), NameCase::Insensitive)
+    let parent_comparison = crate::metadata::DirectoryNameComparison::load(mutation, parent)?;
+    let tunneled = if parent_comparison.select(parameters.name_case()) == NameCase::Insensitive
         && !parent_metadata.is_encrypted()
     {
         operations.name_tunnel().find(
@@ -2175,6 +2176,12 @@ fn create_missing_node(
         .metadata
         .apply(node, mutation, parameters.file_mode())?;
     crate::short_name::store(mutation, parent, name, node, alias)?;
+    if matches!(node, NodeId::Directory(_))
+        && parent_comparison == crate::metadata::DirectoryNameComparison::CaseSensitive
+    {
+        let child = mutation.node(node)?;
+        crate::metadata::WindowsCaseSensitiveDirectory.store(mutation, child)?;
+    }
     if let Some(tunneled) = tunneled {
         let times = mutation.staged_node_metadata(node)?.times();
         let selected = mutation.node(node)?;

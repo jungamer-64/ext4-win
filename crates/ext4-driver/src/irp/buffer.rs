@@ -547,6 +547,9 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
         };
         let operation = match set.FileInformationClass {
             wdk_sys::_FILE_INFORMATION_CLASS::FileBasicInformation => SetFileOperation::Basic,
+            wdk_sys::_FILE_INFORMATION_CLASS::FileCaseSensitiveInformation => {
+                SetFileOperation::CaseSensitive
+            }
             wdk_sys::_FILE_INFORMATION_CLASS::FilePositionInformation => SetFileOperation::Position,
             wdk_sys::_FILE_INFORMATION_CLASS::FileValidDataLengthInformation => {
                 SetFileOperation::ValidDataLength
