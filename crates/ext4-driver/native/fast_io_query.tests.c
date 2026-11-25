@@ -34,22 +34,27 @@ typedef long LONG;
 typedef unsigned long ULONG;
 typedef unsigned long long ULONG_PTR;
 typedef unsigned char BOOLEAN;
+typedef unsigned char UCHAR;
 typedef char KPROCESSOR_MODE;
 typedef void *PVOID;
 typedef struct { NTSTATUS Status; ULONG_PTR Information; } IO_STATUS_BLOCK, *PIO_STATUS_BLOCK;
 typedef struct { unsigned identity; } DEVICE_OBJECT, *PDEVICE_OBJECT;
-typedef struct { unsigned identity; } FILE_OBJECT, *PFILE_OBJECT;
+typedef struct { BOOLEAN ReadAccess; } FILE_OBJECT, *PFILE_OBJECT;
 typedef struct { unsigned held; } ERESOURCE, *PERESOURCE;
 typedef struct { unsigned held; } FAST_MUTEX;
 typedef struct { long long QuadPart; } LARGE_INTEGER;
-typedef struct {
+enum { FastIoIsQuestionable, FastIoIsPossible };
+typedef struct _EXT4WIN_STREAM_CONTEXT {
     ERESOURCE MainResource;
     FAST_MUTEX HeaderMutex;
     LONG MetadataValid;
     LONG NamespaceQueryFallback;
     unsigned PublishedMetadata;
     long long AllocationCharge;
-    struct { LARGE_INTEGER FileSize; } Header;
+    struct { LARGE_INTEGER FileSize; UCHAR IsFastIoPossible; } Header;
+    struct _EXT4WIN_STREAM_CONTEXT *VolumeStream;
+    PVOID RustState;
+    PVOID SectionState;
 } EXT4WIN_STREAM_CONTEXT, *PEXT4WIN_STREAM_CONTEXT;
 typedef struct { unsigned Metadata; LARGE_INTEGER AllocationSize, EndOfFile; } EXT4WIN_FAST_IO_QUERY_SNAPSHOT,
     *PEXT4WIN_FAST_IO_QUERY_SNAPSHOT;
@@ -82,23 +87,46 @@ static void RtlCopyVolatileMemory(volatile void *destination, volatile const voi
 }
 #include "requestor_access.h"
 
+static EXT4WIN_STREAM_CONTEXT volume;
 static EXT4WIN_STREAM_CONTEXT stream = { .MetadataValid = TRUE, .PublishedMetadata = 0x5a,
-    .AllocationCharge = 4096, .Header = { { 120 } } };
-static FILE_OBJECT file;
+    .AllocationCharge = 4096, .Header = { { 120 }, FastIoIsPossible }, .VolumeStream = &volume };
+static FILE_OBJECT file = { TRUE };
 static DEVICE_OBJECT device;
-static BOOLEAN admitted = TRUE;
+static BOOLEAN verifying, contended, promote_on_acquire;
 static unsigned acquisitions, releases, encodings;
 
-static BOOLEAN ext4win_acquire_fast_io_query_stream(
-    PFILE_OBJECT observed, BOOLEAN wait, PEXT4WIN_STREAM_CONTEXT *stream_out)
+static BOOLEAN ext4win_stream_fast_io_stream(PFILE_OBJECT observed, PEXT4WIN_STREAM_CONTEXT *stream_out)
 {
     assert(observed == &file && stream.MainResource.held == 0);
-    (void)wait;
-    if (!admitted) { return FALSE; }
-    stream.MainResource.held = 1;
-    ++acquisitions;
     *stream_out = &stream;
     return TRUE;
+}
+static BOOLEAN wdk_sys_acquire_resource_shared(PERESOURCE resource, BOOLEAN wait)
+{
+    assert(resource == &stream.MainResource && resource->held == 0);
+    if (contended) {
+        assert(!wait);
+        return FALSE;
+    }
+    if (promote_on_acquire) { stream.Header.IsFastIoPossible = FastIoIsPossible; }
+    resource->held = 1;
+    ++acquisitions;
+    return TRUE;
+}
+static BOOLEAN ext4win_storage_verify_required(const void *state)
+{
+    assert(state == volume.RustState && stream.MainResource.held);
+    return verifying;
+}
+static ULONG ext4win_file_flags(PFILE_OBJECT observed) { assert(observed == &file); return 0; }
+static UCHAR ext4win_storage_media_state(const void *state) { assert(state == volume.RustState); return 0; }
+static UCHAR ext4win_storage_io_policy(const void *state) { assert(state == volume.RustState); return 0; }
+static ULONG ext4win_section_phase(const void *state) { assert(state == stream.SectionState); return 0; }
+static BOOLEAN ext4win_fast_io_query_admit(ULONG flags, UCHAR read_access, UCHAR possible,
+    UCHAR media, UCHAR section, UCHAR policy)
+{
+    assert(stream.MainResource.held && flags == 0 && media == 0 && section == 0 && policy == 0);
+    return read_access && possible;
 }
 static BOOLEAN ExTryToAcquireFastMutex(FAST_MUTEX *mutex)
 {
@@ -201,22 +229,38 @@ int main(void)
     assert_balanced(7);
     assert(encodings == 6);
 
-    admitted = FALSE;
+    verifying = TRUE;
     assert(!ext4win_fast_io_query_basic_info(&file, TRUE, &basic, &status, &device));
-    assert_balanced(7);
-    admitted = TRUE;
+    assert_balanced(8);
+    verifying = FALSE;
     stream.MetadataValid = TRUE;
+    contended = TRUE;
+    assert(!ext4win_fast_io_query_basic_info(&file, FALSE, &basic, &status, &device));
+    assert_balanced(8);
+    contended = FALSE;
+
+    /* Use the byte-lock projection observed after resource acquisition. */
+    stream.Header.IsFastIoPossible = FastIoIsQuestionable;
+    assert(!ext4win_fast_io_query_basic_info(&file, FALSE, &basic, &status, &device));
+    assert_balanced(9);
+    assert(encodings == 6);
+    promote_on_acquire = TRUE;
+    assert(ext4win_fast_io_query_basic_info(&file, FALSE, &basic, &status, &device));
+    assert_balanced(10);
+    assert(encodings == 7);
+    promote_on_acquire = FALSE;
+
     stream.HeaderMutex.held = 1;
     assert(!ext4win_fast_io_query_basic_info(&file, FALSE, &basic, &status, &device));
     assert(!ext4win_fast_io_query_standard_info(&file, FALSE, &standard, &status, &device));
     assert(!ext4win_fast_io_query_network_open_info(&file, FALSE, &network, &status, &device));
     assert(status.Status == STATUS_NOT_SUPPORTED && status.Information == 0);
-    assert_balanced(10);
-    assert(stream.HeaderMutex.held && encodings == 6);
+    assert_balanced(13);
+    assert(stream.HeaderMutex.held && encodings == 7);
     stream.HeaderMutex.held = 0;
     assert(ext4win_fast_io_query_basic_info(&file, FALSE, &basic, &status, &device));
     assert(status.Status == STATUS_SUCCESS && status.Information == sizeof(basic));
-    assert_balanced(11);
-    assert(!stream.HeaderMutex.held && encodings == 7);
+    assert_balanced(14);
+    assert(!stream.HeaderMutex.held && encodings == 8);
     ExitProcess(0);
 }

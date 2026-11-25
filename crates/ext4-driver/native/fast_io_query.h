@@ -36,11 +36,21 @@ ext4win_fast_io_query_observe(
     _In_ BOOLEAN wait,
     _Out_ PEXT4WIN_FAST_IO_QUERY_SNAPSHOT snapshot)
 {
-    PEXT4WIN_STREAM_CONTEXT stream;
+    PEXT4WIN_STREAM_CONTEXT stream, volume;
     BOOLEAN captured;
 
-    if (!ext4win_acquire_fast_io_query_stream(file_object, wait, &stream)) { return FALSE; }
-    captured = ext4win_capture_fast_io_query_snapshot(stream, wait, snapshot);
+    if (!ext4win_stream_fast_io_stream(file_object, &stream)) { return FALSE; }
+    volume = stream->VolumeStream;
+    if (volume == NULL || !wdk_sys_acquire_resource_shared(&stream->MainResource, wait)) {
+        return FALSE;
+    }
+    captured = !ext4win_storage_verify_required(volume->RustState) &&
+        ext4win_fast_io_query_admit(ext4win_file_flags(file_object), file_object->ReadAccess,
+            stream->Header.IsFastIoPossible == FastIoIsPossible,
+            ext4win_storage_media_state(volume->RustState),
+            (UCHAR)ext4win_section_phase(stream->SectionState),
+            ext4win_storage_io_policy(volume->RustState)) &&
+        ext4win_capture_fast_io_query_snapshot(stream, wait, snapshot);
     wdk_sys_release_resource(&stream->MainResource);
     return captured;
 }

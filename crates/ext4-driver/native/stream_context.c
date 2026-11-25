@@ -1017,41 +1017,6 @@ ext4win_stream_may_have_native_residency(
     return STATUS_SUCCESS;
 }
 
-_Success_(return != FALSE)
-static BOOLEAN
-ext4win_acquire_fast_io_query_stream(
-    _In_ PFILE_OBJECT file_object,
-    _In_ BOOLEAN wait,
-    _Outptr_ PEXT4WIN_STREAM_CONTEXT *stream_out)
-{
-    PEXT4WIN_STREAM_CONTEXT stream;
-
-    if (!ext4win_stream_fast_io_stream(file_object, &stream) || (stream->VolumeStream == NULL)) { return FALSE; }
-    if (ext4win_storage_verify_required(stream->VolumeStream->RustState) ||
-        !ext4win_fast_io_query_admit(ext4win_file_flags(file_object), file_object->ReadAccess,
-        stream->Header.IsFastIoPossible == FastIoIsPossible,
-        ext4win_storage_media_state(stream->VolumeStream->RustState),
-        (UCHAR)ext4win_section_phase(stream->SectionState),
-        ext4win_storage_io_policy(stream->VolumeStream->RustState))) { return FALSE; }
-    if (wait) {
-        (VOID)wdk_sys_acquire_resource_shared(&stream->MainResource, TRUE);
-    }
-    else if (!wdk_sys_acquire_resource_shared(&stream->MainResource, FALSE)) {
-        return FALSE;
-    }
-    if (ext4win_storage_verify_required(stream->VolumeStream->RustState) ||
-        !ext4win_fast_io_query_admit(ext4win_file_flags(file_object), file_object->ReadAccess,
-        stream->Header.IsFastIoPossible == FastIoIsPossible,
-        ext4win_storage_media_state(stream->VolumeStream->RustState),
-        (UCHAR)ext4win_section_phase(stream->SectionState),
-        ext4win_storage_io_policy(stream->VolumeStream->RustState))) {
-        wdk_sys_release_resource(&stream->MainResource);
-        return FALSE;
-    }
-    *stream_out = stream;
-    return TRUE;
-}
-
 #include "fast_io_query.h"
 
 #include "fast_io_lock.h"
