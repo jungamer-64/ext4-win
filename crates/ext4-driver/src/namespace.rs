@@ -97,8 +97,8 @@ impl WindowsName {
     /// Converts a raw ext4 name if Windows can represent it without escaping.
     ///
     /// # Errors
-    /// Returns an error when the ext4 bytes are not UTF-8 or contain a
-    /// character that Windows path lookup cannot expose losslessly.
+    /// Returns `InvalidName` for invalid UTF-8 or characters outside the Windows namespace.
+    /// Allocation can fail for an otherwise representable name.
     pub(crate) fn from_ext4(name: &Ext4Name) -> DriverResult<Self> {
         let text = str::from_utf8(name.bytes()).map_err(|_| DriverError::InvalidName)?;
         if text.chars().any(|ch| {

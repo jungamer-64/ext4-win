@@ -608,6 +608,33 @@ pub(crate) enum DirectorySelection {
     Full,
 }
 
+/// Consumes a candidate only when it is unrepresentable or fails the search expression.
+/// # Errors
+/// Propagates projection and matching failures without consuming the candidate.
+fn select_directory_name(
+    candidate: DriverResult<WindowsName>,
+    short_name: Option<crate::short_name::ShortName>,
+    pattern: &DirectoryPattern,
+    cursor: &mut DirectoryCursor,
+    next: &DirectoryCursor,
+) -> DriverResult<Option<WindowsName>> {
+    match candidate {
+        Ok(name) => {
+            let alias_matches = match short_name {
+                Some(alias) => pattern.matches_alias(&alias.windows_name()?)?,
+                None => false,
+            };
+            if pattern.matches(&name)? || alias_matches {
+                return Ok(Some(name));
+            }
+        }
+        Err(DriverError::InvalidName) => {}
+        Err(error) => return Err(error),
+    }
+    *cursor = *next;
+    Ok(None)
+}
+
 impl DirectoryQuery {
     /// Captures the initial expression at admission; output and cursor remain private until copy.
     /// # Errors
@@ -694,24 +721,22 @@ impl DirectoryQuery {
 
     /// Applies long-name and alias matching before admitting a wire record's capacity.
     /// # Errors
-    /// Returns record-size overflow or an output buffer smaller than the fixed header.
+    /// Returns name projection, search expression, or output capacity errors.
     pub(crate) fn select(
         &mut self,
         entry: ext4_core::ScannedDirectoryEntry,
         short_name: Option<crate::short_name::ShortName>,
     ) -> DriverResult<DirectorySelection> {
-        let Ok(name) = WindowsName::from_ext4(entry.entry().name()) else {
-            self.cursor = *entry.next_cursor();
+        let Some(name) = select_directory_name(
+            WindowsName::from_ext4(entry.entry().name()),
+            short_name,
+            self.pattern.get(),
+            &mut self.cursor,
+            entry.next_cursor(),
+        )?
+        else {
             return Ok(DirectorySelection::Skip);
         };
-        let alias_matches = match short_name {
-            Some(alias) => self.pattern.get().matches_alias(&alias.windows_name()?)?,
-            None => false,
-        };
-        if !self.pattern.get().matches(&name)? && !alias_matches {
-            self.cursor = *entry.next_cursor();
-            return Ok(DirectorySelection::Skip);
-        }
         let layout = DirectoryRecordLayout::new(self.class, &name)?;
         let Some(extent) = layout.admit(
             self.written,

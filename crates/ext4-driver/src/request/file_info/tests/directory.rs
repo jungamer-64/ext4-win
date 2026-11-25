@@ -9,6 +9,65 @@ fn directory_file_index_uses_zero_beyond_the_u32_ordinal_domain() {
 }
 
 /// # Panics
+/// Fails if name projection failure consumes an entry or an unsupported name stalls the scan.
+#[test]
+fn directory_name_selection_preserves_cursor_on_allocation_failure() {
+    use super::*;
+    let result = (|| -> DriverResult<()> {
+        let name = ext4_core::Ext4Name::new(b"caf\xC3\xA9")?;
+        let pattern = DirectoryPattern::All;
+        let mut cursor = DirectoryCursor::start();
+        cursor.seek_ordinal(4);
+        let before = cursor;
+        let mut next = cursor;
+        next.seek_ordinal(5);
+
+        assert_eq!(
+            select_directory_name(
+                Err(DriverError::InsufficientResources),
+                None,
+                &pattern,
+                &mut cursor,
+                &next,
+            ),
+            Err(DriverError::InsufficientResources)
+        );
+        assert_eq!(cursor, before);
+        let selected = select_directory_name(
+            WindowsName::from_ext4(&name),
+            None,
+            &pattern,
+            &mut cursor,
+            &next,
+        )?;
+        let expected = [0x0063, 0x0061, 0x0066, 0x00E9];
+        assert_eq!(
+            selected.as_ref().map(WindowsName::utf16),
+            Some(expected.as_slice())
+        );
+        assert_eq!(cursor, before);
+
+        for bytes in [b"a:b".as_slice(), b"\xFF".as_slice()] {
+            cursor = before;
+            let name = ext4_core::Ext4Name::new(bytes)?;
+            assert_eq!(
+                select_directory_name(
+                    WindowsName::from_ext4(&name),
+                    None,
+                    &pattern,
+                    &mut cursor,
+                    &next,
+                ),
+                Ok(None)
+            );
+            assert_eq!(cursor, next);
+        }
+        Ok(())
+    })();
+    assert_eq!(result, Ok(()));
+}
+
+/// # Panics
 /// Fails if exact-fit, first-call prefix, or deferred-name buffer contracts change.
 #[test]
 fn directory_capacity_preserves_first_and_subsequent_call_semantics() {

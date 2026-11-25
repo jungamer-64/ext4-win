@@ -370,10 +370,15 @@ pub(crate) fn visible_alias(
     let windows = alias.windows_name()?;
     let mut reader = DirectoryReader::new(parent, DirectoryScanCursor::start());
     while let Some(entry) = read.next_directory_entry(&mut reader)? {
-        if entry.entry().name() != name
-            && let Ok(long) = WindowsName::from_ext4(entry.entry().name())
-            && NameCase::Insensitive.lookup(&windows).matches(&long)
-        {
+        if entry.entry().name() == name {
+            continue;
+        }
+        let long = match WindowsName::from_ext4(entry.entry().name()) {
+            Ok(long) => long,
+            Err(DriverError::InvalidName) => continue,
+            Err(error) => return Err(error),
+        };
+        if NameCase::Insensitive.lookup(&windows).matches(&long) {
             return Ok(None);
         }
     }
