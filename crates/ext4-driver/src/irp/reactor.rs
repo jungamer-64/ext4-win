@@ -18,6 +18,7 @@ use crate::kernel::{
     fatal::KernelWideInconsistency,
     operational_trace::{OperationalOutcome, OperationalPath, OperationalTrace},
     status::{DriverError, DriverResult},
+    volume_verify::VerificationDevice,
 };
 use crate::memory::InPlaceInitialization;
 use crate::state::{KernelDevice, KernelFileObject, MountedVolumeAccess, MountedVolumeBinding};
@@ -725,6 +726,13 @@ pub(crate) enum OperationTransition {
         /// Fully captured native operation whose resource lease owns every referenced identity.
         work: crate::irp::PassiveWork,
         /// Operation moved by value into the work-item completion envelope.
+        suspended: Box<dyn CompletionOperation>,
+    },
+    /// Start blocking I/O Manager verification on a device-referenced thread.
+    VerifyMedia {
+        /// Referenced real device whose current medium needs verification.
+        device: VerificationDevice,
+        /// Original operation resumed after native verification returns.
         suspended: Box<dyn CompletionOperation>,
     },
     /// Transfer one break-causing top-level IRP to the stream-owned FsRtl oplock package.
@@ -3766,6 +3774,13 @@ impl CompletionReactor {
                     );
                     self.grant_available_intents();
                 }
+                OperationTransition::VerifyMedia { device, suspended } => {
+                    self.submit_native_verification(
+                        index,
+                        device,
+                        PassiveContinuation::Operation(suspended),
+                    );
+                }
                 OperationTransition::CheckOplock {
                     check,
                     owned,
@@ -4522,38 +4537,66 @@ impl CompletionReactor {
                     return;
                 }
             };
-        let work = crate::irp::PassiveWork::VerifyVolume(query);
-        let prepared = match self
-            .completion_rundown
-            .acquire()
-            .and_then(|lease| lease.ok_or(DriverError::InvalidDeviceRequest))
-            .and_then(|lease| PassiveWorkEnvelope::prepare_request(self.device, lease))
-        {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                self.set_ready_continuation(
-                    index,
-                    PassiveContinuation::Verification(suspended),
-                    CompletionEvent::PassiveCompleted(work.failed(error)),
-                );
-                return;
+        self.submit_native_verification(index, query, PassiveContinuation::Verification(suspended));
+    }
+
+    /// Issues verification without occupying the work queue that may be needed during a mount.
+    #[cfg(not(test))]
+    fn submit_native_verification(
+        &self,
+        index: usize,
+        query: VerificationDevice,
+        continuation: PassiveContinuation,
+    ) {
+        let phase = match &continuation {
+            PassiveContinuation::Verification(verification)
+                if matches!(verification.as_ref(), MediaVerification::Storage { .. }) =>
+            {
+                Phase::Verifying
             }
+            _ => Phase::Passive,
         };
+        let admission = self.with_mounted_access(|access| access.authorize_storage());
+        let rundown = admission.and_then(|()| {
+            if matches!(phase, Phase::Passive) && self.cancellation_is_pending(index) {
+                return Err(ext4_core::Error::OperationCancelled.into());
+            }
+            self.completion_rundown
+                .acquire()?
+                .ok_or(DriverError::InvalidDeviceRequest)
+        });
         let identity = self
             .with_scheduler(|scheduler| scheduler.identity(index))
             .unwrap_or_else(|| {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
             });
-        let prepared = prepared.bind(
-            NonNull::from(self),
-            identity,
-            work,
-            PassiveContinuation::Verification(suspended),
-        );
-        if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Verifying)) {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        let prepared = match rundown {
+            Ok(rundown) => PassiveWorkEnvelope::prepare_verification(
+                self.device,
+                rundown,
+                NonNull::from(self),
+                identity,
+                query,
+                continuation,
+            ),
+            Err(error) => Err((error, continuation)),
+        };
+        match prepared {
+            Ok(prepared) => {
+                if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, phase)) {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                }
+                PassiveWorkEnvelope::start_verification(prepared);
+                self.grant_available_intents();
+            }
+            Err((error, continuation)) => self.set_ready_continuation(
+                index,
+                continuation,
+                CompletionEvent::PassiveCompleted(super::PassiveWorkCompletion::VerifyVolume(Err(
+                    error,
+                ))),
+            ),
         }
-        PassiveWorkEnvelope::queue(prepared);
     }
 
     /// Verifies one pre-Cc denial while retaining the same handle lane and captured work.
@@ -4608,11 +4651,7 @@ impl CompletionReactor {
                 return;
             }
         };
-        self.submit_passive_work(
-            index,
-            super::PassiveWork::VerifyVolume(query),
-            PassiveContinuation::Verification(verified),
-        );
+        self.submit_native_verification(index, query, PassiveContinuation::Verification(verified));
     }
 
     /// Builds, registers, and submits the private mount-time length query.
@@ -6744,6 +6783,10 @@ mod tests {
                 suspended,
             } => {
                 drop(request);
+                drop(suspended);
+            }
+            OperationTransition::VerifyMedia { device, suspended } => {
+                let _result = device.execute();
                 drop(suspended);
             }
             OperationTransition::SubmitPassiveWork { work, suspended } => {

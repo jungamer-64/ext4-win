@@ -1,4 +1,4 @@
-//! Preallocated outer completions. Paging DPCs cannot be starved by Cache Manager workers.
+//! Preallocated outer completions. Paging and verification DPCs progress independently of workers.
 
 use core::{
     cell::UnsafeCell,

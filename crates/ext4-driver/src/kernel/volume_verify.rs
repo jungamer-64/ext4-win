@@ -78,6 +78,58 @@ impl VerificationDevice {
     }
 }
 
+/// Starts one finite native verification or VPB handoff on an I/O Manager-owned system thread.
+/// Its device reference prevents unload until the start routine returns. The request or retirement
+/// owner observes completion through its own retained envelope.
+/// # Safety
+/// The caller must run at PASSIVE_LEVEL, retain `owner` through creation, and transfer exclusive
+/// ownership of the valid context to `start` on success. The context stays with the caller on error.
+/// # Errors
+/// Returns the native thread-creation failure before the routine can run.
+#[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "IoCreateSystemThread retains the supplied device and transfers a caller-owned native context"
+)]
+pub(crate) unsafe fn start_verification_thread(
+    owner: KernelDevice,
+    start: wdk_sys::PKSTART_ROUTINE,
+    context: wdk_sys::PVOID,
+) -> DriverResult<()> {
+    let mut attributes = wdk_sys::OBJECT_ATTRIBUTES {
+        Length: u32::try_from(core::mem::size_of::<wdk_sys::OBJECT_ATTRIBUTES>())
+            .map_err(|_| DriverError::InternalInvariantViolation)?,
+        Attributes: wdk_sys::OBJ_KERNEL_HANDLE,
+        ..wdk_sys::OBJECT_ATTRIBUTES::default()
+    };
+    let mut handle = core::ptr::null_mut();
+    let status = unsafe {
+        // SAFETY: The caller retains the device and context until the I/O Manager takes ownership.
+        wdk_sys::ntddk::IoCreateSystemThread(
+            owner.as_ptr().cast(),
+            &raw mut handle,
+            wdk_sys::SYNCHRONIZE,
+            &raw mut attributes,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+            start,
+            context,
+        )
+    };
+    if status < 0 {
+        return Err(DriverError::MediaVerificationFailed(status));
+    }
+    let closed = unsafe {
+        // SAFETY: The context's operation owner observes completion independently of this handle.
+        // The I/O Manager retains the device until the system thread actually exits.
+        super::ffi::ZwClose(handle)
+    };
+    if closed != wdk_sys::STATUS_SUCCESS {
+        super::fatal::KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+    }
+    Ok(())
+}
+
 impl Drop for VerificationDevice {
     #[cfg_attr(
         not(test),

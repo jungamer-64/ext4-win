@@ -4571,8 +4571,8 @@ impl MutationRequestOperation {
             Err(error) => return self.complete_error(owned, error),
         };
         self.state = MutationOperationState::VerifyingCreateAdmission { owned, association };
-        OperationTransition::SubmitPassiveWork {
-            work: crate::irp::PassiveWork::VerifyVolume(query),
+        OperationTransition::VerifyMedia {
+            device: query,
             suspended: self,
         }
     }

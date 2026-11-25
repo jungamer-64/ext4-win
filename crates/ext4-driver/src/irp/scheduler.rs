@@ -1176,9 +1176,9 @@ mod tests {
         for class in [
             ExecutionClass::Ordinary,
             ExecutionClass::Release,
-            ExecutionClass::Verification,
             ExecutionClass::Paging,
             ExecutionClass::Finalization,
+            ExecutionClass::Verification,
         ] {
             for index in class.slots() {
                 let slot = require_some!(slots.get_mut(index));
@@ -1187,7 +1187,7 @@ mod tests {
             }
             assert!(!scheduler.available(class));
             assert!(scheduler.reserve(class).is_none());
-            if class == ExecutionClass::Release {
+            if class != ExecutionClass::Verification {
                 assert!(scheduler.available(ExecutionClass::Verification));
             }
             if class == ExecutionClass::Ordinary {

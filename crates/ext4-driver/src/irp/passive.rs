@@ -636,8 +636,6 @@ unsafe impl Send for PassiveWork {}
 pub(super) struct PassiveWorkEnvelope {
     /// First-field node, linked only after native work is complete.
     node: core::cell::UnsafeCell<LIST_ENTRY>,
-    /// Native queue storage owned until this envelope is finally destroyed.
-    work_item: NonNull<wdk_sys::_IO_WORKITEM>,
     /// I/O Manager callback device, retained through the worker lifetime.
     device: KernelDevice,
     /// Reuse policy and completion-destination lifetime are a single ownership fact.
@@ -666,9 +664,29 @@ pub(super) enum PassiveReclaim {
 #[cfg(not(test))]
 enum PassiveLifetime {
     /// Actor retirement precedes release of this prepared finalization reserve.
-    Reserve(CompletionRundownLease),
+    Reserve(NativeWorkItem, CompletionRundownLease),
     /// One dynamically prepared request owns this lease until completion reclamation.
-    Request(CompletionRundownLease),
+    Request(NativeWorkItem, CompletionRundownLease),
+    /// Thread-backed verification has no system work item.
+    Verification(CompletionRundownLease),
+}
+
+/// One owned system work item, always dequeued when its envelope is destroyed.
+#[cfg(not(test))]
+struct NativeWorkItem(NonNull<wdk_sys::_IO_WORKITEM>);
+
+#[cfg(not(test))]
+impl Drop for NativeWorkItem {
+    #[expect(
+        unsafe_code,
+        reason = "the envelope owns a dormant or dequeued work item"
+    )]
+    fn drop(&mut self) {
+        unsafe {
+            // SAFETY: Only an unpublished or exclusively reclaimed envelope can release its item.
+            ffi::IoFreeWorkItem(self.0.as_ptr());
+        }
+    }
 }
 
 /// Context kept until the actor reclaims the exact completed native call.
@@ -689,6 +707,8 @@ enum PassiveState {
     Dormant,
     /// The queue owns the next native call and its completion destination.
     Prepared(PassiveJob, PassiveWork),
+    /// A dedicated device thread owns this synchronous I/O Manager verification.
+    Verifying(PassiveJob, crate::kernel::volume_verify::VerificationDevice),
     /// The native call ended; the actor owns the result through inbox publication.
     Completed(PassiveJob, PassiveWorkCompletion),
 }
@@ -712,28 +732,25 @@ impl PassiveWorkEnvelope {
     /// Allocates storage before publication while the supplied lease pins its destination.
     /// # Errors
     /// Returns allocation failure before any callback or native effect has been submitted.
-    fn allocate(device: KernelDevice, lifetime: PassiveLifetime) -> DriverResult<Box<Self>> {
+    fn allocate(
+        device: KernelDevice,
+        lease: CompletionRundownLease,
+        lifetime: impl FnOnce(NativeWorkItem, CompletionRundownLease) -> PassiveLifetime,
+    ) -> DriverResult<Box<Self>> {
         let work_item = NonNull::new(unsafe {
             // SAFETY: Initialization or active request ownership retains the device.
             ffi::IoAllocateWorkItem(device.as_ptr())
         })
+        .map(NativeWorkItem)
         .ok_or(DriverError::InsufficientResources)?;
-        match memory::boxed_try_map(lifetime, |lifetime| Self {
-            node: core::cell::UnsafeCell::new(LIST_ENTRY::default()),
-            work_item,
-            device,
-            lifetime,
-            state: PassiveState::Dormant,
-        }) {
-            Ok(envelope) => Ok(envelope),
-            Err(failure) => {
-                unsafe {
-                    // SAFETY: This native item was never queued and allocation rollback owns it.
-                    ffi::IoFreeWorkItem(work_item.as_ptr());
-                }
-                Err(failure.into_parts().0)
-            }
-        }
+        memory::boxed_try_with(|| {
+            Ok(Self {
+                node: core::cell::UnsafeCell::new(LIST_ENTRY::default()),
+                device,
+                lifetime: lifetime(work_item, lease),
+                state: PassiveState::Dormant,
+            })
+        })
     }
 
     /// Prepares cache-map release storage before any open handle can depend on finalization.
@@ -743,7 +760,7 @@ impl PassiveWorkEnvelope {
         device: KernelDevice,
         lease: CompletionRundownLease,
     ) -> DriverResult<Box<Self>> {
-        Self::allocate(device, PassiveLifetime::Reserve(lease))
+        Self::allocate(device, lease, PassiveLifetime::Reserve)
     }
 
     /// Binds existing storage without allocation; its retained lifetime already pins the reactor.
@@ -775,14 +792,14 @@ impl PassiveWorkEnvelope {
         device: KernelDevice,
         rundown: CompletionRundownLease,
     ) -> DriverResult<Box<Self>> {
-        Self::allocate(device, PassiveLifetime::Request(rundown))
+        Self::allocate(device, rundown, PassiveLifetime::Request)
     }
 
     /// Consumes ordinary work before submission; finalization reserves are non-cancellable.
     pub(super) fn cancel_before_queue(
         mut envelope: Box<Self>,
     ) -> (PassiveWork, PassiveContinuation) {
-        if !matches!(envelope.lifetime, PassiveLifetime::Request(_)) {
+        if !matches!(envelope.lifetime, PassiveLifetime::Request(..)) {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
         let PassiveState::Prepared(job, work) =
@@ -795,11 +812,13 @@ impl PassiveWorkEnvelope {
 
     /// Native queue publication is infallible once storage and lifetime ownership exist.
     pub(super) fn queue(envelope: Box<Self>) {
-        let raw = Box::into_raw(envelope);
-        let work_item = unsafe {
-            // SAFETY: The callback exclusively owns this stable envelope after queue publication.
-            (*raw).work_item
+        let (PassiveLifetime::Reserve(work_item, _) | PassiveLifetime::Request(work_item, _)) =
+            &envelope.lifetime
+        else {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         };
+        let work_item = work_item.0;
+        let raw = Box::into_raw(envelope);
         unsafe {
             // SAFETY: Storage and lifetime lease retain the context through callback/inbox transfer.
             ffi::IoQueueWorkItem(
@@ -810,6 +829,57 @@ impl PassiveWorkEnvelope {
             );
         }
     }
+    /// Allocates a device-thread job without reserving a system work item.
+    /// # Errors
+    /// Returns allocation failure together with the original continuation.
+    pub(super) fn prepare_verification(
+        device: KernelDevice,
+        rundown: CompletionRundownLease,
+        reactor: NonNull<CompletionReactor>,
+        identity: SlotId,
+        query: crate::kernel::volume_verify::VerificationDevice,
+        suspended: PassiveContinuation,
+    ) -> Result<Box<Self>, (DriverError, PassiveContinuation)> {
+        memory::boxed_try_map(suspended, |suspended| Self {
+            node: core::cell::UnsafeCell::new(LIST_ENTRY::default()),
+            device,
+            lifetime: PassiveLifetime::Verification(rundown),
+            state: PassiveState::Verifying(
+                PassiveJob {
+                    reactor,
+                    identity,
+                    suspended,
+                },
+                query,
+            ),
+        })
+        .map_err(|failure| failure.into_parts())
+    }
+
+    /// Transfers the verification job to its own thread, or publishes a zero-effect failure.
+    pub(super) fn start_verification(envelope: Box<Self>) {
+        let device = envelope.device;
+        let address = Box::into_raw(envelope);
+        let result = unsafe {
+            // SAFETY: The boxed envelope retains the actor, device and unique verification job
+            // until the system thread consumes it or thread creation returns an error.
+            crate::kernel::volume_verify::start_verification_thread(
+                device,
+                Some(verification_thread),
+                address.cast(),
+            )
+        };
+        if let Err(error) = result {
+            let address = NonNull::new(address).unwrap_or_else(|| {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+            });
+            unsafe {
+                // SAFETY: Creation failed without transferring the unique envelope.
+                finish_verification(address, |_| Err(error));
+            }
+        }
+    }
+
     /// Projects the first-field inbox node while preserving access to the complete allocation.
     pub(super) fn node_ptr(envelope: NonNull<Self>) -> *mut LIST_ENTRY {
         envelope.as_ptr().cast()
@@ -846,7 +916,7 @@ impl PassiveWorkEnvelope {
         } else {
             completion
         };
-        let reserve = if matches!(envelope.lifetime, PassiveLifetime::Reserve(_)) {
+        let reserve = if matches!(envelope.lifetime, PassiveLifetime::Reserve(..)) {
             Some(envelope)
         } else {
             None
@@ -861,18 +931,12 @@ impl PassiveWorkEnvelope {
 
 #[cfg(not(test))]
 impl Drop for PassiveWorkEnvelope {
-    #[expect(
-        unsafe_code,
-        reason = "unique dormant/completed envelope ownership proves this native item is not queued"
-    )]
     fn drop(&mut self) {
-        unsafe {
-            // SAFETY: Pre-publication rollback or exclusive inbox reclamation owns the dequeued item.
-            ffi::IoFreeWorkItem(self.work_item.as_ptr());
-        }
-        // Reading the lease variants states the lifetime contract; they release only after native storage.
+        // The selected execution owner retains the reactor through all callback storage access.
         match &self.lifetime {
-            PassiveLifetime::Reserve(lease) | PassiveLifetime::Request(lease) => {
+            PassiveLifetime::Reserve(_, lease)
+            | PassiveLifetime::Request(_, lease)
+            | PassiveLifetime::Verification(lease) => {
                 let _retained = lease;
             }
         }
@@ -919,6 +983,57 @@ unsafe extern "C" fn passive_work_item(device: wdk_sys::PDEVICE_OBJECT, context:
         CompletionReactor::enqueue_passive_completion(reactor, address);
     }
     // The actor may reclaim or reuse storage immediately; no envelope access is permitted here.
+}
+
+/// Runs the blocking native call away from system work items and the mounted reactor.
+/// # Safety
+/// Context is the unique envelope transferred by a successful device-thread creation.
+#[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "thread creation transfers the unique verification context"
+)]
+unsafe extern "C" fn verification_thread(context: wdk_sys::PVOID) {
+    let address = NonNull::new(context.cast()).unwrap_or_else(|| {
+        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+    });
+    unsafe {
+        // SAFETY: The I/O Manager transferred ownership of this stable allocation to the thread.
+        finish_verification(
+            address,
+            crate::kernel::volume_verify::VerificationDevice::execute,
+        );
+    }
+}
+
+/// Publishes a verification result on the same reactor completion inbox as other passive results.
+/// # Safety
+/// The caller owns the unique, unlinked verification envelope and its captured device.
+#[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "the job owner transfers a completed envelope once"
+)]
+unsafe fn finish_verification(
+    mut address: NonNull<PassiveWorkEnvelope>,
+    verify: impl FnOnce(crate::kernel::volume_verify::VerificationDevice) -> DriverResult<()>,
+) {
+    let envelope = unsafe {
+        // SAFETY: The caller has exclusive ownership through completion publication.
+        address.as_mut()
+    };
+    let PassiveState::Verifying(job, query) =
+        core::mem::replace(&mut envelope.state, PassiveState::Dormant)
+    else {
+        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+    };
+    let reactor = job.reactor;
+    envelope.state =
+        PassiveState::Completed(job, PassiveWorkCompletion::VerifyVolume(verify(query)));
+    unsafe {
+        // SAFETY: The envelope's lease retains the destination until inbox publication.
+        CompletionReactor::enqueue_passive_completion(reactor, address);
+    }
 }
 
 #[cfg(test)]

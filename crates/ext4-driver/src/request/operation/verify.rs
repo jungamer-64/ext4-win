@@ -200,8 +200,8 @@ impl MountedVolumeOperation for VerifyAdmissionOperation {
                 CompletionEvent::Core(OperationEvent::Admitted),
             ) => {
                 self.state = VerifyAdmissionState::Waiting(owned);
-                OperationTransition::SubmitPassiveWork {
-                    work: crate::irp::PassiveWork::VerifyVolume(query),
+                OperationTransition::VerifyMedia {
+                    device: query,
                     suspended: self,
                 }
             }
