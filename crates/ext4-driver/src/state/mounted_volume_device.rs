@@ -1672,38 +1672,45 @@ unsafe extern "C" fn mounted_volume_retirement(device: PDEVICE_OBJECT, context: 
         // free it; the I/O Manager releases its device reference after the callback returns.
         ffi::IoFreeWorkItem(work_item.as_ptr());
     }
-    MountedVolumeAdmission::release_retired();
+    MOUNTED_VOLUMES.release_retired();
 }
 
-/// Closed bit of [`MOUNTED_VOLUMES`]; the remaining bits count live mounted volumes.
+/// Closed bit of the census. The low half counts all reservations and mounted devices;
+/// the intervening bits count the subset whose mount operation has not finished.
 const MOUNTED_VOLUMES_CLOSED: usize = 1 << (usize::BITS - 1);
 
-/// Driver-lifetime census of mounted volume devices that have not completed `IoDeleteDevice`.
-///
-/// The I/O Manager may invoke `DriverUnload` once every device has no open references, even
-/// while mounted devices are still retiring or listed as delete-pending. Prepare-unload
-/// therefore closes this census only when it is empty, refusing new mounts afterwards, and
-/// `DriverUnload` requires the closed empty census instead of an empty device list.
-static MOUNTED_VOLUMES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Unit of the count of mounts still in progress.
+const MOUNT_IN_PROGRESS: usize = 1 << (usize::BITS / 2);
+/// Mask of the total number of pending mounts and published devices.
+const MOUNT_COUNT: usize = MOUNT_IN_PROGRESS - 1;
+/// Mask of the number of pending mounts.
+const MOUNTS_PENDING: usize = MOUNTED_VOLUMES_CLOSED - MOUNT_IN_PROGRESS;
 
-/// One live mounted volume counted by the census until its device is deleted.
+/// Driver-lifetime mount intake and volume census.
+pub(crate) static MOUNTED_VOLUMES: MountedVolumeCensus = MountedVolumeCensus::new();
+
+/// Serializes mount reservations, publication, and unload against one atomic state.
+/// A device stays counted until its retirement calls `IoDeleteDevice`.
 #[derive(Debug)]
-pub(crate) struct MountedVolumeAdmission(());
+pub(crate) struct MountedVolumeCensus(core::sync::atomic::AtomicUsize);
 
-impl MountedVolumeAdmission {
-    /// Counts a mount before its device is created.
+impl MountedVolumeCensus {
+    /// Starts with open intake and no volumes.
+    const fn new() -> Self {
+        Self(core::sync::atomic::AtomicUsize::new(0))
+    }
+
+    /// Reserves census membership before starting mount I/O.
     /// # Errors
-    /// Returns invalid-device-request after prepare-unload closed the census, or resource
+    /// Returns invalid-device-request after mount intake closed, or resource
     /// exhaustion when the count cannot be represented.
-    pub(crate) fn acquire() -> DriverResult<Self> {
-        MOUNTED_VOLUMES
+    pub(crate) fn reserve_mount(&self) -> DriverResult<MountReservation<'_>> {
+        self.0
             .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-                if state & MOUNTED_VOLUMES_CLOSED != 0 {
-                    return None;
-                }
-                state
-                    .checked_add(1)
-                    .filter(|next| next & MOUNTED_VOLUMES_CLOSED == 0)
+                (state & MOUNTED_VOLUMES_CLOSED == 0
+                    && state & MOUNT_COUNT != MOUNT_COUNT
+                    && state & MOUNTS_PENDING != MOUNTS_PENDING)
+                    .then(|| state + MOUNT_IN_PROGRESS + 1)
             })
             .map_err(|state| {
                 if state & MOUNTED_VOLUMES_CLOSED != 0 {
@@ -1712,22 +1719,15 @@ impl MountedVolumeAdmission {
                     DriverError::InsufficientResources
                 }
             })?;
-        Ok(Self(()))
+        Ok(MountReservation { census: self })
     }
 
-    /// Transfers the count to the published device; retirement releases it after deletion.
-    pub(crate) fn publish(self) {
-        core::mem::forget(self);
-    }
-
-    /// Releases the count of a published device whose `IoDeleteDevice` has been called.
-    fn release_retired() {
-        if MOUNTED_VOLUMES
+    /// Removes the pending reservation and, on failure, releases its census membership.
+    fn finish_mount(&self, decrement: usize) {
+        if self
+            .0
             .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-                if state & !MOUNTED_VOLUMES_CLOSED == 0 {
-                    return None;
-                }
-                state.checked_sub(1)
+                (state & MOUNTS_PENDING != 0).then(|| state - decrement)
             })
             .is_err()
         {
@@ -1735,12 +1735,40 @@ impl MountedVolumeAdmission {
         }
     }
 
+    /// Releases the count of a published device whose `IoDeleteDevice` has been called.
+    fn release_retired(&self) {
+        if self
+            .0
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                let total = state & MOUNT_COUNT;
+                let pending = (state & MOUNTS_PENDING) / MOUNT_IN_PROGRESS;
+                (total > pending).then(|| state - 1)
+            })
+            .is_err()
+        {
+            KernelWideInconsistency::mounted_volume_state_corruption().bugcheck();
+        }
+    }
+
+    /// Closes mount intake for this image load so existing volumes can dismount without a
+    /// racing remount. Published volumes stay usable until their ordinary dismount.
+    /// # Errors
+    /// Returns device-busy while earlier reservations can still publish. Intake stays closed
+    /// and repeated requests observe the same drain.
+    pub(crate) fn quiesce_mounts(&self) -> DriverResult<()> {
+        let previous = self.0.fetch_or(MOUNTED_VOLUMES_CLOSED, Ordering::AcqRel);
+        if previous & MOUNTS_PENDING != 0 {
+            return Err(DriverError::DeviceBusy);
+        }
+        Ok(())
+    }
+
     /// Closes mount admission for driver retirement when no mounted volume remains.
     /// # Errors
-    /// Returns device-busy while a mounted volume is live or still retiring. A closed census
-    /// stays closed, so repeated requests are idempotent.
-    pub(crate) fn close_for_unload() -> DriverResult<()> {
-        MOUNTED_VOLUMES
+    /// Returns device-busy while a mount is pending or a volume is live or still retiring.
+    /// A closed census stays closed, so repeated requests are idempotent.
+    pub(crate) fn close_for_unload(&self) -> DriverResult<()> {
+        self.0
             .try_update(Ordering::AcqRel, Ordering::Acquire, |state| match state {
                 0 => Some(MOUNTED_VOLUMES_CLOSED),
                 MOUNTED_VOLUMES_CLOSED => Some(MOUNTED_VOLUMES_CLOSED),
@@ -1751,14 +1779,29 @@ impl MountedVolumeAdmission {
     }
 
     /// Reports whether prepare-unload closed the census with no mounted volume remaining.
-    pub(crate) fn retired_for_unload() -> bool {
-        MOUNTED_VOLUMES.load(Ordering::Acquire) == MOUNTED_VOLUMES_CLOSED
+    pub(crate) fn retired_for_unload(&self) -> bool {
+        self.0.load(Ordering::Acquire) == MOUNTED_VOLUMES_CLOSED
     }
 }
 
-impl Drop for MountedVolumeAdmission {
+/// One pending mount that remains counted until publication fails or transfers to its device.
+#[derive(Debug)]
+pub(crate) struct MountReservation<'census> {
+    /// Census that must observe the result of this reservation.
+    census: &'census MountedVolumeCensus,
+}
+
+impl MountReservation<'_> {
+    /// Transfers census membership to the published device. Device deletion releases it.
+    pub(crate) fn publish(self) {
+        self.census.finish_mount(MOUNT_IN_PROGRESS);
+        core::mem::forget(self);
+    }
+}
+
+impl Drop for MountReservation<'_> {
     fn drop(&mut self) {
-        Self::release_retired();
+        self.census.finish_mount(MOUNT_IN_PROGRESS + 1);
     }
 }
 
