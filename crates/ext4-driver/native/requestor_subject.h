@@ -1,6 +1,8 @@
 #ifndef EXT4WIN_REQUESTOR_SUBJECT_H
 #define EXT4WIN_REQUESTOR_SUBJECT_H
 
+#include "requestor_context.h"
+
 typedef struct _EXT4WIN_REQUESTOR_SUBJECT {
     SECURITY_SUBJECT_CONTEXT Subject;
     KPROCESSOR_MODE Mode;
@@ -10,23 +12,16 @@ typedef struct _EXT4WIN_REQUESTOR_SUBJECT {
 /* FsRtl releases and pool-frees this prefix after notification ownership transfers. */
 C_ASSERT(FIELD_OFFSET(EXT4WIN_REQUESTOR_SUBJECT, Subject) == 0);
 
-/* A filter may resume this IRP on a different thread. Use the IRP's retained
- * issuing thread and its stable owning process for user authorization. */
+/* A retained issuing thread does not retain the token it used at submission.
+ * Capture on its dispatch stack before any deferred execution. */
 static NTSTATUS ext4win_capture_irp_subject(PIRP irp, PSECURITY_SUBJECT_CONTEXT subject)
 {
-    PETHREAD thread = irp->Tail.Overlay.Thread;
-    PEPROCESS process;
-    if (irp->RequestorMode == KernelMode) {
-        SeCaptureSubjectContext(subject);
-        return STATUS_SUCCESS;
-    }
-    if (irp->RequestorMode != UserMode) { return STATUS_INVALID_PARAMETER; }
-    if (thread == NULL) { return STATUS_INVALID_DEVICE_STATE; }
-    process = PsGetThreadProcess(thread);
-    if (process == NULL || IoGetRequestorProcess(irp) != process) {
+    NTSTATUS status = ext4win_require_requestor_process(irp);
+    if (!NT_SUCCESS(status)) { return status; }
+    if (irp->RequestorMode == UserMode && irp->Tail.Overlay.Thread != PsGetCurrentThread()) {
         return STATUS_INVALID_DEVICE_STATE;
     }
-    SeCaptureSubjectContextEx(thread, process, subject);
+    SeCaptureSubjectContext(subject);
     return STATUS_SUCCESS;
 }
 
@@ -39,16 +34,18 @@ static BOOLEAN ext4win_subject_has_privilege(PSECURITY_SUBJECT_CONTEXT subject, 
     return SePrivilegeCheck(&required, subject, UserMode);
 }
 
-BOOLEAN NTAPI ext4win_requestor_has_privilege(PIRP irp, ULONG privilege)
+NTSTATUS NTAPI ext4win_require_requestor_privilege(PIRP irp, ULONG privilege)
 {
     SECURITY_SUBJECT_CONTEXT subject;
+    NTSTATUS status;
     BOOLEAN allowed;
-    if (KeGetCurrentIrql() != PASSIVE_LEVEL) { return 0; }
-    if (irp->RequestorMode == KernelMode) { return TRUE; }
-    if (!NT_SUCCESS(ext4win_capture_irp_subject(irp, &subject))) { return 0; }
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) { return STATUS_INVALID_DEVICE_STATE; }
+    if (irp->RequestorMode == KernelMode) { return STATUS_SUCCESS; }
+    status = ext4win_capture_irp_subject(irp, &subject);
+    if (!NT_SUCCESS(status)) { return status; }
     allowed = ext4win_subject_has_privilege(&subject, privilege);
     SeReleaseSubjectContext(&subject);
-    return allowed;
+    return allowed ? STATUS_SUCCESS : STATUS_PRIVILEGE_NOT_HELD;
 }
 
 /* The work item references the device until PASSIVE_LEVEL token retirement completes.

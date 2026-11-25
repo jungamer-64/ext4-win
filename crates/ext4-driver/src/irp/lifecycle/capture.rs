@@ -3,9 +3,7 @@
 use alloc::boxed::Box;
 use core::{ffi::c_void, num::NonZeroUsize, ptr::NonNull};
 
-use wdk_sys::PVOID;
-#[cfg(not(test))]
-use wdk_sys::{NTSTATUS, STATUS_SUCCESS};
+use wdk_sys::{NTSTATUS, PVOID, STATUS_SUCCESS};
 
 #[cfg(not(test))]
 use crate::kernel::ffi;
@@ -1029,60 +1027,41 @@ impl QueueContext {
 
 /// Checks the active IRP's effective requestor token before queue publication.
 /// # Errors
-/// Returns access denied without enabled volume-management privilege.
-#[cfg_attr(
-    not(test),
-    expect(
-        unsafe_code,
-        reason = "dispatch retains the IRP and its issuing thread"
-    )
-)]
-fn authorize_volume_management(_target: &ActiveIrp<'_>) -> Result<(), IrpCompletion> {
-    #[cfg(not(test))]
-    let allowed = unsafe {
-        // SAFETY: The active dispatch retains the IRP throughout the check.
-        ffi::ext4win_requestor_has_privilege(
-            _target.irp.as_ptr(),
-            wdk_sys::SE_MANAGE_VOLUME_PRIVILEGE,
-        )
-    } != 0;
-    #[cfg(test)]
-    let allowed = false;
-    if allowed {
-        Ok(())
-    } else {
-        Err(IrpCompletion::from_error(DriverError::AccessDenied))
+/// Returns the capture failure or access denied for a missing volume-management privilege.
+fn authorize_volume_management(target: &ActiveIrp<'_>) -> Result<(), IrpCompletion> {
+    let status = requestor_privilege_status(target, wdk_sys::SE_MANAGE_VOLUME_PRIVILEGE);
+    if status == wdk_sys::STATUS_PRIVILEGE_NOT_HELD {
+        return Err(IrpCompletion::from_error(DriverError::AccessDenied));
     }
+    ensure_native_success(status)
 }
 
 /// Checks symbolic-link authority from the active IRP before queue publication.
 /// # Errors
-/// Returns privilege-not-held without enabled symbolic-link creation privilege.
+/// Returns the capture failure or privilege-not-held for a missing symbolic-link privilege.
+fn authorize_symbolic_link(target: &ActiveIrp<'_>) -> Result<(), IrpCompletion> {
+    ensure_native_success(requestor_privilege_status(
+        target,
+        wdk_sys::SE_CREATE_SYMBOLIC_LINK_PRIVILEGE,
+    ))
+}
+
+/// Performs the native privilege check on the active issuing context.
 #[cfg_attr(
     not(test),
     expect(
         unsafe_code,
-        reason = "dispatch retains the IRP and its issuing thread"
+        reason = "dispatch retains the IRP while native code validates its issuing context"
     )
 )]
-fn authorize_symbolic_link(_target: &ActiveIrp<'_>) -> Result<(), IrpCompletion> {
+fn requestor_privilege_status(_target: &ActiveIrp<'_>, _privilege: u32) -> NTSTATUS {
     #[cfg(not(test))]
-    let allowed = unsafe {
+    unsafe {
         // SAFETY: The active dispatch retains the IRP throughout the check.
-        ffi::ext4win_requestor_has_privilege(
-            _target.irp.as_ptr(),
-            wdk_sys::SE_CREATE_SYMBOLIC_LINK_PRIVILEGE,
-        )
-    } != 0;
-    #[cfg(test)]
-    let allowed = false;
-    if allowed {
-        Ok(())
-    } else {
-        Err(IrpCompletion::from_native_failure(
-            wdk_sys::STATUS_PRIVILEGE_NOT_HELD,
-        ))
+        ffi::ext4win_require_requestor_privilege(_target.irp.as_ptr(), _privilege)
     }
+    #[cfg(test)]
+    wdk_sys::STATUS_PRIVILEGE_NOT_HELD
 }
 
 /// Captured mount-key operation authority of the active IRP's requestor.
@@ -1662,8 +1641,8 @@ fn capture_allocation_query(
     let starting_vcn = {
         let mut value = 0_i64;
         let status = unsafe {
-            // SAFETY: Dispatch owns this live FSCTL IRP in requestor context. Native capture
-            // probes and copies only the fixed STARTING_VCN prefix, never forming a Rust view.
+            // SAFETY: Dispatch owns the live FSCTL IRP. Native code checks the process and
+            // probes and copies only the fixed prefix without forming a Rust reference.
             ffi::ext4win_capture_allocation_start(
                 target.irp.as_ptr(),
                 core::ptr::addr_of_mut!(value),
@@ -1729,7 +1708,7 @@ impl CapturedRequestorOutput {
         not(test),
         expect(
             unsafe_code,
-            reason = "dispatch owns the IRP and its requestor process while C probes and locks output pages"
+            reason = "the native boundary checks the dispatch process before the output is probed and locked"
         )
     )]
     fn capture(target: &ActiveIrp<'_>, capacity: usize) -> Result<Self, IrpCompletion> {
@@ -1744,13 +1723,15 @@ impl CapturedRequestorOutput {
         {
             let length = wdk_sys::ULONG::try_from(capacity)
                 .map_err(|_| IrpCompletion::from_error(DriverError::InvalidParameter))?;
-            let user_buffer = unsafe {
-                // SAFETY: Dispatch retains the live IRP through queue-time capture.
-                (*target.irp.as_ptr()).UserBuffer
+            let mut user_buffer = core::ptr::null_mut();
+            let status = unsafe {
+                // SAFETY: Dispatch retains the IRP and exclusively owns this local output slot.
+                ffi::ext4win_requestor_output_address(target.irp.as_ptr(), &raw mut user_buffer)
             };
+            ensure_native_success(status)?;
             let native = unsafe {
-                // SAFETY: Dispatch retains original-process access to the bounded requestor
-                // output. No Rust references alias this buffer before terminal publication.
+                // SAFETY: The address was checked in this same dispatch context. Capture locks
+                // at most the bounded prefix without creating Rust references to requestor memory.
                 wdk::file_system::LockedRequestorOutput::capture(
                     user_buffer,
                     length,
@@ -1925,7 +1906,6 @@ impl Drop for CapturedSetSecurityDescriptor {
 /// # Errors
 ///
 /// Returns a completion preserving `status` when it is a failed NTSTATUS.
-#[cfg(not(test))]
 fn ensure_native_success(status: NTSTATUS) -> Result<(), IrpCompletion> {
     if status >= STATUS_SUCCESS {
         Ok(())

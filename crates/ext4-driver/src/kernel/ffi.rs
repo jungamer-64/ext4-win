@@ -204,10 +204,10 @@ pub(crate) use wdk_sys::ntddk::{
 unsafe extern "system" {
     /// # Safety
     /// The active IRP must retain its issuing thread through the privilege check.
-    pub(crate) fn ext4win_requestor_has_privilege(
+    pub(crate) fn ext4win_require_requestor_privilege(
         irp: wdk_sys::PIRP,
         privilege: wdk_sys::ULONG,
-    ) -> u8;
+    ) -> wdk_sys::NTSTATUS;
     /// Captures the effective requestor and retains a device-bound cleanup work item.
     pub(crate) fn ext4win_subject_capture(
         device: wdk_sys::PDEVICE_OBJECT,
@@ -356,6 +356,12 @@ unsafe extern "system" {
         value: *mut i64,
     ) -> wdk_sys::NTSTATUS;
 
+    /// Returns the non-null output address after checking the dispatch process.
+    pub(crate) fn ext4win_requestor_output_address(
+        irp: wdk_sys::PIRP,
+        address: *mut wdk_sys::PVOID,
+    ) -> wdk_sys::NTSTATUS;
+
     /// Snapshots buffered cluster-control ABI fields without acquiring object authority.
     pub(crate) fn ext4win_capture_cluster_control(
         irp: wdk_sys::PIRP,
@@ -369,8 +375,8 @@ unsafe extern "system" {
 
     /// Resolves an admitted embedded handle before leaving its original requestor context.
     pub(crate) fn ext4win_reference_cluster_file(
+        irp: wdk_sys::PIRP,
         handle: wdk_sys::HANDLE,
-        mode: wdk_sys::KPROCESSOR_MODE,
         file: *mut wdk_sys::PFILE_OBJECT,
         granted: *mut u32,
     ) -> wdk_sys::NTSTATUS;

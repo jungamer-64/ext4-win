@@ -57,6 +57,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed={SECURITY_CAPTURE_SOURCE}");
     println!("cargo:rerun-if-changed=native/cluster_control_capture.h");
     println!("cargo:rerun-if-changed=native/requestor_access.h");
+    println!("cargo:rerun-if-changed=native/requestor_buffer.h");
+    println!("cargo:rerun-if-changed=native/requestor_context.h");
     println!("cargo:rerun-if-changed=native/io_manager_input.h");
     println!("cargo:rerun-if-changed=native/input_validation.h");
     println!("cargo:rerun-if-changed={STREAM_CONTEXT_SOURCE}");

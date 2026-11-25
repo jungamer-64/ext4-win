@@ -125,11 +125,11 @@ impl PreparedClusterControl {
             let mut file = core::ptr::null_mut();
             if !handle.is_null() {
                 let status = unsafe {
-                    // SAFETY: This call remains on the captured IRP's original requestor thread;
-                    // Rust admitted the complete semantics before acquiring an object reference.
+                    // SAFETY: Dispatch retains the IRP and the admitted handle came from its
+                    // captured input. Native code checks the process before referencing it.
                     ffi::ext4win_reference_cluster_file(
+                        target.irp.as_ptr(),
                         handle,
-                        target.requestor_mode(),
                         &raw mut file,
                         &raw mut granted,
                     )

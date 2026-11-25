@@ -6,10 +6,16 @@ __declspec(dllimport) __declspec(noreturn) void __stdcall ExitProcess(unsigned);
 __declspec(dllimport) void * __cdecl memcpy(void *, const void *, size_t);
 #define assert(value) do { if (!(value)) { ExitProcess(__LINE__); } } while (0)
 #define _IRQL_requires_max_(value)
+#define _IRQL_requires_(value)
 #define NTAPI
+#define PASSIVE_LEVEL 0
+#define APC_LEVEL 1
+#define KernelMode 0
+#define UserMode 1
 #define NT_SUCCESS(value) ((value) >= 0)
 #define STATUS_SUCCESS ((NTSTATUS)0)
 #define STATUS_INVALID_PARAMETER ((NTSTATUS)0xc000000d)
+#define STATUS_INVALID_DEVICE_STATE ((NTSTATUS)0xc0000184)
 #define STATUS_BUFFER_TOO_SMALL ((NTSTATUS)0xc0000023)
 #define STATUS_NOT_SUPPORTED ((NTSTATUS)0xc00000bb)
 #define STATUS_INVALID_DEVICE_REQUEST ((NTSTATUS)0xc0000010)
@@ -37,7 +43,19 @@ typedef struct {
     unsigned char MajorFunction, MinorFunction;
     struct { struct { ULONG OutputBufferLength, InputBufferLength, FsControlCode; } FileSystemControl; } Parameters;
 } IO_STACK_LOCATION, *PIO_STACK_LOCATION;
-typedef struct { IO_STACK_LOCATION stack; struct { PVOID SystemBuffer; } AssociatedIrp; unsigned char RequestorMode; } IRP, *PIRP;
+typedef struct { unsigned identity; } EPROCESS, *PEPROCESS;
+typedef struct { PEPROCESS owner; } ETHREAD, *PETHREAD;
+typedef struct {
+    IO_STACK_LOCATION stack;
+    struct { PVOID SystemBuffer; } AssociatedIrp;
+    struct { struct { PETHREAD Thread; } Overlay; } Tail;
+    PEPROCESS requestor_process;
+    KPROCESSOR_MODE RequestorMode;
+} IRP, *PIRP;
+static EPROCESS issuer, unrelated;
+static ETHREAD issuing_thread = { &issuer };
+static PEPROCESS current_process = &issuer;
+static unsigned irql;
 static unsigned wow64, references;
 static NTSTATUS reference_status;
 static FILE_OBJECT object;
@@ -45,6 +63,10 @@ static void *object_type;
 static void **IoFileObjectType = &object_type;
 static PIO_STACK_LOCATION IoGetCurrentIrpStackLocation(PIRP irp) { return &irp->stack; }
 static unsigned IoIs32bitProcess(PIRP irp) { (void)irp; return wow64; }
+static unsigned KeGetCurrentIrql(void) { return irql; }
+static PEPROCESS PsGetThreadProcess(PETHREAD thread) { return thread->owner; }
+static PEPROCESS PsGetCurrentProcess(void) { return current_process; }
+static PEPROCESS IoGetRequestorProcess(PIRP irp) { return irp->requestor_process; }
 static void copy_bytes(void *target, const void *source, size_t width)
 {
     size_t i;
@@ -55,6 +77,7 @@ static NTSTATUS ObReferenceObjectByHandle(HANDLE handle, ACCESS_MASK desired, vo
 {
     assert(handle == (HANDLE)(uintptr_t)0x44);
     assert(desired == 0 && type == object_type && mode == 1);
+    assert(irql == PASSIVE_LEVEL && current_process == &issuer);
     references++;
     if (reference_status < 0) { return reference_status; }
     *result = &object;
@@ -82,7 +105,9 @@ int main(void)
     _Static_assert(sizeof(MOVE_FILE_DATA32) == 32 && offsetof(MOVE_FILE_DATA32, StartingVcn) == 8, "WOW64 MOVE ABI");
     _Static_assert(sizeof(MARK_HANDLE_INFO) == 24 && sizeof(MARK_HANDLE_INFO32) == 12, "MARK ABIs");
     irp.stack.MajorFunction = IRP_MJ_FILE_SYSTEM_CONTROL;
-    irp.RequestorMode = 1;
+    irp.RequestorMode = UserMode;
+    irp.Tail.Overlay.Thread = &issuing_thread;
+    irp.requestor_process = &issuer;
     irp.AssociatedIrp.SystemBuffer = input;
     for (mode = 0; mode < 2; mode++) {
         wow64 = mode;
@@ -91,7 +116,7 @@ int main(void)
         put32(input, 0, 0x44); put32(input, 8, 7); put32(input, 16, 109); put32(input, 24, 3);
         assert(ext4win_capture_cluster_control(&irp, &handle, &vcn, &lcn, &count, &source, &flags) == STATUS_SUCCESS);
         assert(handle == (HANDLE)(uintptr_t)0x44 && vcn == 7 && lcn == 109 && count == 3);
-        assert(ext4win_reference_cluster_file(handle, irp.RequestorMode, &file, &granted) == STATUS_SUCCESS);
+        assert(ext4win_reference_cluster_file(&irp, handle, &file, &granted) == STATUS_SUCCESS);
         assert(file == &object && granted == 0x123);
         irp.stack.Parameters.FileSystemControl.InputBufferLength = 31;
         assert(ext4win_capture_cluster_control(&irp, &handle, &vcn, &lcn, &count, &source, &flags) == STATUS_BUFFER_TOO_SMALL);
@@ -119,9 +144,25 @@ int main(void)
         assert(source == 1);
         assert(references == before);
     }
+    {
+        unsigned before = references;
+        current_process = &unrelated;
+        file = &object;
+        granted = 0x123;
+        assert(ext4win_reference_cluster_file(&irp, (HANDLE)(uintptr_t)0x44, &file, &granted)
+            == STATUS_INVALID_DEVICE_STATE);
+        assert(file == NULL && granted == 0 && references == before);
+        current_process = &issuer;
+        irql = APC_LEVEL;
+        assert(ext4win_reference_cluster_file(&irp, (HANDLE)(uintptr_t)0x44, &file, &granted)
+            == STATUS_INVALID_DEVICE_STATE);
+        assert(file == NULL && granted == 0 && references == before);
+        irql = PASSIVE_LEVEL;
+    }
     reference_status = STATUS_ACCESS_DENIED;
     put32(input, 0, 0); put32(input, 4, 0x44);
-    assert(ext4win_reference_cluster_file((HANDLE)(uintptr_t)0x44, irp.RequestorMode, &file, &granted) == STATUS_ACCESS_DENIED);
+    assert(ext4win_reference_cluster_file(&irp, (HANDLE)(uintptr_t)0x44, &file, &granted)
+        == STATUS_ACCESS_DENIED);
     assert(file == NULL);
     ExitProcess(0);
 }

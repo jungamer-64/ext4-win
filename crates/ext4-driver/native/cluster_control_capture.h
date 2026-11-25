@@ -1,6 +1,8 @@
 #ifndef EXT4WIN_CLUSTER_CONTROL_CAPTURE_H
 #define EXT4WIN_CLUSTER_CONTROL_CAPTURE_H
 
+#include "requestor_context.h"
+
 /* ABI capture and handle resolution both run in the requesting process before queue publication.
  * Rust admits the captured semantics before resolving a handle. Successful resolution transfers
  * one FILE_OBJECT reference; capture alone transfers no object ownership. */
@@ -65,16 +67,19 @@ NTSTATUS NTAPI ext4win_capture_cluster_control(
     return STATUS_SUCCESS;
 }
 
-/* Only synchronous requestor-context admission may use this captured handle identity. */
-_IRQL_requires_max_(APC_LEVEL)
-NTSTATUS NTAPI ext4win_reference_cluster_file(HANDLE handle, KPROCESSOR_MODE mode,
+/* Resolve a semantically admitted handle in the IRP's issuing process. */
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS NTAPI ext4win_reference_cluster_file(PIRP irp, HANDLE handle,
     PFILE_OBJECT *file, PACCESS_MASK granted)
 {
     OBJECT_HANDLE_INFORMATION information = {0};
     NTSTATUS status;
     *file = NULL; *granted = 0;
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) { return STATUS_INVALID_DEVICE_STATE; }
+    status = ext4win_require_requestor_process(irp);
+    if (!NT_SUCCESS(status)) { return status; }
     status = ObReferenceObjectByHandle(handle, 0, *IoFileObjectType,
-        mode, (PVOID *)file, &information);
+        irp->RequestorMode, (PVOID *)file, &information);
     if (NT_SUCCESS(status)) { *granted = information.GrantedAccess; }
     return status;
 }

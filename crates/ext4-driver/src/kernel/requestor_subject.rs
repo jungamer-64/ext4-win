@@ -28,7 +28,7 @@ impl NotificationSubject {
     /// # Safety
     /// The active dispatch must retain the device and IRP through this call.
     /// # Errors
-    /// Returns native IRQL/allocation failure; host fixtures cannot fabricate token authority.
+    /// Returns a context or allocation failure before delegation to FsRtl.
     #[expect(
         unsafe_code,
         reason = "native capture borrows the active IRP and device for effective-token capture"
@@ -102,7 +102,7 @@ impl RequestorSubject {
     /// # Safety
     /// The active dispatch must retain the device and IRP through this call.
     /// # Errors
-    /// Returns native allocation/IRQL failure; host tests cannot capture kernel token authority.
+    /// Returns a context or allocation failure before taking ownership of the subject.
     #[expect(
         unsafe_code,
         reason = "native capture retains tokens and a device-referenced release work item"

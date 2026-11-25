@@ -28,6 +28,7 @@
 #define VOID void
 #define NTAPI
 #define _Use_decl_annotations_
+#define _IRQL_requires_max_(level)
 #define UNREFERENCED_PARAMETER(value) ((void)(value))
 typedef int NTSTATUS, KPROCESSOR_MODE, BOOLEAN;
 typedef unsigned ULONG;
@@ -55,6 +56,8 @@ static DEVICE_OBJECT device;
 static int irql, pools, works, subjects, locks, fail_pool, fail_work;
 static const unsigned caller_token = 99;
 static int traversal_privilege, management_privilege;
+static PETHREAD current_thread;
+static PEPROCESS current_process;
 static PIO_WORKITEM queued;
 static PRIVILEGE_SET privilege;
 static SECURITY_DESCRIPTOR writable = {FILE_WRITE_ATTRIBUTES, STATUS_ACCESS_DENIED};
@@ -70,6 +73,8 @@ static int KeGetCurrentIrql(void) { return irql; }
 static unsigned RtlConvertUlongToLuid(unsigned privilege_id) { return privilege_id; }
 static PEPROCESS IoGetRequestorProcess(PIRP irp) { return irp->process; }
 static PEPROCESS PsGetThreadProcess(PETHREAD thread) { return thread->process; }
+static PEPROCESS PsGetCurrentProcess(void) { return current_process; }
+static PETHREAD PsGetCurrentThread(void) { return current_thread; }
 static BOOLEAN SePrivilegeCheck(PRIVILEGE_SET *required, PSECURITY_SUBJECT_CONTEXT subject, KPROCESSOR_MODE mode)
 {
     assert(irql == PASSIVE_LEVEL && mode == UserMode);
@@ -106,12 +111,10 @@ static void IoQueueWorkItem(PIO_WORKITEM work, PIO_WORKITEM_ROUTINE routine, int
     work->routine = routine; work->context = context; queued = work;
 }
 static void SeCaptureSubjectContext(SECURITY_SUBJECT_CONTEXT *subject)
-{ (void)subject; assert(0); }
-static void SeCaptureSubjectContextEx(PETHREAD thread, PEPROCESS process, SECURITY_SUBJECT_CONTEXT *subject)
 {
-    assert(irql == PASSIVE_LEVEL && thread->process == process);
+    assert(irql == PASSIVE_LEVEL && current_thread != NULL);
     subjects++;
-    subject->token = thread->token;
+    subject->token = current_thread->token;
 }
 static void SeReleaseSubjectContext(SECURITY_SUBJECT_CONTEXT *subject)
 { assert(irql == PASSIVE_LEVEL && subject->token == 77 && subjects == 1); subjects--; }
@@ -140,7 +143,10 @@ int main(void)
     PVOID subject = NULL;
     EPROCESS process = {1}, unrelated = {2};
     ETHREAD thread = {77, &process};
+    ETHREAD worker = {99, &process};
     IRP request = {{{&thread}}, UserMode, &process};
+    current_thread = &thread;
+    current_process = &process;
     fail_pool = 1;
     assert(ext4win_subject_capture(&device, &request, &subject) == STATUS_INSUFFICIENT_RESOURCES);
     assert(subject == NULL && pools == 0 && works == 0);
@@ -187,15 +193,29 @@ int main(void)
     request.RequestorMode = UserMode;
     request.Tail.Overlay.Thread = NULL;
     assert(ext4win_notification_subject_capture(&device, &request, &subject) == STATUS_INVALID_DEVICE_STATE);
-    assert(!ext4win_requestor_has_privilege(&request, SE_MANAGE_VOLUME_PRIVILEGE));
+    assert(ext4win_require_requestor_privilege(&request, SE_MANAGE_VOLUME_PRIVILEGE)
+        == STATUS_INVALID_DEVICE_STATE);
     request.Tail.Overlay.Thread = &thread;
     request.process = &unrelated;
     assert(ext4win_notification_subject_capture(&device, &request, &subject) == STATUS_INVALID_DEVICE_STATE);
     assert(subject == NULL && subjects == 0);
     request.process = &process;
-    assert(!ext4win_requestor_has_privilege(&request, SE_MANAGE_VOLUME_PRIVILEGE));
+    assert(ext4win_require_requestor_privilege(&request, SE_MANAGE_VOLUME_PRIVILEGE)
+        == STATUS_PRIVILEGE_NOT_HELD);
+
+    /* A same-process worker cannot use either its own token or the issuing thread's new token. */
+    current_thread = &worker;
+    thread.token = caller_token;
+    assert(ext4win_require_requestor_privilege(&request, SE_MANAGE_VOLUME_PRIVILEGE)
+        == STATUS_INVALID_DEVICE_STATE);
+    assert(ext4win_subject_capture(&device, &request, &subject) == STATUS_INVALID_DEVICE_STATE);
+    assert(ext4win_notification_subject_capture(&device, &request, &subject) == STATUS_INVALID_DEVICE_STATE);
+    assert(subject == NULL && subjects == 0 && works == 0 && pools == 0);
+    current_thread = &thread;
+    thread.token = 77;
+
     management_privilege = 1;
-    assert(ext4win_requestor_has_privilege(&request, SE_MANAGE_VOLUME_PRIVILEGE));
+    assert(ext4win_require_requestor_privilege(&request, SE_MANAGE_VOLUME_PRIVILEGE) == STATUS_SUCCESS);
     traversal_privilege = 1;
     assert(ext4win_notification_subject_capture(&device, &request, &subject) == STATUS_SUCCESS);
     assert(subject == NULL && subjects == 0 && works == 0);
