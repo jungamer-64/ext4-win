@@ -594,6 +594,7 @@ fn pack_attribute_information(
             | FILE_SUPPORTS_REPARSE_POINTS
             | FILE_SUPPORTS_EXTENDED_ATTRIBUTES
             | FILE_SUPPORTS_HARD_LINKS
+            | wdk_sys::FILE_SUPPORTS_OPEN_BY_FILE_ID
             | match access {
                 ext4_core::MediaAccess::ReadWrite => 0,
                 ext4_core::MediaAccess::ReadOnly => wdk_sys::FILE_READ_ONLY_VOLUME,
@@ -1177,9 +1178,10 @@ mod tests {
     }
 
     /// # Panics
-    /// Panics when the filesystem name, buffer boundaries or hard-link capability differ.
+    /// Panics when the filesystem name, buffer boundaries, hard-link or file-id open capability
+    /// differ.
     #[test]
-    fn attribute_information_reports_ext4_and_hard_links() {
+    fn attribute_information_reports_ext4_hard_links_and_file_id_opens() {
         let mut buffer = vec![0xA5; 128];
         let written =
             pack_attribute_information(buffer.as_mut_slice(), ext4_core::MediaAccess::ReadWrite);
@@ -1190,6 +1192,7 @@ mod tests {
         assert!(attributes.is_ok());
         if let Ok(attributes) = attributes {
             assert_ne!(attributes & wdk_sys::FILE_SUPPORTS_HARD_LINKS, 0);
+            assert_ne!(attributes & wdk_sys::FILE_SUPPORTS_OPEN_BY_FILE_ID, 0);
         }
         assert_eq!(
             LittleEndianInput::new(buffer.as_slice()).read_u32(WireOffset::new(8)),
