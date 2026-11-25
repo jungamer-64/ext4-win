@@ -970,8 +970,8 @@ enum VpbPublication {
     Mounted(PoolVpb),
     /// The ended session retains direct-access or failed-lock exclusion until owner release.
     Excluded(PoolVpb),
-    /// `STATUS_WRONG_VOLUME` gives the I/O Manager exclusive authority to install the successor.
-    HandingOffToIoManager,
+    /// The native verify may install a successor. The reserve survives until that attempt ends.
+    HandingOffToIoManager(PoolVpb),
     /// The I/O Manager owns a successor; this mount retains only its original VPB reference.
     Withdrawn,
 }
@@ -1416,15 +1416,6 @@ impl RetiringVpb {
         .unwrap_or_else(|_| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
         released.map_err(|wait| (self, wait))
     }
-}
-
-/// Native completion condition that still retains a retiring mount.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum VpbRetirementWait {
-    /// The I/O Manager has yet to replace the original after `STATUS_WRONG_VOLUME`.
-    IoManagerHandoff,
-    /// Native clients retain the detached VPB. The count includes the mount's reference.
-    References(u32),
 }
 
 /// Normalizes the WDK flag representation once at the native boundary.
