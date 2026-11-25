@@ -275,7 +275,8 @@ Verifier evidence identifying active checks and the loaded driver before and aft
 filesystem I/O. Unknown Verifier report formats fail validation. Live results apply to
 the generated volume and exercised scenarios, not arbitrary physical volumes or untested
 feature combinations. Disk offline/online cycles must preserve the volume GUID and drive
-letters. The [live-session owner](tools/xtask/src/live/owner.rs) defines
+letters. The driver must unload with the dismounted VHDX still attached and Driver
+Verifier active. The [live-session owner](tools/xtask/src/live/owner.rs) defines
 scenario execution and evidence collection.
 
 Live evaluation creates its own VHDX below `target/live-vhdx-sessions/<session-id>/` and

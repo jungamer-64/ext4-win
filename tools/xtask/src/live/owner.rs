@@ -1037,7 +1037,7 @@ pub(crate) fn read_remount_payload(path: &Path) -> TaskResult<()> {
     combine_verification_and_cleanup(readback, closed)
 }
 
-/// Executes startup discovery, native I/O and reattachment while the same driver remains loaded.
+/// Executes native I/O, remount, unload with attached storage, and hot-attach after restart.
 /// # Errors
 /// Returns load, Verifier, discovery, filesystem, hot-attach or required detachment failures.
 fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<()> {
@@ -1093,10 +1093,18 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
     dismount_filesystem(session)?;
     remove_namespace(session)?;
     exercise_offline_online(session, &payload)?;
-    attachment(session, false)?;
-    wait_removed(session)?;
+    storage::validate(&scope)?;
+    observe_verifier(session)?;
+    println!("live unload: stop the driver with the session VHDX still attached");
     session.publish(Phase::Intent(Operation::StopDriver))?;
-    driver_load::restart_session(root, session.id())?;
+    let id = session.id().clone();
+    driver_load::restart_session(root, &id, || {
+        session.publish(Phase::Observed(Operation::StopDriver))?;
+        storage::validate(&scope)?;
+        attachment(session, false)?;
+        wait_removed(session)?;
+        session.publish(Phase::Intent(Operation::StartDriver))
+    })?;
     session.publish(Phase::Observed(Operation::StartDriver))?;
     activate_verifier(session)?;
     attachment(session, true)?;

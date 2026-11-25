@@ -584,10 +584,15 @@ pub(crate) fn start_session(
     Ok(session.state().bundle.artifact.clone())
 }
 
-/// Restarts the bound installed service after its disposable volumes have drained.
+/// Restarts the bound installed service and runs the storage transition while SCM is Stopped.
 /// # Errors
-/// Returns identity mismatch, an unresolved prior lifecycle state, retirement, stop or start failure.
-pub(crate) fn restart_session(root: &Path, id: &SessionId) -> TaskResult<()> {
+/// Returns identity, retirement, stop, storage transition or start failure. A failed storage
+/// transition leaves the observed stop available to session cleanup.
+pub(crate) fn restart_session(
+    root: &Path,
+    id: &SessionId,
+    while_stopped: impl FnOnce() -> TaskResult<()>,
+) -> TaskResult<()> {
     let mut session = recovered(root, id)?;
     bind_service(&mut session, PackagePresence::Present)?;
     if windows_host::service_state("ext4win")? != Some(4) {
@@ -614,6 +619,7 @@ pub(crate) fn restart_session(root: &Path, id: &SessionId) -> TaskResult<()> {
     scm(&mut session, Operation::StopDriver, "stop")?;
     wait_stopped(Duration::from_secs(60))?;
     session.publish(Phase::Observed(Operation::StopDriver))?;
+    while_stopped()?;
     scm(&mut session, Operation::StartDriver, "start")?;
     wait_state(4, Duration::from_secs(15))?;
     session.publish(Phase::Observed(Operation::StartDriver))
