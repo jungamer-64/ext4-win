@@ -88,6 +88,8 @@ const JBD2_CHECKSUM_CRC32C: u8 = 4;
 const JOURNAL_HEADER_BYTES: usize = 12;
 /// Byte offset of the checksum that authenticates a metadata-checksummed commit block.
 const JOURNAL_COMMIT_CHECKSUM_OFFSET: usize = 0x10;
+/// Offset of the big-endian commit time in seconds.
+const JOURNAL_COMMIT_SECONDS_OFFSET: usize = 0x30;
 /// Full commit-header storage, including the trailing alignment bytes before block padding.
 const JOURNAL_COMMIT_HEADER_BYTES: usize = 0x40;
 /// Bytes occupied by the JBD2 superblock payload.
@@ -803,6 +805,8 @@ struct RecoverySummary {
     revoke_records: usize,
     /// Number of complete committed transactions.
     transactions: u32,
+    /// Seconds recorded by the last authenticated commit in this scan.
+    last_commit_seconds: u64,
 }
 
 /// One validated descriptor tag retained only for the active transaction.
@@ -1034,6 +1038,7 @@ impl JournalRecoveryOperation {
                 max_transaction_tags: 0,
                 revoke_records: 0,
                 transactions: 0,
+                last_commit_seconds: 0,
             },
             tags: Vec::new(),
             revokes: Vec::new(),
@@ -1376,7 +1381,7 @@ impl JournalRecoveryOperation {
     /// Performs the allocation-free committed-prefix scan pass.
     /// # Errors
     ///
-    /// Returns an error for arithmetic overflow or unsupported committed revoke structure.
+    /// Returns an error for corrupt commits, unsupported revoke structure or arithmetic overflow.
     fn scan_control_block(&mut self, block: &[u8]) -> Result<()> {
         let Ok(header) = Jbd2Header::parse(block) else {
             return self.finish_scan();
@@ -1416,12 +1421,16 @@ impl JournalRecoveryOperation {
                 self.advance_walk_blocks(1)?;
             }
             JBD2_COMMIT_BLOCK => {
-                if self
-                    .journal
-                    .parse_commit_block(block, self.walk.sequence)
-                    .is_err()
-                {
-                    return self.finish_scan();
+                let seconds = be_u64(block, disk_offset(JOURNAL_COMMIT_SECONDS_OFFSET))?;
+                if let Err(error) = self.journal.parse_commit_block(block, self.walk.sequence) {
+                    // A clean read-only mount can discard the log. During replay, an earlier
+                    // timestamp identifies stale ring contents even if the sequence was reused.
+                    if self.policy == RecoveryPolicy::Discard
+                        || seconds < self.summary.last_commit_seconds
+                    {
+                        return self.finish_scan();
+                    }
+                    return Err(error);
                 }
                 if self.walk.scan_transaction_tags == 0 && self.walk.scan_transaction_revokes == 0 {
                     return Err(Error::JournalCorrupt);
@@ -1444,6 +1453,7 @@ impl JournalRecoveryOperation {
                 self.walk.sequence = self.walk.sequence.next();
                 self.summary.end_cursor = self.walk.cursor;
                 self.summary.next_sequence = self.walk.sequence;
+                self.summary.last_commit_seconds = seconds;
                 self.walk.scan_transaction_tags = 0;
                 self.walk.scan_transaction_revokes = 0;
                 if self.walk.consumed >= self.journal.usable_log_blocks()? {
@@ -5041,8 +5051,8 @@ mod tests {
 
     /// # Panics
     ///
-    /// Panics when an unauthenticated torn commit becomes committed, an authenticated partial
-    /// commit is discarded, or committed descriptor corruption is ignored.
+    /// Panics when recovery discards an authenticated partial commit or accepts corruption in
+    /// the active log.
     #[test]
     fn recovery_accepts_authenticated_partial_commit_and_rejects_corruption() {
         let outcome = (|| -> Result<()> {
@@ -5087,8 +5097,11 @@ mod tests {
                 RecoveryState::NeedsRecovery,
             )?;
             torn_recovery.scan_control_block(&descriptor)?;
-            torn_recovery.scan_control_block(&torn)?;
-            assert!(matches!(torn_recovery.phase, RecoveryPhase::Validate));
+            assert_eq!(
+                torn_recovery.scan_control_block(&torn),
+                Err(Error::ChecksumMismatch)
+            );
+            assert!(matches!(torn_recovery.phase, RecoveryPhase::Scan));
             assert_eq!(torn_recovery.summary.transactions, 0);
 
             let mut committed =
@@ -5108,6 +5121,65 @@ mod tests {
             Ok(())
         })();
         assert_eq!(outcome, Ok(()));
+    }
+
+    /// # Errors
+    /// Returns fixture encoding or journal scan failures.
+    /// # Panics
+    /// Fails if missing or stale commit records prevent recovery of the valid prefix.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare replay boundaries with independently selected wire fields"
+    )]
+    fn recovery_stops_before_a_missing_or_stale_commit() -> Result<()> {
+        let journal = test_external_journal::<LoadedJournal>(
+            0,
+            JBD2_FEATURE_INCOMPAT_CSUM_V3,
+            64,
+            17,
+            3,
+            3,
+            100,
+        )?;
+        let block_size = journal.geometry.block_size;
+        let metadata = [JournalBlock::new(BlockAddress::new(10), vec![0x44; 1024])];
+        let data = [vec![0x44; 1024]];
+        let descriptor = journal.encode_descriptor_block(
+            JournalSequence::new(17),
+            &metadata,
+            &data,
+            block_size,
+        )?;
+        let mut commit = journal.encode_commit_block(JournalSequence::new(17), block_size)?;
+        put_be_u32(&mut commit, DiskOffset::new(0x34), 123)?;
+        put_be_u32(
+            &mut commit,
+            DiskOffset::new(JOURNAL_COMMIT_CHECKSUM_OFFSET),
+            0,
+        )?;
+        let checksum =
+            journal.block_checksum_with_zeroed(&commit, JOURNAL_COMMIT_CHECKSUM_OFFSET)?;
+        put_be_u32(
+            &mut commit,
+            DiskOffset::new(JOURNAL_COMMIT_CHECKSUM_OFFSET),
+            checksum,
+        )?;
+        let mut stale = journal.encode_commit_block(JournalSequence::new(18), block_size)?;
+        *stale.get_mut(0x10).ok_or(Error::TruncatedStructure)? ^= 1;
+        for tail in [vec![0; 1024], commit.clone(), stale] {
+            let mut recovery = JournalRecoveryOperation::new(
+                journal.copy_without_state::<LoadedJournal>()?,
+                RecoveryState::NeedsRecovery,
+            )?;
+            recovery.scan_control_block(&descriptor)?;
+            recovery.scan_control_block(&commit)?;
+            recovery.scan_control_block(&tail)?;
+            assert!(matches!(recovery.phase, RecoveryPhase::Validate));
+            assert_eq!(recovery.summary.transactions, 1);
+            assert_eq!(recovery.summary.next_sequence, JournalSequence::new(18));
+        }
+        Ok(())
     }
 
     /// # Panics

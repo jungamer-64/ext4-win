@@ -6479,6 +6479,59 @@ fn journal_checksum_zero_does_not_disable_authentication() -> Result<()> {
 }
 
 /// # Errors
+/// Propagates fixture setup, durable commit preparation or unexpected mount failures.
+/// # Panics
+/// Fails if corrupt commit recovery modifies either device or publishes a successful mount.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare recovery results and both complete media images"
+)]
+fn active_commit_checksum_failure_preserves_the_log() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let (_ticket, durable) = durable_label_change(&mut fixture)?;
+    drop(durable);
+    let active_journal = fixture.disk.journal.clone();
+    let sequence = active_journal.get(4120..4124).ok_or(Error::DeviceRange)?;
+    let commit = fixture
+        .disk
+        .journal
+        .as_chunks_mut::<4096>()
+        .0
+        .iter_mut()
+        .find(|block| {
+            block.get(..8) == Some([0xc0, 0x3b, 0x39, 0x98, 0, 0, 0, 2].as_slice())
+                && block.get(8..12) == Some(sequence)
+        })
+        .ok_or(Error::JournalCorrupt)?;
+    *commit.get_mut(16).ok_or(Error::DeviceRange)? ^= 1;
+    let filesystem = fixture.disk.filesystem.clone();
+    let damaged_journal = fixture.disk.journal.clone();
+    let effects = fixture.disk.storage_effects;
+    for access in [
+        MountAccess::ReadWrite,
+        MountAccess::ReadOnly {
+            recovery: ReadOnlyRecovery::Replay,
+        },
+    ] {
+        assert_eq!(
+            fixture.disk.mount(access).err(),
+            Some(Error::ChecksumMismatch)
+        );
+        assert_eq!(fixture.disk.storage_effects, effects);
+        assert_eq!(fixture.disk.filesystem, filesystem);
+        assert_eq!(fixture.disk.journal, damaged_journal);
+    }
+    fixture.disk.journal = active_journal;
+    let (_, epoch, _, _) = fixture.disk.mount(MountAccess::ReadWrite)?.into_parts();
+    assert_eq!(
+        epoch.identity().label(),
+        Ext4VolumeLabel::new(b"committed")?
+    );
+    Ok(())
+}
+
+/// # Errors
 /// Returns fixture encoding failures.
 /// # Panics
 /// Fails if an unsupported format selector reaches journal replay or mount writes.
