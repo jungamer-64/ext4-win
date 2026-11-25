@@ -1,6 +1,31 @@
 #ifndef EXT4WIN_FAST_IO_QUERY_H
 #define EXT4WIN_FAST_IO_QUERY_H
 
+_Success_(return != FALSE)
+static BOOLEAN
+ext4win_capture_fast_io_query_snapshot(
+    _In_ PEXT4WIN_STREAM_CONTEXT stream,
+    _In_ BOOLEAN wait,
+    _Out_ PEXT4WIN_FAST_IO_QUERY_SNAPSHOT snapshot)
+{
+    BOOLEAN valid;
+
+    if (wait) {
+        ExAcquireFastMutex(&stream->HeaderMutex);
+    } else if (!ExTryToAcquireFastMutex(&stream->HeaderMutex)) {
+        return FALSE;
+    }
+    valid = (stream->MetadataValid != FALSE) &&
+        (InterlockedCompareExchange(&stream->NamespaceQueryFallback, FALSE, FALSE) == FALSE);
+    if (valid) {
+        snapshot->Metadata = stream->PublishedMetadata;
+        snapshot->AllocationSize.QuadPart = stream->AllocationCharge;
+        snapshot->EndOfFile = stream->Header.FileSize;
+    }
+    ExReleaseFastMutex(&stream->HeaderMutex);
+    return valid;
+}
+
 /* Admission and the committed metadata snapshot are observed under shared MainResource.
  * Fast I/O passes the requestor's raw buffer, so publication starts only after release:
  * a contained requestor fault cannot retain the resource or its critical region. */
@@ -15,7 +40,7 @@ ext4win_fast_io_query_observe(
     BOOLEAN captured;
 
     if (!ext4win_acquire_fast_io_query_stream(file_object, wait, &stream)) { return FALSE; }
-    captured = ext4win_capture_fast_io_query_snapshot(stream, snapshot);
+    captured = ext4win_capture_fast_io_query_snapshot(stream, wait, snapshot);
     wdk_sys_release_resource(&stream->MainResource);
     return captured;
 }

@@ -1052,26 +1052,6 @@ ext4win_acquire_fast_io_query_stream(
     return TRUE;
 }
 
-_Success_(return != FALSE)
-static BOOLEAN
-ext4win_capture_fast_io_query_snapshot(
-    _In_ PEXT4WIN_STREAM_CONTEXT stream,
-    _Out_ PEXT4WIN_FAST_IO_QUERY_SNAPSHOT snapshot)
-{
-    BOOLEAN valid;
-
-    ExAcquireFastMutex(&stream->HeaderMutex);
-    valid = (stream->MetadataValid != FALSE) &&
-        (InterlockedCompareExchange(&stream->NamespaceQueryFallback, FALSE, FALSE) == FALSE);
-    if (valid) {
-        snapshot->Metadata = stream->PublishedMetadata;
-        snapshot->AllocationSize.QuadPart = stream->AllocationCharge;
-        snapshot->EndOfFile = stream->Header.FileSize;
-    }
-    ExReleaseFastMutex(&stream->HeaderMutex);
-    return valid;
-}
-
 #include "fast_io_query.h"
 
 #include "fast_io_lock.h"

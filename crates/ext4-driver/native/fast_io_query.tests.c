@@ -40,8 +40,18 @@ typedef struct { NTSTATUS Status; ULONG_PTR Information; } IO_STATUS_BLOCK, *PIO
 typedef struct { unsigned identity; } DEVICE_OBJECT, *PDEVICE_OBJECT;
 typedef struct { unsigned identity; } FILE_OBJECT, *PFILE_OBJECT;
 typedef struct { unsigned held; } ERESOURCE, *PERESOURCE;
-typedef struct { ERESOURCE MainResource; } EXT4WIN_STREAM_CONTEXT, *PEXT4WIN_STREAM_CONTEXT;
-typedef struct { unsigned long long marker; } EXT4WIN_FAST_IO_QUERY_SNAPSHOT,
+typedef struct { unsigned held; } FAST_MUTEX;
+typedef struct { long long QuadPart; } LARGE_INTEGER;
+typedef struct {
+    ERESOURCE MainResource;
+    FAST_MUTEX HeaderMutex;
+    LONG MetadataValid;
+    LONG NamespaceQueryFallback;
+    unsigned PublishedMetadata;
+    long long AllocationCharge;
+    struct { LARGE_INTEGER FileSize; } Header;
+} EXT4WIN_STREAM_CONTEXT, *PEXT4WIN_STREAM_CONTEXT;
+typedef struct { unsigned Metadata; LARGE_INTEGER AllocationSize, EndOfFile; } EXT4WIN_FAST_IO_QUERY_SNAPSHOT,
     *PEXT4WIN_FAST_IO_QUERY_SNAPSHOT;
 typedef struct { unsigned long long times[4]; ULONG attributes; } FILE_BASIC_INFORMATION,
     *PFILE_BASIC_INFORMATION;
@@ -72,28 +82,46 @@ static void RtlCopyVolatileMemory(volatile void *destination, volatile const voi
 }
 #include "requestor_access.h"
 
-static EXT4WIN_STREAM_CONTEXT stream;
+static EXT4WIN_STREAM_CONTEXT stream = { .MetadataValid = TRUE, .PublishedMetadata = 0x5a,
+    .AllocationCharge = 4096, .Header = { { 120 } } };
 static FILE_OBJECT file;
 static DEVICE_OBJECT device;
-static BOOLEAN admitted = TRUE, snapshot_valid = TRUE;
+static BOOLEAN admitted = TRUE;
 static unsigned acquisitions, releases, encodings;
 
 static BOOLEAN ext4win_acquire_fast_io_query_stream(
     PFILE_OBJECT observed, BOOLEAN wait, PEXT4WIN_STREAM_CONTEXT *stream_out)
 {
-    assert(observed == &file && wait && stream.MainResource.held == 0);
+    assert(observed == &file && stream.MainResource.held == 0);
+    (void)wait;
     if (!admitted) { return FALSE; }
     stream.MainResource.held = 1;
     ++acquisitions;
     *stream_out = &stream;
     return TRUE;
 }
-static BOOLEAN ext4win_capture_fast_io_query_snapshot(
-    PEXT4WIN_STREAM_CONTEXT observed, PEXT4WIN_FAST_IO_QUERY_SNAPSHOT snapshot)
+static BOOLEAN ExTryToAcquireFastMutex(FAST_MUTEX *mutex)
 {
-    assert(observed == &stream && stream.MainResource.held == 1);
-    snapshot->marker = 0x5a;
-    return snapshot_valid;
+    assert(mutex == &stream.HeaderMutex && stream.MainResource.held == 1);
+    if (mutex->held) { return FALSE; }
+    mutex->held = 1;
+    return TRUE;
+}
+static void ExAcquireFastMutex(FAST_MUTEX *mutex)
+{
+    assert(ExTryToAcquireFastMutex(mutex));
+}
+static void ExReleaseFastMutex(FAST_MUTEX *mutex)
+{
+    assert(mutex == &stream.HeaderMutex && mutex->held && stream.MainResource.held == 1);
+    mutex->held = 0;
+}
+static LONG InterlockedCompareExchange(volatile LONG *value, LONG exchange, LONG compare)
+{
+    LONG prior = *value;
+    assert(stream.HeaderMutex.held);
+    if (prior == compare) { *value = exchange; }
+    return prior;
 }
 static void wdk_sys_release_resource(PERESOURCE resource)
 {
@@ -104,21 +132,21 @@ static void wdk_sys_release_resource(PERESOURCE resource)
 static void ext4win_fast_io_basic_record(const EXT4WIN_FAST_IO_QUERY_SNAPSHOT *snapshot,
     PFILE_BASIC_INFORMATION output)
 {
-    assert(snapshot->marker == 0x5a && stream.MainResource.held == 0);
+    assert(snapshot->Metadata == 0x5a && stream.MainResource.held == 0 && !stream.HeaderMutex.held);
     ++encodings;
     output->attributes = 0x20;
 }
 static void ext4win_fast_io_standard_record(const EXT4WIN_FAST_IO_QUERY_SNAPSHOT *snapshot,
     PFILE_STANDARD_INFORMATION output)
 {
-    assert(snapshot->marker == 0x5a && stream.MainResource.held == 0);
+    assert(snapshot->AllocationSize.QuadPart == 4096 && stream.MainResource.held == 0 && !stream.HeaderMutex.held);
     ++encodings;
     output->links = 2;
 }
 static void ext4win_fast_io_network_record(const EXT4WIN_FAST_IO_QUERY_SNAPSHOT *snapshot,
     PFILE_NETWORK_OPEN_INFORMATION output)
 {
-    assert(snapshot->marker == 0x5a && stream.MainResource.held == 0);
+    assert(snapshot->EndOfFile.QuadPart == 120 && stream.MainResource.held == 0 && !stream.HeaderMutex.held);
     ++encodings;
     output->attributes = 0x80;
 }
@@ -167,7 +195,7 @@ int main(void)
     assert(encodings == 6);
 
     /* Rejected snapshots release the resource and fall back without encoding. */
-    snapshot_valid = FALSE;
+    stream.MetadataValid = FALSE;
     assert(!ext4win_fast_io_query_basic_info(&file, TRUE, &basic, &status, &device));
     assert(status.Status == STATUS_NOT_SUPPORTED && status.Information == 0);
     assert_balanced(7);
@@ -176,5 +204,19 @@ int main(void)
     admitted = FALSE;
     assert(!ext4win_fast_io_query_basic_info(&file, TRUE, &basic, &status, &device));
     assert_balanced(7);
+    admitted = TRUE;
+    stream.MetadataValid = TRUE;
+    stream.HeaderMutex.held = 1;
+    assert(!ext4win_fast_io_query_basic_info(&file, FALSE, &basic, &status, &device));
+    assert(!ext4win_fast_io_query_standard_info(&file, FALSE, &standard, &status, &device));
+    assert(!ext4win_fast_io_query_network_open_info(&file, FALSE, &network, &status, &device));
+    assert(status.Status == STATUS_NOT_SUPPORTED && status.Information == 0);
+    assert_balanced(10);
+    assert(stream.HeaderMutex.held && encodings == 6);
+    stream.HeaderMutex.held = 0;
+    assert(ext4win_fast_io_query_basic_info(&file, FALSE, &basic, &status, &device));
+    assert(status.Status == STATUS_SUCCESS && status.Information == sizeof(basic));
+    assert_balanced(11);
+    assert(!stream.HeaderMutex.held && encodings == 7);
     ExitProcess(0);
 }
