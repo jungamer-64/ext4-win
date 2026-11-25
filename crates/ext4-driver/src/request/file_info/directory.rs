@@ -630,73 +630,98 @@ fn select_directory_name(
     Ok(None)
 }
 
+/// Expression state of the directory handle when one query is admitted.
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the prepared query moves directly into the request allocation without a per-query box"
+)]
+pub(crate) enum DirectoryQueryStart {
+    /// The handle already holds the expression captured by its first query.
+    Prepared(DirectoryQuery),
+    /// The first query must observe this directory's comparison before capturing its expression.
+    ComparisonRequired(DirectoryNodeId),
+}
+
 impl DirectoryQuery {
-    /// Captures the initial expression at admission; output and cursor remain private until copy.
+    /// Reuses the handle's expression, or reports that the first query must capture one.
+    /// # Errors
+    /// Returns invalid handle, allocation, or shared-lease exhaustion errors.
+    pub(crate) fn start(mut request: PendingIrpLease<'_>) -> DriverResult<DirectoryQueryStart> {
+        let (existing, directory) = request.with_active(|active| {
+            let opened = OpenedDirectory::decode(active.current_stack()?.file_object()?)?;
+            Ok::<_, DriverError>((opened.search().expression()?, opened.id()))
+        })?;
+        match existing {
+            Some(pattern) => {
+                Self::with_pattern(request, pattern).map(DirectoryQueryStart::Prepared)
+            }
+            None => Ok(DirectoryQueryStart::ComparisonRequired(directory)),
+        }
+    }
+
+    /// Captures the first expression under the comparison this directory had when it was observed.
+    /// A case-sensitive directory matches exactly even when the handle was opened insensitively;
+    /// later changes to the directory do not alter an expression already captured by a handle.
     /// # Errors
     /// Returns invalid handle/pattern, allocation, or shared-lease exhaustion errors.
-    pub(crate) fn prepare(
+    pub(crate) fn capture(
         mut request: PendingIrpLease<'_>,
-    ) -> DriverResult<(Self, DirectoryNodeId)> {
-        let existing = request.with_active(|active| {
-            let opened = OpenedDirectory::decode(active.current_stack()?.file_object()?)?;
-            opened.search().expression()
+        comparison: crate::metadata::DirectoryNameComparison,
+    ) -> DriverResult<Self> {
+        let requested = request.with_active(|active| {
+            let file = active.current_stack()?.file_object()?;
+            Ok::<_, DriverError>(if file.flags() & wdk_sys::FO_OPENED_CASE_SENSITIVE != 0 {
+                NameCase::Exact
+            } else {
+                NameCase::Insensitive
+            })
         })?;
-        let matching = if existing.is_none() {
-            Some(request.with_active(|active| {
-                let file = active.current_stack()?.file_object()?;
-                Ok::<_, DriverError>(if file.flags() & wdk_sys::FO_OPENED_CASE_SENSITIVE != 0 {
-                    NameCase::Exact
-                } else {
-                    NameCase::Insensitive
-                })
-            })?)
-        } else {
-            None
-        };
-        let prepared = request.prepared_query_directory()?;
-        let stack = prepared.stack();
-        let pattern = if let Some(matching) = matching {
-            Some(DirectoryPattern::from_prepared(
-                prepared.pattern(),
-                matching,
-            )?)
-        } else {
-            None
-        };
-        let (pattern, directory, cursor, initial) = request.with_active(|active| {
+        let pattern = DirectoryPattern::from_prepared(
+            request.prepared_query_directory()?.pattern(),
+            comparison.select(requested),
+        )?;
+        let pattern = request.with_active(|active| {
+            OpenedDirectory::decode(active.current_stack()?.file_object()?)?
+                .search()
+                .capture_pattern(pattern)
+        })?;
+        Self::with_pattern(request, pattern)
+    }
+
+    /// Binds the handle's expression; output and cursor remain private until copy.
+    /// # Errors
+    /// Returns invalid handle or allocation errors.
+    fn with_pattern(
+        mut request: PendingIrpLease<'_>,
+        pattern: Shared<DirectoryPattern>,
+    ) -> DriverResult<Self> {
+        let stack = request.prepared_query_directory()?.stack();
+        let (directory, cursor, initial) = request.with_active(|active| {
             let opened = OpenedDirectory::decode(active.current_stack()?.file_object()?)?;
-            let directory = opened.id();
             let search = opened.search();
             let initial = !search.completed();
-            let pattern = match existing {
-                Some(pattern) => pattern,
-                None => search
-                    .capture_pattern(pattern.ok_or(DriverError::InternalInvariantViolation)?)?,
-            };
             let mut cursor = search.cursor();
             if initial {
                 cursor.restart();
             } else {
                 initialize_directory_cursor(&mut cursor, stack.cursor_position());
             }
-            Ok::<_, DriverError>((pattern, directory, cursor, initial))
+            Ok::<_, DriverError>((opened.id(), cursor, initial))
         })?;
-        Ok((
-            Self {
-                directory,
-                pattern,
-                class: stack.information_class(),
-                length: stack.length(),
-                emission: stack.entry_emission(),
-                initial,
-                cursor,
-                packed: DriverVec::try_repeated_copy(0, stack.length().as_usize())?,
-                written: 0,
-                information: 0,
-                previous: None,
-            },
+        Ok(Self {
             directory,
-        ))
+            pattern,
+            class: stack.information_class(),
+            length: stack.length(),
+            emission: stack.entry_emission(),
+            initial,
+            cursor,
+            packed: DriverVec::try_repeated_copy(0, stack.length().as_usize())?,
+            written: 0,
+            information: 0,
+            previous: None,
+        })
     }
 
     /// Starts a fresh core walk from this request's private continuation.
