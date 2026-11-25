@@ -1401,6 +1401,8 @@ pub(crate) struct CompletionReactor {
     ordinary_pending: AtomicUsize,
     /// Release requests have independent queue and notification admission.
     release_pending: AtomicUsize,
+    /// Kernel verification cannot queue behind an oplock acknowledgment or paging I/O.
+    verification_pending: AtomicUsize,
     /// Paging pending budget cannot be consumed by ordinary callers.
     paging_pending: AtomicUsize,
     /// Non-cancellable terminal IRPs retain the native FILE_OBJECT resources they release.
@@ -1756,6 +1758,14 @@ impl CompletionReactor {
         }
         let destination = unsafe {
             // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
+            core::ptr::addr_of_mut!((*reactor).verification_pending)
+        };
+        unsafe {
+            // SAFETY: This field is initialized exactly once before any reactor observer exists.
+            destination.write(AtomicUsize::new(0));
+        }
+        let destination = unsafe {
+            // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
             core::ptr::addr_of_mut!((*reactor).wake_event)
         };
         unsafe {
@@ -1983,6 +1993,7 @@ impl CompletionReactor {
             oplock_completion_head: _,
             ordinary_pending: _,
             release_pending: _,
+            verification_pending: _,
             paging_pending: _,
             terminal_pending: _,
             terminal_head: _,
@@ -2556,6 +2567,7 @@ impl CompletionReactor {
         match class {
             ExecutionClass::Ordinary => &self.ordinary_pending,
             ExecutionClass::Release => &self.release_pending,
+            ExecutionClass::Verification => &self.verification_pending,
             ExecutionClass::Paging => &self.paging_pending,
             ExecutionClass::Finalization => &self.terminal_pending,
         }
@@ -3039,6 +3051,7 @@ impl CompletionReactor {
         if reactor.state() != ReactorState::Stopped
             || reactor.ordinary_pending.load(Ordering::Acquire) != 0
             || reactor.release_pending.load(Ordering::Acquire) != 0
+            || reactor.verification_pending.load(Ordering::Acquire) != 0
             || reactor.paging_pending.load(Ordering::Acquire) != 0
             || reactor.terminal_pending.load(Ordering::Acquire) != 0
             || reactor.has_active()
@@ -3084,6 +3097,7 @@ impl CompletionReactor {
             || !reactor.thread_handle.load(Ordering::Acquire).is_null()
             || reactor.ordinary_pending.load(Ordering::Acquire) != 0
             || reactor.release_pending.load(Ordering::Acquire) != 0
+            || reactor.verification_pending.load(Ordering::Acquire) != 0
             || reactor.paging_pending.load(Ordering::Acquire) != 0
             || reactor.terminal_pending.load(Ordering::Acquire) != 0
             || reactor.has_active()
@@ -3196,6 +3210,7 @@ impl CompletionReactor {
             if self.state() == ReactorState::Draining
                 && self.ordinary_pending.load(Ordering::Acquire) == 0
                 && self.release_pending.load(Ordering::Acquire) == 0
+                && self.verification_pending.load(Ordering::Acquire) == 0
                 && self.paging_pending.load(Ordering::Acquire) == 0
                 && self.terminal_pending.load(Ordering::Acquire) == 0
                 && !self.has_active()
@@ -3478,6 +3493,7 @@ impl CompletionReactor {
         let mut admitted_any = false;
         for class in [
             ExecutionClass::Finalization,
+            ExecutionClass::Verification,
             ExecutionClass::Release,
             ExecutionClass::Paging,
             ExecutionClass::Ordinary,

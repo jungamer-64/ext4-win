@@ -22,6 +22,8 @@ pub(crate) enum ExecutionClass {
     Paging,
     /// Oplock acknowledgements and byte-range unlocks release existing waiters.
     Release,
+    /// I/O Manager verification may unblock paging while release work is waiting for it.
+    Verification,
     /// Non-cancellable handle release, serialized over reusable terminal resources.
     Finalization,
 }
@@ -30,11 +32,17 @@ impl ExecutionClass {
     /// Disjoint execution slots also determine each class's independent notification budget.
     pub(crate) const fn slots(self) -> core::ops::Range<usize> {
         match self {
-            Self::Ordinary => 0..OWNERSHIP_SLOTS.start,
+            Self::Ordinary => 0..44,
+            Self::Verification => 44..45,
             Self::Paging => 47..63,
             Self::Release => 46..47,
             Self::Finalization => 63..64,
         }
+    }
+
+    /// These classes return a status-only IRP without requiring a PASSIVE_LEVEL worker.
+    pub(super) const fn completes_at_dispatch_level(self) -> bool {
+        matches!(self, Self::Paging | Self::Verification)
     }
 }
 
@@ -1168,6 +1176,7 @@ mod tests {
         for class in [
             ExecutionClass::Ordinary,
             ExecutionClass::Release,
+            ExecutionClass::Verification,
             ExecutionClass::Paging,
             ExecutionClass::Finalization,
         ] {
@@ -1178,6 +1187,9 @@ mod tests {
             }
             assert!(!scheduler.available(class));
             assert!(scheduler.reserve(class).is_none());
+            if class == ExecutionClass::Release {
+                assert!(scheduler.available(ExecutionClass::Verification));
+            }
             if class == ExecutionClass::Ordinary {
                 assert!(scheduler.available(ExecutionClass::Release));
                 assert!(scheduler.available(ExecutionClass::Paging));

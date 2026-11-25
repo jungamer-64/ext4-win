@@ -878,7 +878,9 @@ impl QueueContext {
         };
         let execution = if paging {
             super::scheduler::ExecutionClass::Paging
-        } else if release || matches!(prepared, PreparedRequest::VerifyVolume(_)) {
+        } else if matches!(prepared, PreparedRequest::VerifyVolume(_)) {
+            super::scheduler::ExecutionClass::Verification
+        } else if release {
             super::scheduler::ExecutionClass::Release
         } else {
             super::scheduler::ExecutionClass::Ordinary
@@ -1993,7 +1995,7 @@ mod tests {
                     assert_eq!(expected, wdk_sys::STATUS_SUCCESS);
                     assert_eq!(
                         captured.execution_class(),
-                        super::super::scheduler::ExecutionClass::Release
+                        super::super::scheduler::ExecutionClass::Verification
                     );
                     assert!(
                         matches!(&captured.context, QueueContextOwnership::Captured(context) if matches!(context.prepared, PreparedRequest::VerifyVolume(_)))

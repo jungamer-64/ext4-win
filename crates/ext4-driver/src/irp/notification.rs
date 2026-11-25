@@ -40,6 +40,7 @@ impl NotificationPool {
         for class in [
             super::scheduler::ExecutionClass::Ordinary,
             super::scheduler::ExecutionClass::Release,
+            super::scheduler::ExecutionClass::Verification,
             super::scheduler::ExecutionClass::Paging,
             super::scheduler::ExecutionClass::Finalization,
         ] {
@@ -113,7 +114,7 @@ struct NotificationSlot {
     job: UnsafeCell<Option<NotificationJob>>,
 }
 
-/// Paging completion is DISPATCH_LEVEL-safe and independent of blocking native cache workers.
+/// Paging and verification complete independently of blocking native work.
 #[cfg_attr(
     test,
     expect(
@@ -124,8 +125,8 @@ struct NotificationSlot {
 enum NotificationCallback {
     /// Ordinary and terminal handle notifications may call PASSIVE_LEVEL native routines.
     Worker(NonNull<wdk_sys::_IO_WORKITEM>),
-    /// Resident final-address DPC storage for paging read/write completion.
-    Paging(UnsafeCell<wdk_sys::KDPC>),
+    /// Resident final-address DPC storage for status-only completion.
+    Dpc(UnsafeCell<wdk_sys::KDPC>),
 }
 
 /// Mutually exclusive terminal ownership selected before the actor releases its slot.
@@ -159,8 +160,8 @@ impl NotificationSlot {
     ) -> DriverResult<Self> {
         #[cfg(test)]
         let _native_identities = (device, reactor);
-        let callback = if class == super::scheduler::ExecutionClass::Paging {
-            NotificationCallback::Paging(UnsafeCell::new(wdk_sys::KDPC::default()))
+        let callback = if class.completes_at_dispatch_level() {
+            NotificationCallback::Dpc(UnsafeCell::new(wdk_sys::KDPC::default()))
         } else {
             #[cfg(not(test))]
             let work_item = unsafe {
@@ -191,12 +192,12 @@ impl NotificationSlot {
         reason = "pool construction retains exclusive final-address DPC initialization authority"
     )]
     fn initialize_callback(&self) {
-        if let NotificationCallback::Paging(dpc) = &self.callback {
+        if let NotificationCallback::Dpc(dpc) = &self.callback {
             unsafe {
                 // SAFETY: This resident slot will never move and no request can yet acquire it.
                 ffi::KeInitializeDpc(
                     dpc.get(),
-                    Some(notify_paging),
+                    Some(notify_at_dispatch_level),
                     core::ptr::from_ref(self).cast_mut().cast(),
                 );
             }
@@ -359,7 +360,7 @@ impl NotificationPermit {
         // Copy only native queue identity before publication permits callback-driven slot reuse.
         let (work_item, dpc) = match &slot.callback {
             NotificationCallback::Worker(work_item) => (Some(*work_item), core::ptr::null_mut()),
-            NotificationCallback::Paging(dpc) => (None, dpc.get()),
+            NotificationCallback::Dpc(dpc) => (None, dpc.get()),
         };
         core::mem::forget(self);
         if let Some(work_item) = work_item {
@@ -547,22 +548,22 @@ impl IrpNotification {
     }
 }
 
-/// Paging completion never waits for the system workers that may be blocked on this same IRP.
+/// Completes IRPs that native workers may be waiting on, including I/O Manager verify.
 /// # Safety
 /// The native DPC must return the final-address slot initialized by NotificationSlot.
 #[expect(
     unsafe_code,
-    reason = "the DPC owns a status-prepared paging IRP and resident notification slot"
+    reason = "the DPC owns a status-prepared IRP and resident notification slot"
 )]
 #[cfg(not(test))]
-unsafe extern "C" fn notify_paging(
+unsafe extern "C" fn notify_at_dispatch_level(
     _dpc: *mut wdk_sys::KDPC,
     context: wdk_sys::PVOID,
     _first: wdk_sys::PVOID,
     _second: wdk_sys::PVOID,
 ) {
     let (job, lease) = unsafe {
-        // SAFETY: DPC publication uniquely transferred this paging slot and its lifetime lease.
+        // SAFETY: DPC publication uniquely transferred this DPC slot and its lifetime lease.
         take_notification(context)
     };
     let NotificationJob::Complete(irp, status) = job else {
@@ -605,6 +606,7 @@ mod tests {
         let classes = [
             ExecutionClass::Ordinary,
             ExecutionClass::Release,
+            ExecutionClass::Verification,
             ExecutionClass::Paging,
             ExecutionClass::Finalization,
         ];
@@ -616,8 +618,8 @@ mod tests {
                     permit.slot.as_ref()
                 };
                 assert_eq!(
-                    matches!(slot.callback, NotificationCallback::Paging(_)),
-                    class == ExecutionClass::Paging
+                    matches!(slot.callback, NotificationCallback::Dpc(_)),
+                    matches!(class, ExecutionClass::Paging | ExecutionClass::Verification)
                 );
                 held.push_reserved_owned(permit)
                     .map_err(|failure| failure.into_parts().0)?;

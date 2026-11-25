@@ -1346,7 +1346,7 @@ impl OwnedIrp {
     pub(crate) fn claim_media_verification(&mut self) -> DriverResult<()> {
         self.context.claim_media_verification()
     }
-    /// Reserved release/finalization requests must keep making progress during native verification.
+    /// A native verify may depend on release, finalization or an independent verify IRP.
     pub(crate) fn allows_media_verification(&self) -> bool {
         matches!(
             self.context.execution_class(),

@@ -678,7 +678,7 @@ fn open_handle_lane(
     match execution {
         ExecutionClass::Ordinary => Ok(HandleOperationLane::Ordinary),
         ExecutionClass::Release => Ok(HandleOperationLane::Release),
-        ExecutionClass::Paging | ExecutionClass::Finalization => {
+        ExecutionClass::Paging | ExecutionClass::Verification | ExecutionClass::Finalization => {
             Err(DriverError::InternalInvariantViolation)
         }
     }
