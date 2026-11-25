@@ -464,17 +464,24 @@ pub fn driver_path(raw: &str) -> io::Result<PathBuf> {
 
 /// Reports whether a kernel image with this base name is currently loaded.
 ///
-/// SCM reports a driver service stopped once unload is requested, while the I/O Manager may defer
-/// the image unload until the driver's remaining device objects are deleted. Only absence from
-/// the loaded-driver list establishes that a later start can load a new image.
+/// Windows can return a successful enumeration with all image addresses redacted if the
+/// caller lacks enabled SeDebugPrivilege. A negative observation requires a readable inventory.
 /// # Errors
-/// Returns native enumeration failures.
+/// Returns privilege, enumeration, name lookup or incomplete inventory failures.
 pub fn driver_image_loaded(base_name: &str) -> io::Result<bool> {
+    identity::with_debug_privilege(|| observe_driver_image(base_name))
+}
+
+/// Enumerates image bases and resolves them while the caller retains its observation privilege.
+/// # Errors
+/// Returns native enumeration, unreadable inventory or name lookup failures.
+fn observe_driver_image(base_name: &str) -> io::Result<bool> {
+    let entry_size = core::mem::size_of::<*mut core::ffi::c_void>();
     let mut images: Vec<*mut core::ffi::c_void> = vec![ptr::null_mut(); 1024];
     loop {
         let capacity = images
             .len()
-            .checked_mul(core::mem::size_of::<*mut core::ffi::c_void>())
+            .checked_mul(entry_size)
             .and_then(|bytes| u32::try_from(bytes).ok())
             .ok_or_else(|| io::Error::other("loaded-driver list capacity overflow"))?;
         let mut needed = 0;
@@ -490,10 +497,16 @@ pub fn driver_image_loaded(base_name: &str) -> io::Result<bool> {
             return Err(io::Error::last_os_error());
         }
         if needed <= capacity {
-            let count = usize::try_from(needed)
-                .map_err(io::Error::other)?
-                .checked_div(core::mem::size_of::<*mut core::ffi::c_void>())
-                .ok_or_else(|| io::Error::other("invalid loaded-driver entry size"))?;
+            let needed = usize::try_from(needed).map_err(io::Error::other)?;
+            let count = needed
+                .checked_div(entry_size)
+                .filter(|_| needed.is_multiple_of(entry_size))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "loaded-driver list contains a partial entry",
+                    )
+                })?;
             images.truncate(count);
             break;
         }
@@ -503,8 +516,21 @@ pub fn driver_image_loaded(base_name: &str) -> io::Result<bool> {
             .ok_or_else(|| io::Error::other("loaded-driver list capacity overflow"))?;
         images.resize(grown, ptr::null_mut());
     }
-    let mut name = vec![0_u16; 260];
-    for image in images {
+    contains_driver_image(&images, base_name)
+}
+
+/// Determines presence in a snapshot whose image bases must all be visible.
+/// # Errors
+/// Returns incomplete inventory or name lookup failures.
+fn contains_driver_image(images: &[*mut core::ffi::c_void], base_name: &str) -> io::Result<bool> {
+    if images.is_empty() || images.iter().any(|image| image.is_null()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "loaded-driver list is empty or contains redacted image addresses",
+        ));
+    }
+    let mut name = [0_u16; 260];
+    for &image in images {
         let length = unsafe {
             // SAFETY: the writable name buffer has the advertised UTF-16 capacity.
             windows_sys::Win32::System::ProcessStatus::K32GetDeviceDriverBaseNameW(
@@ -513,11 +539,20 @@ pub fn driver_image_loaded(base_name: &str) -> io::Result<bool> {
                 u32::try_from(name.len()).map_err(io::Error::other)?,
             )
         };
+        if length == 0 {
+            return Err(io::Error::last_os_error());
+        }
         let length = usize::try_from(length).map_err(io::Error::other)?;
-        if length != 0
-            && String::from_utf16_lossy(name.get(..length).unwrap_or_default())
-                .eq_ignore_ascii_case(base_name)
-        {
+        let observed = name
+            .get(..length)
+            .filter(|_| length < name.len().saturating_sub(1))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "loaded-driver base name may be truncated",
+                )
+            })?;
+        if String::from_utf16_lossy(observed).eq_ignore_ascii_case(base_name) {
             return Ok(true);
         }
     }
@@ -2175,6 +2210,36 @@ pub fn secure_random(output: &mut [u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// # Panics
+    /// Fails if an empty or redacted inventory is accepted as evidence of image absence.
+    #[test]
+    fn redacted_driver_addrs_cannot_establish_image_absence() {
+        for images in [&[][..], &[ptr::null_mut(); 2][..]] {
+            assert!(matches!(
+                contains_driver_image(images, "ext4win.sys"),
+                Err(error) if error.kind() == io::ErrorKind::InvalidData
+            ));
+        }
+    }
+
+    /// # Errors
+    /// Returns privilege admission or native inventory failure.
+    /// # Panics
+    /// Fails if the inventory misses the running kernel or reports an absent image as loaded.
+    #[test]
+    #[ignore = "requires an elevated Windows token containing SeDebugPrivilege"]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare the native image inventory with known system state"
+    )]
+    fn native_loaded_driver_observation_contract() -> io::Result<()> {
+        assert!(driver_image_loaded("ntoskrnl.exe")?);
+        let absent = format!("ext4win-absent-{}.sys", std::process::id());
+        assert!(!driver_image_loaded(&absent)?);
+        Ok(())
+    }
+
     /// # Errors
     /// Returns fixture, native cursor observation or explicit namespace cleanup failures.
     /// # Panics

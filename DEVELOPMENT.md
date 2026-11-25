@@ -309,9 +309,10 @@ not establish completion. After interruption, use the matching cleanup command f
 command table. The [driver-load owner](tools/xtask/src/driver_load/owner.rs) and
 [session records](tools/xtask/src/session.rs) define recovery and persistence.
 A start timeout leaves the service and package in place while SCM reports `StartPending`.
-Prepare-unload can return busy while lower I/O remains outstanding. Cancellation or an
-absent control endpoint is not proof of unload: SCM stop, package removal, and final
-service/package absence are required.
+Prepare-unload can return busy while lower I/O remains outstanding. Host-side unload
+verification requires a token with `SeDebugPrivilege` to observe kernel image residency.
+Cleanup confirms image departure before removing the package, then confirms that the
+service registry subtree and DriverStore package are absent.
 
 Operational ETW carries no file names, offsets, lengths, pointers, or file data; its
 [provider owner](crates/ext4-driver/src/kernel/operational_trace.rs) defines the payload.

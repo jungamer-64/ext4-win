@@ -74,7 +74,7 @@ struct LiveState {
     wsl: WslAttachment,
     /// Nested driver lifecycle progress.
     driver: DriverStage,
-    /// Disposable ext4 UUID retained before identity-table effects, for query-based cleanup.
+    /// Disposable ext4 UUID retained before identity-table effects and checked after restart.
     identity: Option<[u8; 16]>,
 }
 
@@ -1134,10 +1134,13 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
     }
     storage::validate(&scope)?;
     observe_verifier(session)?;
+    let mut driver = driver_load::quiesce_session(root, session.id())?;
     dismount_filesystem(session)?;
     remove_namespace(session)?;
     attachment(session, false)?;
-    wait_removed(session)
+    wait_removed(session)?;
+    // Exercise recovery after endpoint retirement commits while SCM is still Running.
+    driver.prepare_unload()
 }
 
 /// Removes owned storage first, preserving the driver's unload endpoint until volume cleanup ends.
@@ -1174,17 +1177,8 @@ fn cleanup(root: &Path, session: &mut Session<LiveState>) -> TaskResult<()> {
         fs::remove_file(vhdx(session))?;
         session.publish(Phase::Observed(Operation::RemoveVhdx))?;
     }
-    if let Some(uuid) = session.state().identity
-        && windows_host::service_state("ext4win")? == Some(4)
-    {
-        let uuid = ext4_core::FilesystemUuid::from_bytes(uuid);
-        let observed = windows_host::query_identity(uuid)?;
-        if !observed.active.map.users().is_empty() || !observed.active.map.groups().is_empty() {
-            replace_identity(session, uuid, ext4_security::IdentityMap::empty())?;
-        }
-        session.state_mut().identity = None;
-        session.publish(Phase::Observed(Operation::IdentityMapping))?;
-    }
+    // SCM deletes the bound service's registry subtree, which owns the fixture mappings.
+    // The control endpoint may already be retired when cleanup resumes.
     let driver_directory = root
         .join("target/driver-load-sessions")
         .join(session.id().as_str());

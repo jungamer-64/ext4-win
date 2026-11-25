@@ -286,6 +286,9 @@ fn host_contract(root: &Path) -> TaskResult<()> {
     {
         return Err(io::Error::other("an ext4win service already exists").into());
     }
+    if windows_host::driver_image_loaded("ext4win.sys")? {
+        return Err(io::Error::other("an ext4win driver image is still loaded").into());
+    }
     if !packages(&root.join("target/driver-load-preflight"))?.is_empty() {
         return Err(io::Error::other("an ext4win DriverStore package already exists").into());
     }
@@ -471,6 +474,13 @@ fn wait_state(expected: u32, timeout: Duration) -> TaskResult<()> {
 fn wait_stopped(timeout: Duration) -> TaskResult<()> {
     let start = Instant::now();
     wait_state(1, timeout)?;
+    wait_image_unloaded(start, timeout)
+}
+
+/// Confirms image departure even when the service entry was already removed.
+/// # Errors
+/// Returns an observation failure or time out while the image remains loaded.
+fn wait_image_unloaded(start: Instant, timeout: Duration) -> TaskResult<()> {
     while windows_host::driver_image_loaded("ext4win.sys")? {
         if start.elapsed() >= timeout {
             return Err(io::Error::new(
@@ -627,6 +637,13 @@ pub(crate) fn quiesce_session(root: &Path, id: &SessionId) -> TaskResult<Quiesce
 }
 
 impl QuiescedDriver {
+    /// Retires the control endpoint independently of the SCM stop operation.
+    /// # Errors
+    /// Returns identity or retirement failures. The endpoint may already be retired.
+    pub(crate) fn prepare_unload(&mut self) -> TaskResult<()> {
+        request_unload(&mut self.0, UnloadRequest::PrepareUnload)
+    }
+
     /// Stops the driver after all dismounted volumes retire, then restarts it after the storage
     /// transition. The supplied transition runs only while SCM is observed Stopped.
     /// # Errors
@@ -636,7 +653,7 @@ impl QuiescedDriver {
         mut self,
         while_stopped: impl FnOnce() -> TaskResult<()>,
     ) -> TaskResult<()> {
-        request_unload(&mut self.0, UnloadRequest::PrepareUnload)?;
+        self.prepare_unload()?;
         scm(&mut self.0, Operation::StopDriver, "stop")?;
         wait_stopped(Duration::from_secs(60))?;
         self.0.publish(Phase::Observed(Operation::StopDriver))?;
@@ -843,7 +860,7 @@ pub(crate) fn cleanup_driver_load_session(root: &Path, id: &OsStr) -> TaskResult
         {
             return Err(io::Error::other("completed driver session has new service/package state; no cleanup authority is retained").into());
         }
-        return Ok(());
+        return wait_image_unloaded(Instant::now(), Duration::from_secs(60));
     }
     let inventory = packages(session.directory())?;
     if inventory.len() > 1 {
@@ -899,14 +916,14 @@ pub(crate) fn cleanup_driver_load_session(root: &Path, id: &OsStr) -> TaskResult
             )
             .into());
         }
-        if state != 1 {
-            if state != 3 {
-                request_unload(&mut session, UnloadRequest::PrepareUnload)?;
-                scm(&mut session, Operation::StopDriver, "stop")?;
-            }
-            wait_stopped(Duration::from_secs(60))?;
-            session.publish(Phase::Observed(Operation::StopDriver))?;
+        if state != 1 && state != 3 {
+            request_unload(&mut session, UnloadRequest::PrepareUnload)?;
+            scm(&mut session, Operation::StopDriver, "stop")?;
         }
+        wait_stopped(Duration::from_secs(60))?;
+        session.publish(Phase::Observed(Operation::StopDriver))?;
+    } else {
+        wait_image_unloaded(Instant::now(), Duration::from_secs(60))?;
     }
     if let Some(package) = inventory.first() {
         let prior = core::mem::replace(&mut session.state_mut().package, PackageState::Absent);

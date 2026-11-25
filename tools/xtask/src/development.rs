@@ -64,7 +64,7 @@ pub(crate) fn verify_portable(repository_root: &Path) -> TaskResult<()> {
     Ok(())
 }
 
-/// Runs the native ETW ABI contract that requires an elevated Windows host.
+/// Runs native host contracts that require an elevated Windows token.
 /// # Errors
 /// Returns unsupported hosts, missing elevation or native test failures.
 pub(crate) fn verify_windows_host(root: &Path) -> TaskResult<()> {
@@ -140,6 +140,22 @@ pub(crate) fn verify_windows_host(root: &Path) -> TaskResult<()> {
                 ],
             ),
             "native restore-privilege namespace contract",
+        )?;
+        run_checked(
+            cargo_command(
+                root,
+                &[
+                    "test",
+                    "--locked",
+                    "-p",
+                    "windows-host",
+                    "native::tests::native_loaded_driver_observation_contract",
+                    "--",
+                    "--ignored",
+                    "--exact",
+                ],
+            ),
+            "native loaded-driver observation contract",
         )?;
         println!("native Windows host contracts: PASS");
         Ok(())

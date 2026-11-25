@@ -374,12 +374,31 @@ fn set_privilege(token: &OwnedHandle, name: &str, enabled: bool) -> io::Result<(
 pub(super) fn with_restore_privilege<T: Send>(
     work: impl FnOnce() -> io::Result<T> + Send,
 ) -> io::Result<T> {
+    with_thread_privilege("SeRestorePrivilege", work)
+}
+
+/// Queries kernel module residency with SeDebugPrivilege on a private, joined thread.
+/// # Errors
+/// Returns privilege admission, observation, reversion or thread failure.
+pub(super) fn with_debug_privilege<T: Send>(
+    work: impl FnOnce() -> io::Result<T> + Send,
+) -> io::Result<T> {
+    with_thread_privilege("SeDebugPrivilege", work)
+}
+
+/// Runs synchronous work with one enabled privilege on a private impersonation token.
+/// # Errors
+/// Returns privilege admission, operation, reversion or thread failure.
+fn with_thread_privilege<T: Send>(
+    privilege: &str,
+    work: impl FnOnce() -> io::Result<T> + Send,
+) -> io::Result<T> {
     std::thread::scope(|scope| {
         std::thread::Builder::new()
             .spawn_scoped(scope, || {
                 let source = process_token()?;
                 let token = impersonation(&source)?;
-                set_privilege(&token, "SeRestorePrivilege", true)?;
+                set_privilege(&token, privilege, true)?;
                 let assigned = unsafe {
                     // SAFETY: This newly created thread has no earlier impersonation; the private
                     // token remains retained through explicit reversion and thread completion.
@@ -401,7 +420,7 @@ pub(super) fn with_restore_privilege<T: Send>(
                 completed(result, reversion)
             })?
             .join()
-            .map_err(|_| io::Error::other("restore-privilege filesystem thread panicked"))?
+            .map_err(|_| io::Error::other(format!("{privilege} thread panicked")))?
     })
 }
 
