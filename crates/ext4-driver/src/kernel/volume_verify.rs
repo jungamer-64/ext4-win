@@ -105,6 +105,27 @@ pub(crate) fn required(device: KernelDevice) -> bool {
     unsafe { ext4win_volume_requires_verify(device.as_ptr()) != 0 }
 }
 
+/// Observes the I/O Manager's current association as a pointer identity.
+/// # Safety
+/// The caller retains the real device. It must establish independent retention before
+/// dereferencing the observed VPB.
+#[expect(
+    unsafe_code,
+    reason = "native observation reads only the retained device's VPB pointer"
+)]
+pub(crate) unsafe fn observe_current_vpb(device: wdk_sys::PDEVICE_OBJECT) -> wdk_sys::PVPB {
+    #[cfg(not(test))]
+    unsafe {
+        // SAFETY: The caller retains the real device while the native accessor reads its association.
+        ext4win_observe_current_vpb(device)
+    }
+    #[cfg(test)]
+    unsafe {
+        // SAFETY: Fixture changes and observations are serialized by the host VPB lock.
+        (*device).Vpb
+    }
+}
+
 /// Caller serializes and revalidates its complete mounted association before acknowledgment.
 #[expect(
     unsafe_code,
@@ -124,6 +145,7 @@ pub(crate) fn acknowledge(device: KernelDevice) {
     reason = "native code owns the interlocked DEVICE_OBJECT flag representation"
 )]
 unsafe extern "C" {
+    fn ext4win_observe_current_vpb(device: wdk_sys::PDEVICE_OBJECT) -> wdk_sys::PVPB;
     fn ext4win_clear_verify_required(device: wdk_sys::PDEVICE_OBJECT);
     fn ext4win_volume_requires_verify(device: wdk_sys::PDEVICE_OBJECT) -> u8;
     fn ext4win_verify_volume(device: wdk_sys::PDEVICE_OBJECT) -> wdk_sys::NTSTATUS;

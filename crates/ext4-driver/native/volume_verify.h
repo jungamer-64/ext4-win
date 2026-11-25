@@ -1,5 +1,12 @@
 #pragma once
 
+/* Observe only the association identity, including a concurrent native verify publication. */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PVPB ext4win_observe_current_vpb(_In_ PDEVICE_OBJECT device)
+{
+    return (PVPB)ReadPointerNoFence((volatile const PVOID *)&device->Vpb);
+}
+
 _IRQL_requires_max_(DISPATCH_LEVEL)
 BOOLEAN ext4win_volume_requires_verify(_In_ PDEVICE_OBJECT device)
 {

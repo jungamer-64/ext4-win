@@ -10,10 +10,18 @@ __declspec(dllimport) __declspec(noreturn) void __stdcall ExitProcess(unsigned);
 typedef long LONG;
 typedef long NTSTATUS;
 typedef unsigned char BOOLEAN;
-typedef struct { unsigned long Flags; } DEVICE_OBJECT, *PDEVICE_OBJECT;
+typedef void *PVOID;
+typedef struct { unsigned id; } VPB, *PVPB;
+typedef struct { unsigned long Flags; PVPB Vpb; } DEVICE_OBJECT, *PDEVICE_OBJECT;
 static PDEVICE_OBJECT observed_device;
-static unsigned verify_calls, atomic_reads, atomic_changes;
+static unsigned verify_calls, atomic_reads, atomic_changes, association_reads;
 static NTSTATUS verify_status;
+static PVOID ReadPointerNoFence(volatile const PVOID *address)
+{
+    assert(address == (volatile const PVOID *)&observed_device->Vpb);
+    ++association_reads;
+    return *address;
+}
 static LONG InterlockedCompareExchange(volatile LONG *target, LONG value, LONG expected)
 {
     LONG original = *target;
@@ -38,8 +46,12 @@ static NTSTATUS IoVerifyVolume(PDEVICE_OBJECT device, BOOLEAN allow_raw)
 #include "volume_verify.h"
 int main(void)
 {
-    DEVICE_OBJECT device = { 0x4012 };
+    VPB original = {1}, successor = {2};
+    DEVICE_OBJECT device = { 0x4012, &original };
     observed_device = &device;
+    assert(ext4win_observe_current_vpb(&device) == &original && association_reads == 1);
+    device.Vpb = &successor;
+    assert(ext4win_observe_current_vpb(&device) == &successor && association_reads == 2);
     assert(ext4win_volume_requires_verify(&device));
     assert(device.Flags == 0x4012 && atomic_reads == 1 && atomic_changes == 0);
     verify_status = (NTSTATUS)0xc0000012L;

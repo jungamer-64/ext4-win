@@ -3,6 +3,7 @@
 use super::*;
 #[cfg(not(test))]
 use crate::kernel::operational_trace::{OperationalOutcome, OperationalPath};
+use crate::kernel::volume_verify::{VerificationDevice, observe_current_vpb};
 use crate::{kernel::stream::MediaReplacement, volume_label::WindowsVolumeLabel};
 
 /// Windows volume serial number derived from the ext4 filesystem UUID.
@@ -549,10 +550,8 @@ impl MountedVolumeDevice {
                 );
                 RetirementStep::Released { resumed }
             }
-            Err((retained, wait)) => {
-                if reported != Some(wait)
-                    && let VpbRetirementWait::References(references) = wait
-                {
+            Err((retained, references)) => {
+                if reported != Some(references) {
                     trace.record_vpb_references(references);
                 }
                 if reported.is_none() {
@@ -563,7 +562,7 @@ impl MountedVolumeDevice {
                     *extension.pending_retirement.get() = Some(PendingRetirement {
                         vpb: retained,
                         binding,
-                        reported: Some(wait),
+                        reported: Some(references),
                         retry: retry.next(),
                     });
                 }
@@ -618,8 +617,17 @@ impl MountedVolumeDevice {
             STATUS_SUCCESS,
             OperationalOutcome::Selected,
         );
+        let vpb = unsafe {
+            // SAFETY: Dispatch and reactor rundown completed above. IoVerifyVolume waits for
+            // the preceding native verify on this real device before making its own observation.
+            publication.begin_retirement(|verification| {
+                // This call joins the prior I/O Manager verify. Its status describes its own
+                // attempt. The locked association observation below owns the publication decision.
+                let _verification_status = verification.execute();
+            })
+        };
         PendingRetirement {
-            vpb: publication.begin_retirement(),
+            vpb,
             binding,
             reported: None,
             retry: RetirementRetryDelay::FIRST,
@@ -1051,7 +1059,7 @@ impl MountedVpb {
             .ok_or(DriverError::InvalidParameter)?;
         let current = unsafe {
             // SAFETY: The mount request retains the real device; its VPB association uses this lock.
-            (*real.as_ptr()).Vpb
+            observe_current_vpb(real.as_ptr())
         };
         if current != supplied.as_non_null().as_ptr() {
             return Err(DriverError::InvalidParameter);
@@ -1153,7 +1161,7 @@ impl MountedVpb {
             };
             let withdrawn = matches!(
                 publication,
-                VpbPublication::HandingOffToIoManager | VpbPublication::Withdrawn
+                VpbPublication::HandingOffToIoManager(_) | VpbPublication::Withdrawn
             );
             // SAFETY: The mounted VPB retains its real device while the global lock is held.
             let real = unsafe { KernelDevice::from_raw(vpb.RealDevice) }
@@ -1162,7 +1170,7 @@ impl MountedVpb {
                 VpbRouting::Withdrawn
             } else if unsafe {
                 // SAFETY: The same lock protects the real device's current association.
-                (*real.as_ptr()).Vpb
+                observe_current_vpb(real.as_ptr())
             } == core::ptr::from_mut(vpb)
             {
                 VpbRouting::Current(real)
@@ -1306,9 +1314,14 @@ impl MountedVpb {
                 return Err(DriverError::DeviceRemoved);
             }
             if let Some(replacement) = replacement {
+                let (VpbPublication::Mounted(successor) | VpbPublication::Excluded(successor)) =
+                    core::mem::replace(publication, VpbPublication::Withdrawn)
+                else {
+                    KernelWideInconsistency::mounted_volume_state_corruption().bugcheck();
+                };
                 replacement.revoke();
                 vpb.Flags &= !vpb_flag(wdk_sys::VPB_DIRECT_WRITES_ALLOWED);
-                *publication = VpbPublication::HandingOffToIoManager;
+                *publication = VpbPublication::HandingOffToIoManager(successor);
             }
             crate::kernel::volume_verify::acknowledge(real_device);
             Ok(())
@@ -1317,24 +1330,29 @@ impl MountedVpb {
 
     /// Transfers new-open routing to a successor under the global VPB lock. The original VPB
     /// remains mounted for native routing of retained FILE_OBJECTs until its last reference drains.
-    /// An I/O Manager handoff retains exclusive successor authority until the swap is observed.
-    #[expect(
-        unsafe_code,
-        reason = "the global lock encloses native association replacement and sole allocation-ownership transfer"
-    )]
+    /// An I/O Manager handoff keeps that authority until native verification has settled.
     fn withdraw_locked(vpb: &mut wdk_sys::VPB, publication: &mut VpbPublication) {
-        if matches!(publication, VpbPublication::HandingOffToIoManager) {
+        if matches!(publication, VpbPublication::HandingOffToIoManager(_)) {
             return;
         }
         let replacement = match core::mem::replace(publication, VpbPublication::Withdrawn) {
             VpbPublication::Mounted(replacement) | VpbPublication::Excluded(replacement) => {
                 replacement
             }
-            VpbPublication::HandingOffToIoManager | VpbPublication::Withdrawn => return,
+            VpbPublication::HandingOffToIoManager(_) | VpbPublication::Withdrawn => return,
         };
+        Self::publish_successor_locked(vpb, replacement);
+    }
+
+    /// Transfers the reserve only if this mount still owns the current association.
+    #[expect(
+        unsafe_code,
+        reason = "the global lock encloses native association replacement and sole allocation-ownership transfer"
+    )]
+    fn publish_successor_locked(vpb: &mut wdk_sys::VPB, replacement: PoolVpb) {
         let current = unsafe {
             // SAFETY: The mounted storage route retains RealDevice and its current VPB uses this lock.
-            (*vpb.RealDevice).Vpb
+            observe_current_vpb(vpb.RealDevice)
         };
         if current == core::ptr::from_mut(vpb) {
             let successor = replacement.into_raw();
@@ -1356,13 +1374,50 @@ impl MountedVpb {
         }
     }
 
-    /// Closes future routing after actor/dispatch join and retains only native references already in flight.
-    fn begin_retirement(self) -> RetiringVpb {
-        let mut publication = self.publication.into_inner();
-        VpbSpinLock::with_mounted(self.device, |vpb| {
-            Self::withdraw_locked(vpb, &mut publication);
-        })
-        .unwrap_or_else(|_| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
+    /// Withdraws routing, using the reserve if the native verify leaves this VPB current.
+    /// # Safety
+    /// Dispatch and reactor rundown must have ended, so no later verify can complete with
+    /// `STATUS_WRONG_VOLUME` for this VPB. `join_verify` must synchronize with the preceding
+    /// native verify and its pending VPB swap before returning.
+    #[expect(
+        unsafe_code,
+        reason = "the VPB lock holds the mounted real device until a native reference can join verification"
+    )]
+    unsafe fn begin_retirement(self, join_verify: impl FnOnce(VerificationDevice)) -> RetiringVpb {
+        let replacement = match self.publication.into_inner() {
+            VpbPublication::Mounted(reserve) | VpbPublication::Excluded(reserve) => Some(reserve),
+            VpbPublication::HandingOffToIoManager(reserve) => {
+                let pending = VpbSpinLock::with_mounted(self.device, |vpb| {
+                    // SAFETY: Mounted storage retains the live real device throughout retirement.
+                    let real =
+                        unsafe { KernelDevice::from_raw(vpb.RealDevice) }.unwrap_or_else(|| {
+                            KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
+                        });
+                    let current = unsafe {
+                        // SAFETY: The retained real device supplies only its association identity.
+                        observe_current_vpb(real.as_ptr())
+                    };
+                    (current == core::ptr::from_mut(vpb))
+                        .then(|| VerificationDevice::reference(real))
+                })
+                .unwrap_or_else(|_| {
+                    KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
+                });
+                if let Some(pending) = pending {
+                    join_verify(pending);
+                }
+                Some(reserve)
+            }
+            VpbPublication::Withdrawn => None,
+        };
+        if let Some(replacement) = replacement {
+            VpbSpinLock::with_mounted(self.device, |vpb| {
+                Self::publish_successor_locked(vpb, replacement);
+            })
+            .unwrap_or_else(|_| {
+                KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
+            });
+        }
         RetiringVpb {
             device: self.device,
         }
@@ -1379,26 +1434,23 @@ struct RetiringVpb {
 impl RetiringVpb {
     /// Releases the mount reference only when it is the last native reference.
     /// # Errors
-    /// Returns the reusable owner while the original remains current or native references remain.
+    /// Returns the reusable owner and reference count while native users retain the detached VPB.
     /// Success transfers sole native deallocation authority for the detached original.
     #[expect(
         unsafe_code,
         reason = "the VPB lock serializes the real device association and final reference"
     )]
-    fn try_finish(self) -> Result<PoolVpb, (Self, VpbRetirementWait)> {
+    fn try_finish(self) -> Result<PoolVpb, (Self, u32)> {
         let released = VpbSpinLock::with_mounted(self.device, |vpb| {
             let current = unsafe {
                 // SAFETY: The retained mounted storage route owns the real device through retirement.
-                (*vpb.RealDevice).Vpb
+                observe_current_vpb(vpb.RealDevice)
             };
-            if current == core::ptr::from_mut(vpb) {
-                return Err(VpbRetirementWait::IoManagerHandoff);
+            if current == core::ptr::from_mut(vpb) || vpb.ReferenceCount == 0 {
+                KernelWideInconsistency::mounted_volume_state_corruption().bugcheck();
             }
             if vpb.ReferenceCount != 1 {
-                if vpb.ReferenceCount == 0 {
-                    KernelWideInconsistency::mounted_volume_state_corruption().bugcheck();
-                }
-                return Err(VpbRetirementWait::References(vpb.ReferenceCount));
+                return Err(vpb.ReferenceCount);
             }
             vpb.ReferenceCount = 0;
             vpb.Flags &= !vpb_flag(
@@ -1414,7 +1466,7 @@ impl RetiringVpb {
             })
         })
         .unwrap_or_else(|_| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
-        released.map_err(|wait| (self, wait))
+        released.map_err(|references| (self, references))
     }
 }
 
@@ -1708,8 +1760,8 @@ struct PendingRetirement {
     vpb: RetiringVpb,
     /// Joined mounted binding, released only after the VPB is detached.
     binding: MountedVolumeBinding,
-    /// Last observed native wait; `None` before the first retained attempt.
-    reported: Option<VpbRetirementWait>,
+    /// Last observed native reference count; `None` before the first retained attempt.
+    reported: Option<u32>,
     /// Delay before the next attempt if references still remain.
     retry: RetirementRetryDelay,
 }
@@ -1853,8 +1905,7 @@ mod tests {
         publication.publish_session_end(SessionEndRouting::Remount);
         assert!(publication.prepare_verify_work()?.is_none());
         drop(
-            publication
-                .begin_retirement()
+            retire_fixture(publication)
                 .try_finish()
                 .map_err(|_| DriverError::DeviceBusy)?,
         );
@@ -1933,8 +1984,7 @@ mod tests {
         ));
         assert_eq!(fixture.real.Flags, wdk_sys::DO_VERIFY_VOLUME | 0x4000);
         drop(
-            publication
-                .begin_retirement()
+            retire_fixture(publication)
                 .try_finish()
                 .map_err(|_| DriverError::DeviceBusy)?,
         );
@@ -1961,7 +2011,9 @@ mod tests {
             Some(SessionEndRouting::DirectAccess),
             Some(SessionEndRouting::Remount),
         ] {
-            for io_manager_replaces_first in [true, false] {
+            for (replaced_before_retirement, replaced_during_join) in
+                [(true, false), (false, true), (false, false)]
+            {
                 let mut fixture = VpbFixture::new()?;
                 let publication = fixture.publish()?;
                 fixture.original(|vpb| vpb.Flags |= vpb_flag(wdk_sys::VPB_MOUNTED))?;
@@ -2007,24 +2059,36 @@ mod tests {
                     publication.prepare_storage_verification(),
                     Err(DriverError::VolumeDismounted)
                 ));
-                if io_manager_replaces_first && fixture.real.Vpb == original {
+                if replaced_before_retirement && fixture.real.Vpb == original {
                     fixture.install_native_successor()?;
                 }
                 let current = fixture.real.Vpb;
-                let retirement = publication.begin_retirement();
-                assert_eq!(fixture.real.Vpb, current);
-                let retirement = if current == original {
-                    let (retirement, wait) = retirement
-                        .try_finish()
-                        .err()
-                        .ok_or(DriverError::InternalInvariantViolation)?;
-                    assert_eq!(wait, VpbRetirementWait::IoManagerHandoff);
-                    fixture.original(|vpb| assert_eq!(vpb.ReferenceCount, 1))?;
-                    fixture.install_native_successor()?;
-                    retirement
-                } else {
-                    retirement
+                let mut joined = None;
+                let retirement = unsafe {
+                    // SAFETY: The fixture's native verify either finishes publication inside
+                    // the join or returns with the original still current. No other actor runs.
+                    publication.begin_retirement(|_| {
+                        assert_eq!(fixture.real.Vpb, original);
+                        joined = Some(if replaced_during_join {
+                            fixture
+                                .install_native_successor()
+                                .map(|()| fixture.real.Vpb)
+                        } else {
+                            Ok(original)
+                        });
+                    })
                 };
+                if current == original {
+                    let observed = joined.ok_or(DriverError::InternalInvariantViolation)??;
+                    if replaced_during_join {
+                        assert_eq!(fixture.real.Vpb, observed);
+                    } else {
+                        assert_ne!(fixture.real.Vpb, observed);
+                    }
+                } else {
+                    assert!(joined.is_none());
+                    assert_eq!(fixture.real.Vpb, current);
+                }
                 {
                     let _lock = VpbSpinLock::acquire();
                     // SAFETY: The fixture's real device retains its current VPB under the lock.
@@ -2041,6 +2105,16 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    /// Withdraws a fixture once all modeled dispatch and verify activity has ended.
+    #[expect(
+        unsafe_code,
+        reason = "the host fixture has no asynchronous verify or dispatch"
+    )]
+    fn retire_fixture(publication: MountedVpb) -> RetiringVpb {
+        // SAFETY: No native dispatch or verify runs concurrently with the fixture.
+        unsafe { publication.begin_retirement(|_| {}) }
     }
 
     /// Host I/O Manager allocation and device identities retained through native retirement.
@@ -2265,8 +2339,7 @@ mod tests {
             vpb.ReferenceCount -= 2;
         })?;
         drop(
-            publication
-                .begin_retirement()
+            retire_fixture(publication)
                 .try_finish()
                 .map_err(|_| DriverError::DeviceBusy)?,
         );
@@ -2340,12 +2413,11 @@ mod tests {
             PoolVpb::fixture()?,
         )?;
         let successor = fixture.real.Vpb;
-        let (retirement, references) = publication
-            .begin_retirement()
+        let (retirement, references) = retire_fixture(publication)
             .try_finish()
             .err()
             .ok_or(DriverError::InternalInvariantViolation)?;
-        assert_eq!(references, VpbRetirementWait::References(3));
+        assert_eq!(references, 3);
         fixture.original(|vpb| {
             assert_ne!(vpb.Flags & vpb_flag(wdk_sys::VPB_MOUNTED), 0);
             assert_eq!(vpb.DeviceObject, original_device.as_ptr());
@@ -2370,8 +2442,7 @@ mod tests {
             assert_eq!(vpb.ReferenceCount, 1);
         })?;
         drop(
-            fresh_mount
-                .begin_retirement()
+            retire_fixture(fresh_mount)
                 .try_finish()
                 .map_err(|_| DriverError::DeviceBusy)?,
         );
@@ -2408,8 +2479,7 @@ mod tests {
                 );
             })?;
             drop(
-                publication
-                    .begin_retirement()
+                retire_fixture(publication)
                     .try_finish()
                     .map_err(|_| DriverError::DeviceBusy)?,
             );
@@ -2504,7 +2574,7 @@ mod tests {
         fixture.original(|vpb| {
             vpb.Flags |= vpb_flag(wdk_sys::VPB_REMOVE_PENDING | wdk_sys::VPB_RAW_MOUNT)
         })?;
-        let retirement = publication.begin_retirement();
+        let retirement = retire_fixture(publication);
         {
             let _lock = VpbSpinLock::acquire();
             let successor = unsafe {
