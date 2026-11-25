@@ -556,11 +556,39 @@ pub(crate) struct AttributeValueReference {
     /// Exact positive value length from its owning entry.
     pub(crate) size: usize,
     /// Stored entry fingerprint authenticating name and value checksum.
-    fingerprint: u32,
+    fingerprint: EntryFingerprint,
+}
+
+/// Stored `e_hash` together with both name-byte interpretations that existing writers used.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EntryFingerprint {
+    /// Value recorded in the entry.
+    stored: u32,
     /// Name contribution with unsigned bytes.
     name: u32,
     /// Historical signed-byte name contribution, accepted for existing attributes.
     signed_name: u32,
+}
+
+impl EntryFingerprint {
+    /// Captures the stored value and both name contributions of one entry.
+    fn new(stored: u32, local: &[u8]) -> Self {
+        Self {
+            stored,
+            name: local
+                .iter()
+                .fold(0_u32, |state, byte| state.rotate_left(5) ^ u32::from(*byte)),
+            signed_name: local.iter().fold(0_u32, |state, byte| {
+                state.rotate_left(5)
+                    ^ u32::from_le_bytes(i32::from(i8::from_le_bytes([*byte])).to_le_bytes())
+            }),
+        }
+    }
+
+    /// True when the stored value is `complete` applied to either name contribution.
+    fn admits(self, complete: impl Fn(u32) -> u32) -> bool {
+        self.stored == complete(self.name) || self.stored == complete(self.signed_name)
+    }
 }
 impl AttributeValueReference {
     /// Admits complete value bytes only after inode-size, value CRC and entry relation agree.
@@ -586,8 +614,9 @@ impl AttributeValueReference {
     /// # Errors
     /// Rejects a reference to another value with a different checksum.
     pub(crate) fn verify_checksum(self, checksum: u32) -> Result<()> {
-        if self.fingerprint == (self.name.rotate_left(16) ^ checksum)
-            || self.fingerprint == (self.signed_name.rotate_left(16) ^ checksum)
+        if self
+            .fingerprint
+            .admits(|name| name.rotate_left(16) ^ checksum)
         {
             Ok(())
         } else {
@@ -719,11 +748,23 @@ struct ParsedDiskXattr {
     /// Validated logical slot.
     slot: ParsedDiskXattrSlot,
     /// Local value position or an external inode identity.
-    reference: Option<AttributeValueReference>,
-    /// Local offset relative to the selected value base.
-    value_offset: usize,
-    /// Value length.
-    value_size: usize,
+    value: ParsedDiskValue,
+}
+
+/// Value placement recorded by one entry before the table boundary admits local bytes.
+#[derive(Debug)]
+enum ParsedDiskValue {
+    /// Bytes inside the same storage, authenticated by a nonzero in-inode hash.
+    Local {
+        /// Offset relative to the selected value base.
+        offset: usize,
+        /// Value length.
+        size: usize,
+        /// Stored entry hash and its name contributions.
+        fingerprint: EntryFingerprint,
+    },
+    /// Value held by an EA inode.
+    Inode(AttributeValueReference),
 }
 
 /// Parsed xattr slot before values have been copied into owned sets.
@@ -814,9 +855,8 @@ fn parse_xattr_entries<'a>(
             usize::try_from(le_u32(storage, disk_offset(cursor).checked_add_bytes(8)?)?)
                 .map_err(|_| Error::ArithmeticOverflow)?;
         let entry_hash = le_u32(storage, disk_offset(cursor).checked_add_bytes(12)?)?;
-        if (value_inum == 0 && placement == XattrValuePlacement::InInode && entry_hash != 0)
-            || (value_inum != 0
-                && (value_offset != 0 || value_size == 0 || value_size > XattrValue::MAX_BYTES))
+        if value_inum != 0
+            && (value_offset != 0 || value_size == 0 || value_size > XattrValue::MAX_BYTES)
         {
             return Err(Error::InvalidXattr);
         }
@@ -838,22 +878,18 @@ fn parse_xattr_entries<'a>(
         {
             return Err(Error::InvalidXattr);
         }
-        let reference = if value_inum == 0 {
-            None
+        let fingerprint = EntryFingerprint::new(entry_hash, local);
+        let value = if value_inum == 0 {
+            ParsedDiskValue::Local {
+                offset: value_offset,
+                size: value_size,
+                fingerprint,
+            }
         } else {
-            let name = local
-                .iter()
-                .fold(0_u32, |state, byte| state.rotate_left(5) ^ u32::from(*byte));
-            let signed_name = local.iter().fold(0_u32, |state, byte| {
-                state.rotate_left(5)
-                    ^ u32::from_le_bytes(i32::from(i8::from_le_bytes([*byte])).to_le_bytes())
-            });
-            Some(AttributeValueReference {
+            ParsedDiskValue::Inode(AttributeValueReference {
                 inode: InodeId::try_from(value_inum)?,
                 size: value_size,
-                fingerprint: entry_hash,
-                name,
-                signed_name,
+                fingerprint,
             })
         };
         previous_key = Some(key);
@@ -874,36 +910,51 @@ fn parse_xattr_entries<'a>(
         }
 
         if matches!(slot, ParsedDiskXattrSlot::InlineData)
-            && (placement != XattrValuePlacement::InInode || reference.is_some())
+            && (placement != XattrValuePlacement::InInode
+                || matches!(value, ParsedDiskValue::Inode(_)))
         {
             return Err(Error::InvalidXattr);
         }
-        parsed.try_push(ParsedDiskXattr {
-            slot,
-            reference,
-            value_offset,
-            value_size,
-        })?;
+        parsed.try_push(ParsedDiskXattr { slot, value })?;
         cursor = align_up(name_end)?;
     }
 
     let mut entries = Vec::new();
     for entry in parsed {
-        let value = if let Some(reference) = entry.reference {
-            ParsedValue::Inode(reference)
-        } else if entry.value_size == 0 {
-            ParsedValue::Local(&[])
-        } else {
-            let start = value_base
-                .checked_add(entry.value_offset)
-                .ok_or(Error::ArithmeticOverflow)?;
-            let end = start
-                .checked_add(entry.value_size)
-                .ok_or(Error::ArithmeticOverflow)?;
-            if start % 4 != 0 || start < entries_end {
-                return Err(Error::InvalidXattr);
+        let value = match entry.value {
+            ParsedDiskValue::Inode(reference) => ParsedValue::Inode(reference),
+            ParsedDiskValue::Local {
+                offset,
+                size,
+                fingerprint,
+            } => {
+                let (value, words): (&[u8], &[u8]) = if size == 0 {
+                    (&[], &[])
+                } else {
+                    let start = value_base
+                        .checked_add(offset)
+                        .ok_or(Error::ArithmeticOverflow)?;
+                    let end = start.checked_add(size).ok_or(Error::ArithmeticOverflow)?;
+                    if start % 4 != 0 || start < entries_end {
+                        return Err(Error::InvalidXattr);
+                    }
+                    let value = storage.get(start..end).ok_or(Error::InvalidXattr)?;
+                    let padded_end = core::cmp::min(align_up(end)?, storage.len());
+                    (
+                        value,
+                        storage.get(start..padded_end).ok_or(Error::InvalidXattr)?,
+                    )
+                };
+                // In-inode writers may leave e_hash zero; a recorded hash must still identify the
+                // entry. External-block hashes serve block sharing and are not admission evidence.
+                if placement == XattrValuePlacement::InInode
+                    && fingerprint.stored != 0
+                    && !fingerprint.admits(|name| value_fingerprint(name, words))
+                {
+                    return Err(Error::InvalidXattr);
+                }
+                ParsedValue::Local(value)
             }
-            ParsedValue::Local(storage.get(start..end).ok_or(Error::InvalidXattr)?)
         };
         entries.try_push(ParsedAttribute {
             slot: entry.slot,
@@ -1318,11 +1369,8 @@ impl BoundXattrs {
                     }
                 },
                 EncodedValue::Inode(location) => {
-                    entry
-                        .key
-                        .local
-                        .iter()
-                        .fold(0_u32, |state, byte| state.rotate_left(5) ^ u32::from(*byte))
+                    EntryFingerprint::new(0, &entry.key.local)
+                        .name
                         .rotate_left(16)
                         ^ location.checksum
                 }
@@ -1376,11 +1424,14 @@ fn serialize_xattr_entries(
 }
 
 /// External entry identity mixes unsigned name octets with five-bit rotations, then
-/// zero-padded little-endian value words with sixteen-bit rotations. Inline entries use zero.
+/// zero-padded little-endian value words with sixteen-bit rotations. In-inode entries are
+/// written with zero.
 fn external_entry_fingerprint(name: &[u8], value: &[u8]) -> u32 {
-    let named = name
-        .iter()
-        .fold(0_u32, |state, byte| state.rotate_left(5) ^ u32::from(*byte));
+    value_fingerprint(EntryFingerprint::new(0, name).name, value)
+}
+
+/// Continues a name contribution with zero-padded little-endian value words.
+fn value_fingerprint(named: u32, value: &[u8]) -> u32 {
     let (words, tail) = value.as_chunks::<4>();
     let aligned = words.iter().fold(named, |state, word| {
         state.rotate_left(16) ^ u32::from_le_bytes(*word)
@@ -1553,9 +1604,11 @@ mod tests {
     use alloc::vec;
 
     use super::{
-        InodeXattrSet, XattrName, XattrNamespace, XattrSet, XattrValue, merge_xattr_sets,
-        parse_inline_xattrs, serialize_inline_xattrs,
+        EXT4_XATTR_MAGIC, InodeXattrSet, XattrName, XattrNamespace, XattrSet, XattrValue,
+        disk_offset, merge_xattr_sets, parse_inline_xattrs, serialize_inline_xattrs,
     };
+    use crate::disk::endian::{put_le_u16, put_le_u32};
+    use crate::memory;
 
     /// Fixed vectors from an independent ext4 encoder include unsigned names and padded values.
     /// # Panics
@@ -1618,6 +1671,81 @@ mod tests {
                 .err(),
             Some(crate::Error::InvalidXattr)
         );
+        Ok(())
+    }
+
+    /// # Errors
+    /// Returns name-construction or lookup failures for accepted vectors.
+    /// # Panics
+    /// Fails if a zero or name-consistent in-inode `e_hash` is rejected, or a stale one admitted.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare independently encoded inode regions with admission outcomes"
+    )]
+    fn inode_attribute_hash_is_optional_but_authenticated_when_recorded() -> crate::Result<()> {
+        // Hashes follow the independent external-entry vectors; 0x3231_3be6 is the
+        // signed-byte name contribution for the 0x80, 0xff name over the same value.
+        for (name, value, stored, admitted) in [
+            (b"a".as_slice(), b"123".as_slice(), 0, true),
+            (b"a".as_slice(), b"123".as_slice(), 0x0052_3231, true),
+            (b"a".as_slice(), b"123".as_slice(), 0x0052_3232, false),
+            (
+                [0x80, 0xff].as_slice(),
+                b"12345".as_slice(),
+                0x3231_24f9,
+                true,
+            ),
+            (
+                [0x80, 0xff].as_slice(),
+                b"12345".as_slice(),
+                0x3231_3be6,
+                true,
+            ),
+            (
+                [0x80, 0xff].as_slice(),
+                b"12345".as_slice(),
+                0x3231_3be7,
+                false,
+            ),
+        ] {
+            let mut region = [0_u8; 60];
+            put_le_u32(&mut region, disk_offset(0), EXT4_XATTR_MAGIC)?;
+            *region.get_mut(4).ok_or(crate::Error::InvalidXattr)? =
+                u8::try_from(name.len()).map_err(|_| crate::Error::ArithmeticOverflow)?;
+            *region.get_mut(5).ok_or(crate::Error::InvalidXattr)? = 1;
+            // Values are addressed from the first entry, four bytes into the region.
+            put_le_u16(&mut region, disk_offset(6), 48)?;
+            put_le_u32(
+                &mut region,
+                disk_offset(12),
+                u32::try_from(value.len()).map_err(|_| crate::Error::ArithmeticOverflow)?,
+            )?;
+            put_le_u32(&mut region, disk_offset(16), stored)?;
+            memory::copy_exact(
+                region
+                    .get_mut(20..20 + name.len())
+                    .ok_or(crate::Error::InvalidXattr)?,
+                name,
+            )?;
+            memory::copy_exact(
+                region
+                    .get_mut(52..52 + value.len())
+                    .ok_or(crate::Error::InvalidXattr)?,
+                value,
+            )?;
+            let parsed = parse_inline_xattrs(&region)
+                .and_then(|parsed| parsed.resolve(|_| Err(crate::Error::InvalidXattr)));
+            if admitted {
+                let name = XattrName::new(XattrNamespace::User, name)?;
+                assert_eq!(
+                    parsed?.public().get(&name).map(XattrValue::bytes),
+                    Some(value)
+                );
+            } else {
+                assert_eq!(parsed.err(), Some(crate::Error::InvalidXattr));
+            }
+        }
         Ok(())
     }
 
