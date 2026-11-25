@@ -35,7 +35,7 @@ impl ResizeInodeBlockMap {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// Newly allocated zeroed inode record before an inode kind has been written.
+/// Cleared inode record before an inode kind has been written.
 pub(super) struct AllocatedInodeRecord {
     /// Raw inode image owned by this typestate.
     raw: RawInodeRecord<Vec<u8>>,
@@ -198,6 +198,19 @@ impl RawInodeRecord<Vec<u8>> {
 }
 
 impl AllocatedInodeRecord {
+    /// Selects the successor of the generation persisted in this free inode slot.
+    /// Free records need not have valid checksums. Only the generation field is used, and zero
+    /// is reserved for consumers that omit generation matching.
+    /// # Errors
+    /// Returns a source-read, storage range, or field encoding error.
+    pub(super) fn with_next_generation(mut self, device: &mut OperationDevice<'_>) -> Result<Self> {
+        device.read_metadata_exact_at(self.raw.offset, &mut self.raw.bytes)?;
+        let offset = disk_offset(INODE_GENERATION_OFFSET);
+        let generation = le_u32(&self.raw.bytes, offset)?.checked_add(1).unwrap_or(1);
+        self.raw.bytes.fill(0);
+        put_le_u32(&mut self.raw.bytes, offset, generation)?;
+        Ok(self)
+    }
     /// Initializes a positive-reference attribute value before allocating its extent payload.
     /// # Errors
     /// Propagates metadata, size or field encoding failures.
@@ -974,7 +987,7 @@ impl RawInodeRecord<Vec<u8>> {
     ///
     /// Returns an error when file metadata, timestamps, empty extent-root serialization, or sector
     /// count serialization fails.
-    pub(super) fn initialize_file(
+    fn initialize_file(
         &mut self,
         metadata: NewFileMetadata,
         parent_flags: InodeFlags,
@@ -982,7 +995,6 @@ impl RawInodeRecord<Vec<u8>> {
         block_size: BlockSize,
         timestamp_encoding: InodeTimestampEncoding,
     ) -> Result<()> {
-        self.bytes.fill(0);
         if timestamp_encoding == InodeTimestampEncoding::ExtraFields {
             self.initialize_extra_fields()?;
         }
@@ -1016,7 +1028,7 @@ impl RawInodeRecord<Vec<u8>> {
         clippy::too_many_arguments,
         reason = "directory initialization combines inherited policy, metadata, time, geometry and its allocated storage"
     )]
-    pub(super) fn initialize_directory(
+    fn initialize_directory(
         &mut self,
         metadata: NewDirectoryMetadata,
         parent_flags: InodeFlags,
@@ -1026,7 +1038,6 @@ impl RawInodeRecord<Vec<u8>> {
         allocation_size: FileAllocationSize,
         timestamp_encoding: InodeTimestampEncoding,
     ) -> Result<()> {
-        self.bytes.fill(0);
         if timestamp_encoding == InodeTimestampEncoding::ExtraFields {
             self.initialize_extra_fields()?;
         }
@@ -1062,7 +1073,7 @@ impl RawInodeRecord<Vec<u8>> {
     ///
     /// Returns an error when `target` does not fit inline storage or any symlink inode field is
     /// truncated.
-    pub(super) fn initialize_inline_symlink(
+    fn initialize_inline_symlink(
         &mut self,
         metadata: NewSymlinkMetadata,
         parent_flags: InodeFlags,
@@ -1073,7 +1084,6 @@ impl RawInodeRecord<Vec<u8>> {
         if !target.is_inline() {
             return Err(Error::InvalidWriteRange);
         }
-        self.bytes.fill(0);
         if timestamp_encoding == InodeTimestampEncoding::ExtraFields {
             self.initialize_extra_fields()?;
         }
@@ -1099,7 +1109,7 @@ impl RawInodeRecord<Vec<u8>> {
     ///
     /// Returns an error when `target` should use inline storage or the empty extent-backed symlink
     /// fields cannot be serialized.
-    pub(super) fn initialize_extent_symlink(
+    fn initialize_extent_symlink(
         &mut self,
         metadata: NewSymlinkMetadata,
         parent_flags: InodeFlags,
@@ -1111,7 +1121,6 @@ impl RawInodeRecord<Vec<u8>> {
         if target.is_inline() {
             return Err(Error::InvalidWriteRange);
         }
-        self.bytes.fill(0);
         if timestamp_encoding == InodeTimestampEncoding::ExtraFields {
             self.initialize_extra_fields()?;
         }

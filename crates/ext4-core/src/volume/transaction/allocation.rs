@@ -560,8 +560,9 @@ impl MetadataMutation<'_, '_> {
     /// earlier typed selection cannot silently bind to a new inode within the same pass.
     /// # Errors
     ///
-    /// Returns no-free-inode when no unreserved identity remains, or an error when bitmap staging
-    /// or inode accounting fails. Retirement reservations do not survive publication or abandonment.
+    /// Returns no-free-inode when no unreserved identity remains, or an error when bitmap staging,
+    /// the previous-generation read or inode accounting fails. Retirement reservations do not
+    /// survive publication or abandonment.
     pub(super) fn allocate_inode(&mut self) -> Result<AllocatedInodeRecord> {
         let groups = self.volume.superblock.block_group_count()?;
         for group in 0..groups.as_u32() {
@@ -599,7 +600,9 @@ impl MetadataMutation<'_, '_> {
                         BitmapBitState::Used,
                     )?;
                     self.record_group_free_inodes_delta(group, -1)?;
-                    return self.empty_allocated_inode_record(inode_id);
+                    return self
+                        .empty_allocated_inode_record(inode_id)?
+                        .with_next_generation(&mut self.volume.device);
                 }
             }
         }

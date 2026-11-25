@@ -6053,6 +6053,11 @@ fn transaction_inode_retirement_preserves_replacement_and_next_transaction_alloc
 fn final_unlink_publishes_retirement_before_inode_reuse() -> Result<()> {
     let mut fixture = Fixture::new()?;
     let file = fixture.a;
+    let offset = fixture_inode_offset(&fixture.disk, NodeId::File(file))?
+        .checked_add(100)
+        .ok_or(Error::ArithmeticOverflow)?;
+    let original_generation = fixture_u32(&fixture.disk.filesystem, offset)?;
+    assert_ne!(original_generation, 0);
     fixture.mutate(|pass| {
         let root = pass.directory(DirectoryNodeId::ROOT)?;
         let source = pass.hard_link_source(HardLinkNodeId::File(file))?;
@@ -6110,6 +6115,10 @@ fn final_unlink_publishes_retirement_before_inode_reuse() -> Result<()> {
                 .disk
                 .commit(&mut fixture.coordinator, &mut fixture.cache, ticket, ready)?;
     }
+    assert_eq!(
+        fixture_u32(&fixture.disk.filesystem, offset)?,
+        original_generation
+    );
     let replacement = fixture.mutate(|pass| {
         let root = pass.directory(DirectoryNodeId::ROOT)?;
         let replacement = pass.create_file(
@@ -6123,9 +6132,38 @@ fn final_unlink_publishes_retirement_before_inode_reuse() -> Result<()> {
     // This fixture's first-free allocator must exercise the retired number, not a fresh slot.
     assert_eq!(replacement, file);
     fixture.remount()?;
+    let replacement_generation = fixture_u32(&fixture.disk.filesystem, offset)?;
+    assert_ne!(replacement_generation, 0);
+    assert_ne!(replacement_generation, original_generation);
     let mut bytes = [0; 11];
     fixture.read(|pass| pass.read_file(replacement, FileOffset::ZERO, &mut bytes))?;
     assert_eq!(&bytes, b"replacement");
+
+    let name = Ext4Name::new(b"concurrent-a")?;
+    fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        pass.unlink_file(root, &name)
+    })?;
+    let end = offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?;
+    for (byte, source) in fixture
+        .disk
+        .filesystem
+        .get_mut(offset..end)
+        .ok_or(Error::DeviceRange)?
+        .iter_mut()
+        .zip(u32::MAX.to_le_bytes())
+    {
+        *byte = source;
+    }
+    fixture.remount()?;
+    let wrapped = fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        let metadata = NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?);
+        Ok(pass.create_file(root, &name, metadata)?.id())
+    })?;
+    assert_eq!(wrapped, file);
+    fixture.remount()?;
+    assert_eq!(fixture_u32(&fixture.disk.filesystem, offset)?, 1);
     Ok(())
 }
 
