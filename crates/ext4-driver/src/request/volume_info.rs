@@ -21,8 +21,8 @@ use crate::{
     },
     memory,
     state::{
-        MountedVolumeAccess, MountedVolumeDevice, PreparedVpbLabelPublication, TransferSectorSize,
-        VolumeSerialNumber,
+        MountedVolumeAccess, MountedVolumeDevice, OpenedVolume, PreparedVpbLabelPublication,
+        TransferSectorSize, VolumeSerialNumber,
     },
     volume_label::WindowsVolumeLabel,
     wire::{LittleEndianInput, LittleEndianOutput, WireOffset, WireRange},
@@ -260,14 +260,25 @@ fn prepare_query(
 /// Executes volume information mutations.
 /// # Errors
 ///
-/// Returns an error when volume stack decoding or label mutation fails.
+/// Requires a live direct-volume open with `FILE_WRITE_DATA` on this mount, including for a
+/// request that leaves the current label unchanged.
 pub(crate) fn set(
     mut request: PendingIrpLease<'_>,
     operations: &MountedVolumeAccess<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
 ) -> DriverResult<SetVolumeResolution> {
     let (device, label) = request.with_active(|active| {
-        let stack = active.current_stack()?.set_volume()?;
+        let current = active.current_stack()?;
+        let opened = OpenedVolume::decode(current.file_object()?).map_err(|error| match error {
+            DriverError::ObjectTypeMismatch => DriverError::AccessDenied,
+            error => error,
+        })?;
+        if !operations.owns_volume(opened.volume()) {
+            return Err(DriverError::InvalidDeviceRequest);
+        }
+        operations.authorize_handle(opened.file_object())?;
+        opened.require_data_write()?;
+        let stack = current.set_volume()?;
         let label = match stack.information_class() {
             SetVolumeInformationClass::Label => {
                 let input = active.buffered_input(stack.length())?;
