@@ -77,7 +77,7 @@ pub(crate) fn verify_windows_host(root: &Path) -> TaskResult<()> {
             trim_schedule,
             "native Windows TRIM task registration and cleanup",
         )?;
-        run_checked(
+        let output = run_checked_output(
             cargo_command(
                 root,
                 &[
@@ -85,78 +85,19 @@ pub(crate) fn verify_windows_host(root: &Path) -> TaskResult<()> {
                     "--locked",
                     "-p",
                     "windows-host",
-                    "native::trace::tests::native_etw_contract",
+                    "--lib",
                     "--",
                     "--ignored",
-                    "--exact",
+                    "-Z",
+                    "unstable-options",
+                    "--format",
+                    "json",
                 ],
             ),
-            "native ETW host contract gate",
+            "elevated Windows test suite",
         )?;
-        run_checked(
-            cargo_command(
-                root,
-                &[
-                    "test",
-                    "--locked",
-                    "-p",
-                    "windows-host",
-                    "native::identity::access_tests::native_explicit_privileges_contract",
-                    "--",
-                    "--ignored",
-                    "--exact",
-                ],
-            ),
-            "native explicit security privilege contract",
-        )?;
-        run_checked(
-            cargo_command(
-                root,
-                &[
-                    "test",
-                    "--locked",
-                    "-p",
-                    "windows-host",
-                    "native::identity::access_tests::native_backup_restore_privileges_contract",
-                    "--",
-                    "--ignored",
-                    "--exact",
-                ],
-            ),
-            "native backup and restore privilege authority",
-        )?;
-        run_checked(
-            cargo_command(
-                root,
-                &[
-                    "test",
-                    "--locked",
-                    "-p",
-                    "windows-host",
-                    "native::identity::access_tests::native_restore_namespace_contract",
-                    "--",
-                    "--ignored",
-                    "--exact",
-                ],
-            ),
-            "native restore-privilege namespace contract",
-        )?;
-        run_checked(
-            cargo_command(
-                root,
-                &[
-                    "test",
-                    "--locked",
-                    "-p",
-                    "windows-host",
-                    "native::tests::native_loaded_driver_observation_contract",
-                    "--",
-                    "--ignored",
-                    "--exact",
-                ],
-            ),
-            "native loaded-driver observation contract",
-        )?;
+        io::stdout().write_all(&output.stdout)?;
+        require_elevated_test_completion(&String::from_utf8(output.stdout)?)?;
         println!("native Windows host contracts: PASS");
         Ok(())
     }
@@ -169,6 +110,32 @@ pub(crate) fn verify_windows_host(root: &Path) -> TaskResult<()> {
         )
         .into())
     }
+}
+
+/// Checks the result of the test harness itself, since Cargo succeeds on an empty selection.
+/// # Errors
+/// Returns malformed output or the absence of one successful nonempty suite.
+#[cfg(any(windows, test))]
+fn require_elevated_test_completion(report: &str) -> TaskResult<()> {
+    let mut completion = None;
+    for line in report.lines() {
+        let event: serde_json::Value = serde_json::from_str(line)?;
+        if event.get("type").and_then(serde_json::Value::as_str) == Some("suite")
+            && event.get("event").and_then(serde_json::Value::as_str) == Some("ok")
+        {
+            let passed = event
+                .get("passed")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|passed| *passed > 0);
+            if completion.is_some() || passed.is_none() {
+                return Err(io::Error::other("invalid elevated Windows suite completion").into());
+            }
+            completion = passed;
+        }
+    }
+    completion
+        .map(|_| ())
+        .ok_or_else(|| io::Error::other("elevated Windows suite completion is missing").into())
 }
 
 /// Invokes the current Task Scheduler contract harness without loading a filesystem driver.
@@ -732,6 +699,20 @@ mod tests {
     use super::{
         fuzz_limits, parse_fuzz_targets, require_cargo_fuzz_version, require_fuzz_seed_length,
     };
+
+    /// # Panics
+    /// Fails if a successful Cargo invocation can hide an empty or missing elevated suite.
+    #[test]
+    fn elevated_test_gate_requires_observed_tests() {
+        use super::require_elevated_test_completion;
+
+        let empty = r#"{"type":"suite","event":"ok","passed":0}"#;
+        let nonempty = r#"{"type":"suite","event":"ok","passed":5}"#;
+        assert!(require_elevated_test_completion(empty).is_err());
+        assert!(require_elevated_test_completion("").is_err());
+        assert!(require_elevated_test_completion(nonempty).is_ok());
+        assert!(require_elevated_test_completion(&format!("{nonempty}\n{nonempty}")).is_err());
+    }
 
     /// Corpus admission and harness rejection use the same encoded-input byte limit.
     /// # Panics
