@@ -17,7 +17,7 @@ use std::{
     io::{self, Write},
     os::windows::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, Output, Stdio},
     thread,
     time::Instant,
 };
@@ -74,6 +74,9 @@ struct LiveState {
     wsl: WslAttachment,
     /// Nested driver lifecycle progress.
     driver: DriverStage,
+    /// Boot in which the session may have selected the driver for verification.
+    #[serde(default)]
+    verifier_selection_boot: Option<String>,
     /// Disposable ext4 UUID retained before identity-table effects and checked after restart.
     identity: Option<[u8; 16]>,
 }
@@ -150,7 +153,7 @@ impl LiveState {
 /// Executes a native WSL command with explicit root and deterministic tool search path.
 /// # Errors
 /// Returns requester or external command errors.
-fn wsl(arguments: &[OsString]) -> TaskResult<String> {
+fn wsl_output(arguments: &[OsString]) -> TaskResult<Output> {
     let mut command = Command::new("wsl.exe");
     if arguments
         .first()
@@ -162,13 +165,20 @@ fn wsl(arguments: &[OsString]) -> TaskResult<String> {
             "--exec",
             "/usr/bin/env",
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "LC_ALL=C",
         ]);
         command.args(arguments.iter().skip(1));
     } else {
         command.args(arguments);
     }
-    let output = run_checked_output(command, "WSL session operation")?;
-    Ok(String::from_utf8(output.stdout)?)
+    run_checked_output(command, "WSL session operation")
+}
+
+/// Decodes a WSL management response whose output is text.
+/// # Errors
+/// Returns command or response encoding errors.
+fn wsl(arguments: &[OsString]) -> TaskResult<String> {
+    Ok(String::from_utf8(wsl_output(arguments)?.stdout)?)
 }
 /// Converts static WSL arguments without a shell interpretation boundary.
 /// # Errors
@@ -251,10 +261,46 @@ fn linux_partition(layout: &str, partition: &Partition) -> TaskResult<String> {
     Ok(name.clone())
 }
 
-/// Parses current-boot Driver Verifier activity; next-boot settings are not runtime evidence.
+/// Separates evidence obtained before the additional runtime rule classes are enabled.
+#[derive(Clone, Copy)]
+enum VerifierObservation {
+    /// Initial load with the pre-load selection.
+    InitialLoad,
+    /// Runtime flags before exercising the mounted filesystem.
+    BeforeFilesystemIo,
+    /// Runtime flags after remount and before the first unload.
+    BeforeAttachedUnload,
+    /// Second load with the pre-load selection.
+    Restarted,
+    /// Runtime flags before exercising storage hot attachment.
+    BeforeHotAttach,
+    /// Runtime flags after exercising storage hot attachment.
+    AfterHotAttach,
+}
+
+impl VerifierObservation {
+    /// Stable report names retain the evidence independently for each load and I/O phase.
+    const fn file_name(self) -> &'static str {
+        match self {
+            Self::InitialLoad => "verifier-initial-load.txt",
+            Self::BeforeFilesystemIo => "verifier-before-filesystem-io.txt",
+            Self::BeforeAttachedUnload => "verifier-before-attached-unload.txt",
+            Self::Restarted => "verifier-restarted.txt",
+            Self::BeforeHotAttach => "verifier-before-hot-attach.txt",
+            Self::AfterHotAttach => "verifier-after-hot-attach.txt",
+        }
+    }
+
+    /// Start observations precede activation of the additional runtime rules.
+    const fn requires_runtime_flags(self) -> bool {
+        !matches!(self, Self::InitialLoad | Self::Restarted)
+    }
+}
+
+/// Parses current-boot Driver Verifier activity and requires the requested observation.
 /// # Errors
 /// Returns unknown/localized, ambiguous, insufficient or unloaded reports.
-fn verifier_activity(report: &str) -> TaskResult<()> {
+fn verifier_activity(report: &str, observation: VerifierObservation) -> TaskResult<()> {
     let mut flags = Vec::new();
     let mut modules = Vec::new();
     for line in report.lines().map(str::trim) {
@@ -290,34 +336,95 @@ fn verifier_activity(report: &str) -> TaskResult<()> {
         )
         .into());
     };
-    if flags & 0x0002_091b != 0x0002_091b || loads <= unloads {
-        return Err(io::Error::other(
-            "runtime Verifier checks are missing or ext4win.sys is not loaded",
-        )
-        .into());
+    if loads <= unloads {
+        return Err(io::Error::other("Verifier does not observe ext4win.sys loaded").into());
+    }
+    if observation.requires_runtime_flags() && flags & 0x0002_091b != 0x0002_091b {
+        return Err(io::Error::other("required runtime Verifier checks are missing").into());
     }
     Ok(())
 }
-/// Observes and retains exact loaded-driver Verifier evidence before filesystem work.
+
+/// Observes and retains the loaded driver's distinct current-boot reports.
 /// # Errors
 /// Returns query, evidence write or runtime-activity validation failures.
-fn observe_verifier(session: &mut Session<LiveState>) -> TaskResult<()> {
+fn observe_verifier(
+    session: &mut Session<LiveState>,
+    observation: VerifierObservation,
+) -> TaskResult<()> {
     let mut command = Command::new("verifier.exe");
     command.arg("/query");
     let output = run_checked_output(command, "loaded Driver Verifier runtime query")?;
     let report = String::from_utf8(output.stdout)?;
-    fs::write(session.directory().join("verifier-runtime.txt"), &report)?;
-    verifier_activity(&report)?;
+    fs::write(session.directory().join(observation.file_name()), &report)?;
+    verifier_activity(&report, observation)?;
     session.publish(Phase::Observed(Operation::ObserveVerifier))
 }
 
-/// Applies the live Driver Verifier checks to the loaded image and confirms they are active.
-///
-/// `/now` settings are volatile and belong to one image load: they do not survive the driver's
-/// unload, so every start of the session driver must be followed by a new activation.
+/// Identifies the boot in which a volatile selection exists.
+/// # Errors
+/// Returns management errors or an unrecognized boot timestamp.
+fn verifier_boot() -> TaskResult<String> {
+    let observed = windows::management(
+        "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')",
+        Duration::from_secs(30),
+    )?;
+    observed
+        .as_str()
+        .filter(|boot| !boot.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| io::Error::other("Windows boot timestamp is unavailable").into())
+}
+
+/// Selects the unloaded driver for automatic verification from its first instruction.
+/// # Errors
+/// Returns boot identity, durable intent or named selection failures.
+fn select_startup_verifier(session: &mut Session<LiveState>) -> TaskResult<()> {
+    if session.state().verifier_selection_boot.is_some() {
+        return Err(io::Error::other("startup Verifier selection already requested").into());
+    }
+    if windows_host::driver_image_loaded("ext4win.sys")? {
+        return Err(
+            io::Error::other("startup Verifier selection requires an unloaded image").into(),
+        );
+    }
+    session.state_mut().verifier_selection_boot = Some(verifier_boot()?);
+    session.publish(Phase::Intent(Operation::SelectStartupVerifier))?;
+    let mut command = Command::new("verifier.exe");
+    command.args(["/volatile", "/adddriver", "ext4win.sys"]);
+    run_checked(command, "select ext4win.sys before SCM start")?;
+    session.publish(Phase::Observed(Operation::SelectStartupVerifier))
+}
+
+/// Releases only this session's named volatile selection after image departure.
+/// # Errors
+/// Leaves the durable selection ownership in place if removal is uncertain.
+fn release_startup_verifier(session: &mut Session<LiveState>) -> TaskResult<()> {
+    let Some(selected_in) = session.state().verifier_selection_boot.as_ref() else {
+        return Ok(());
+    };
+    if session.state().driver != DriverStage::Cleaned {
+        return Err(
+            io::Error::other("Verifier release requires observed driver image departure").into(),
+        );
+    }
+    if *selected_in == verifier_boot()? {
+        session.publish(Phase::Intent(Operation::ReleaseStartupVerifier))?;
+        let mut command = Command::new("verifier.exe");
+        command.args(["/volatile", "/removedriver", "ext4win.sys"]);
+        run_checked(command, "release ext4win.sys Verifier selection")?;
+    }
+    session.state_mut().verifier_selection_boot = None;
+    session.publish(Phase::Observed(Operation::ReleaseStartupVerifier))
+}
+
+/// Applies the additional Driver Verifier rules to one already verified image load.
 /// # Errors
 /// Returns activation, runtime-query or insufficient-activity failures.
-fn activate_verifier(session: &mut Session<LiveState>) -> TaskResult<()> {
+fn activate_verifier(
+    session: &mut Session<LiveState>,
+    observation: VerifierObservation,
+) -> TaskResult<()> {
     session.publish(Phase::Intent(Operation::ActivateVerifier))?;
     let mut command = Command::new("verifier.exe");
     command.args([
@@ -334,7 +441,7 @@ fn activate_verifier(session: &mut Session<LiveState>) -> TaskResult<()> {
         "ext4win.sys",
     ]);
     run_checked(command, "live Driver Verifier activation")?;
-    observe_verifier(session)
+    observe_verifier(session, observation)
 }
 
 /// Checks live-host prerequisites without storage, package or driver mutation.
@@ -411,14 +518,13 @@ fn create_storage(session: &mut Session<LiveState>, workload: LiveWorkload) -> T
     attachment(session, false)
 }
 
-/// Formats and populates through Linux tools before any Windows-driver mount can occur.
+/// Acquires the WSL partition mapping only for the owned VHDX and its recorded GPT identity.
 /// # Errors
-/// Returns device-difference, GPT identity, oracle, helper or WSL detachment failures.
-fn format_storage(
-    session: &mut Session<LiveState>,
-    helper: &Path,
-    workload: LiveWorkload,
-) -> TaskResult<()> {
+/// Returns device-difference, GPT identity or attachment failures.
+fn attach_wsl_partition(session: &mut Session<LiveState>) -> TaskResult<String> {
+    if session.state().wsl != WslAttachment::Detached || storage::disk(&vhdx(session))?.is_some() {
+        return Err(io::Error::other("WSL acquisition requires a detached session VHDX").into());
+    }
     let before = wsl_words(&["--exec", "lsblk", "-dn", "-o", "NAME"])?;
     session.state_mut().wsl = WslAttachment::Requested;
     session.publish(Phase::Intent(Operation::AttachWsl))?;
@@ -456,6 +562,18 @@ fn format_storage(
     let partition = format!("/dev/{}", linux_partition(&layout, partition)?);
     session.state_mut().wsl = WslAttachment::Attached;
     session.publish(Phase::Observed(Operation::AttachWsl))?;
+    Ok(partition)
+}
+
+/// Formats and populates through Linux tools before any Windows-driver mount can occur.
+/// # Errors
+/// Returns device-difference, GPT identity, oracle, helper or WSL detachment failures.
+fn format_storage(
+    session: &mut Session<LiveState>,
+    helper: &Path,
+    workload: LiveWorkload,
+) -> TaskResult<()> {
+    let partition = attach_wsl_partition(session)?;
     session.publish(Phase::Intent(Operation::Format))?;
     wsl_words(&[
         "--exec",
@@ -510,6 +628,94 @@ fn format_storage(
     wsl_words(&["--exec", "e2fsck", "-fn", &partition])?;
     session.publish(Phase::Observed(Operation::Format))?;
     finish_wsl(session, wsl)?;
+    Ok(())
+}
+
+/// Rejects pending journal recovery, which a read-only e2fsck can skip.
+/// # Errors
+/// Returns missing or ambiguous superblock observations, an unclean state or pending recovery.
+fn require_clean_superblock(report: &str) -> TaskResult<()> {
+    let mut states = report
+        .lines()
+        .filter_map(|line| line.strip_prefix("Filesystem state:"))
+        .map(str::trim);
+    let mut features = report
+        .lines()
+        .filter_map(|line| line.strip_prefix("Filesystem features:"));
+    let features = match (features.next(), features.next()) {
+        (Some(features), None) => features,
+        _ => return Err(io::Error::other("ambiguous debugfs filesystem features").into()),
+    };
+    if states.next() != Some("clean")
+        || states.next().is_some()
+        || features
+            .split_whitespace()
+            .any(|feature| feature == "needs_recovery")
+    {
+        return Err(io::Error::other("Linux observed an unclean ext4 superblock").into());
+    }
+    Ok(())
+}
+
+/// Checks the values independently reported by debugfs for the Windows-created inode.
+/// # Errors
+/// Returns an incomplete, ambiguous or differing field observation.
+fn require_persisted_probe_metadata(report: &str) -> TaskResult<()> {
+    for (field, expected) in [
+        ("Type:", "regular"),
+        ("Mode:", "0644"),
+        ("User:", "1000"),
+        ("Group:", "100"),
+        ("Links:", "1"),
+    ] {
+        let mut values = report
+            .split_whitespace()
+            .zip(report.split_whitespace().skip(1))
+            .filter_map(|(label, value)| (label == field).then_some(value));
+        if values.next() != Some(expected) || values.next().is_some() {
+            return Err(io::Error::other(format!("persisted probe has unexpected {field}")).into());
+        }
+    }
+    Ok(())
+}
+
+/// Validates the original post-I/O disk using read-only Linux tools after unload.
+/// # Errors
+/// Returns identity, clean-filesystem, Windows-created file or WSL finalization failures.
+fn verify_persisted_storage(session: &mut Session<LiveState>, payload: &[u8]) -> TaskResult<()> {
+    if session.state().driver != DriverStage::Cleaned {
+        return Err(io::Error::other("Linux inspection requires completed driver cleanup").into());
+    }
+    let partition = attach_wsl_partition(session)?;
+    session.publish(Phase::Intent(Operation::InspectFilesystem))?;
+    let superblock = wsl_words(&["--exec", "debugfs", "-R", "stats -h", &partition])?;
+    require_clean_superblock(&superblock)?;
+    let report = wsl_words(&["--exec", "e2fsck", "-f", "-n", &partition])?;
+    println!("Post-I/O e2fsck:\n{report}");
+    let metadata = wsl_words(&[
+        "--exec",
+        "debugfs",
+        "-R",
+        "stat /live-ci/alpha.bin",
+        &partition,
+    ])?;
+    println!("Post-I/O debugfs stat:\n{metadata}");
+    require_persisted_probe_metadata(&metadata)?;
+    let arguments = [
+        "--exec",
+        "debugfs",
+        "-R",
+        "cat /live-ci/alpha.bin",
+        &partition,
+    ];
+    if wsl_output(&arguments.map(OsString::from))?.stdout != payload {
+        return Err(
+            io::Error::other("Linux readback differs from the Windows-written payload").into(),
+        );
+    }
+    session.publish(Phase::Observed(Operation::InspectFilesystem))?;
+    finish_wsl(session, wsl)?;
+    println!("live VHDX post-I/O filesystem integrity: PASS");
     Ok(())
 }
 
@@ -1041,15 +1247,19 @@ pub(crate) fn read_remount_payload(path: &Path) -> TaskResult<()> {
 /// Executes native I/O, remount, unload with attached storage, and hot-attach after restart.
 /// # Errors
 /// Returns load, Verifier, discovery, filesystem, hot-attach or required detachment failures.
-fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<()> {
+fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<Vec<u8>> {
     let scope = scope(session)?;
     storage::validate(&scope)?;
-    session.state_mut().driver = DriverStage::Starting;
-    session.publish(Phase::Intent(Operation::StartDriver))?;
-    let artifact = driver_load::start_session(root, session.id(), Some(&scope))?;
+    let id = session.id().clone();
+    let artifact = driver_load::start_session(root, &id, Some(&scope), || {
+        select_startup_verifier(session)?;
+        session.state_mut().driver = DriverStage::Starting;
+        session.publish(Phase::Intent(Operation::StartDriver))
+    })?;
     session.state_mut().driver = DriverStage::Running;
     session.publish(Phase::Observed(Operation::StartDriver))?;
-    activate_verifier(session)?;
+    observe_verifier(session, VerifierObservation::InitialLoad)?;
+    activate_verifier(session, VerifierObservation::BeforeFilesystemIo)?;
     let mount = mount_namespace(session)?;
     configure_identity(session)?;
     let payload = exercise_io(session, &mount)?;
@@ -1094,7 +1304,7 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
     remove_namespace(session)?;
     exercise_offline_online(session, &payload)?;
     storage::validate(&scope)?;
-    observe_verifier(session)?;
+    observe_verifier(session, VerifierObservation::BeforeAttachedUnload)?;
     println!("live unload: stop the driver with the session VHDX still attached");
     let driver = driver_load::quiesce_session(root, session.id())?;
     dismount_filesystem(session)?;
@@ -1107,7 +1317,8 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
         session.publish(Phase::Intent(Operation::StartDriver))
     })?;
     session.publish(Phase::Observed(Operation::StartDriver))?;
-    activate_verifier(session)?;
+    observe_verifier(session, VerifierObservation::Restarted)?;
+    activate_verifier(session, VerifierObservation::BeforeHotAttach)?;
     attachment(session, true)?;
     let mount = mount_namespace(session)?;
     if fs::read(mount.join("live-ci/alpha.bin"))? != payload {
@@ -1133,14 +1344,39 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
         return Err(io::Error::other("reattachment lost durable identity mapping").into());
     }
     storage::validate(&scope)?;
-    observe_verifier(session)?;
+    observe_verifier(session, VerifierObservation::AfterHotAttach)?;
     let mut driver = driver_load::quiesce_session(root, session.id())?;
     dismount_filesystem(session)?;
     remove_namespace(session)?;
     attachment(session, false)?;
     wait_removed(session)?;
     // Exercise recovery after endpoint retirement commits while SCM is still Running.
-    driver.prepare_unload()
+    driver.prepare_unload()?;
+    Ok(payload)
+}
+
+/// Finalizes the exact nested driver session before any Linux inspection of written storage.
+/// # Errors
+/// Returns missing driver identity or mandatory package and service cleanup failures.
+fn cleanup_bound_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<()> {
+    if session.state().driver == DriverStage::Cleaned {
+        return Ok(());
+    }
+    let driver_directory = root
+        .join("target/driver-load-sessions")
+        .join(session.id().as_str());
+    if driver_directory.is_dir() {
+        session.publish(Phase::Intent(Operation::CleanupDriver))?;
+        driver_load::cleanup_driver_load_session(root, OsStr::new(session.id().as_str()))?;
+        session.state_mut().driver = DriverStage::Cleaned;
+        session.publish(Phase::Observed(Operation::CleanupDriver))?;
+    } else if matches!(
+        session.state().driver,
+        DriverStage::Starting | DriverStage::Running
+    ) {
+        return Err(io::Error::other("started driver's durable session identity is absent").into());
+    }
+    Ok(())
 }
 
 /// Removes owned storage first, preserving the driver's unload endpoint until volume cleanup ends.
@@ -1172,23 +1408,12 @@ fn cleanup(root: &Path, session: &mut Session<LiveState>) -> TaskResult<()> {
     } else {
         remove_namespace(session)?;
     }
+    cleanup_bound_driver(root, session)?;
+    release_startup_verifier(session)?;
     if vhdx(session).exists() {
         session.publish(Phase::Intent(Operation::RemoveVhdx))?;
         fs::remove_file(vhdx(session))?;
         session.publish(Phase::Observed(Operation::RemoveVhdx))?;
-    }
-    // SCM deletes the bound service's registry subtree, which owns the fixture mappings.
-    // The control endpoint may already be retired when cleanup resumes.
-    let driver_directory = root
-        .join("target/driver-load-sessions")
-        .join(session.id().as_str());
-    if driver_directory.is_dir() {
-        session.publish(Phase::Intent(Operation::CleanupDriver))?;
-        driver_load::cleanup_driver_load_session(root, OsStr::new(session.id().as_str()))?;
-        session.state_mut().driver = DriverStage::Cleaned;
-        session.publish(Phase::Observed(Operation::CleanupDriver))?;
-    } else if session.state().driver == DriverStage::Running {
-        return Err(io::Error::other("started driver's durable session identity is absent").into());
     }
     session.publish(Phase::Complete)
 }
@@ -1231,6 +1456,7 @@ fn prepare_session(root: &Path, workload: LiveWorkload, id: SessionId) -> TaskRe
         storage: StorageIdentity::Unobserved,
         wsl: WslAttachment::Detached,
         driver: DriverStage::Absent,
+        verifier_selection_boot: None,
         identity: None,
     };
     let mut session = Session::create(root, "live-vhdx-sessions", id, state)?;
@@ -1290,7 +1516,10 @@ pub(crate) fn verify_live_vhdx(root: &Path, id: &OsStr) -> TaskResult<()> {
             return combine_verification_and_cleanup(Err(error.into()), cleanup);
         }
     };
-    let operation = exercise_driver(root, &mut session);
+    let operation = exercise_driver(root, &mut session).and_then(|payload| {
+        cleanup_bound_driver(root, &mut session)?;
+        verify_persisted_storage(&mut session, &payload)
+    });
     let resources = cleanup_live_vhdx_session(root, OsStr::new(session.id().as_str()));
     let operation = combine_verification_and_cleanup(operation, resources);
     let completion = trace.finish().map(|_| ()).map_err(Into::into);
@@ -1302,6 +1531,30 @@ pub(crate) fn verify_live_vhdx(root: &Path, id: &OsStr) -> TaskResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// # Panics
+    /// Fails if a read-only filesystem inspection can accept pending recovery or an unclean state.
+    #[test]
+    fn persisted_superblock_must_be_clean_without_pending_recovery() {
+        let report = "Filesystem features:  has_journal extents 64bit\nFilesystem state:  clean";
+        assert!(require_clean_superblock(report).is_ok());
+        assert!(
+            require_clean_superblock(&report.replace("64bit", "64bit needs_recovery")).is_err()
+        );
+        assert!(require_clean_superblock(&report.replace("clean", "clean with errors")).is_err());
+        assert!(require_clean_superblock("Filesystem state:  clean").is_err());
+    }
+
+    /// # Panics
+    /// Fails if the post-write oracle accepts missing, ambiguous or different inode observations.
+    #[test]
+    fn persisted_probe_metadata_requires_independent_inode_fields() {
+        let report = "Inode: 16 Type: regular Mode: 0644 Flags: 0x80000\nUser: 1000 Group: 100 Size: 8192\nLinks: 1 Blockcount: 16";
+        assert!(require_persisted_probe_metadata(report).is_ok());
+        assert!(require_persisted_probe_metadata(&report.replace("Links: 1", "Links: 2")).is_err());
+        assert!(require_persisted_probe_metadata(&report.replace("Group: 100", "")).is_err());
+        assert!(require_persisted_probe_metadata(&format!("{report}\nLinks: 1")).is_err());
+    }
 
     /// # Errors
     /// Returns durable fixture setup, reload or mandatory cleanup failures.
@@ -1343,6 +1596,7 @@ mod tests {
                         },
                         wsl: WslAttachment::Requested,
                         driver: DriverStage::Absent,
+                        verifier_selection_boot: None,
                         identity: None,
                     },
                 )?;
@@ -1407,10 +1661,16 @@ mod tests {
     )]
     fn runtime_and_partition_admission() -> TaskResult<()> {
         let report = "Verifier Flags: 0x001209bb\nMODULE: ext4win.sys (load: 1 / unload: 0)";
-        verifier_activity(report)?;
-        assert!(verifier_activity(&report.replace("load: 1", "load: 0")).is_err());
-        assert!(verifier_activity(&report.replace("0x001209bb", "0x00000001")).is_err());
-        assert!(verifier_activity(&format!("{report}\n{report}")).is_err());
+        let runtime = VerifierObservation::BeforeFilesystemIo;
+        let startup = VerifierObservation::InitialLoad;
+        verifier_activity(report, runtime)?;
+        let default_checks = report.replace("0x001209bb", "0x00000000");
+        verifier_activity(&default_checks, startup)?;
+        assert!(verifier_activity(&default_checks, runtime).is_err());
+        assert!(verifier_activity(&report.replace("load: 1", "load: 0"), startup).is_err());
+        assert!(verifier_activity(&report.replace("load: 1", "load: 0"), runtime).is_err());
+        assert!(verifier_activity(&format!("{report}\n{report}"), runtime).is_err());
+
         let partition = Partition {
             number: 2,
             id: windows_host::guid_bytes("2ca3ad84-858a-49ba-be4a-430713ddf498")?,
@@ -1427,6 +1687,7 @@ mod tests {
             },
             wsl: WslAttachment::Detached,
             driver: DriverStage::Running,
+            verifier_selection_boot: None,
             identity: None,
         };
         let volume = r"\\?\Volume{2ca3ad84-858a-49ba-be4a-430713ddf498}\";

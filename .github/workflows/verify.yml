@@ -858,7 +858,6 @@ jobs:
 
       - name: Verify loaded driver ext4 read-write and remount
         if: env.EXT4WIN_DRIVER_SCENARIO != 'load'
-        id: live_io
         timeout-minutes: 150
         shell: pwsh
         run: |
@@ -916,7 +915,7 @@ jobs:
             target/live-vhdx-ci.log
             target/live-driver-trace/*.etl
             target/live-vhdx-sessions/**/*.json
-            target/live-vhdx-sessions/**/verifier-runtime.txt
+            target/live-vhdx-sessions/**/verifier-*.txt
             target/driver-load-sessions/**
           if-no-files-found: warn
           retention-days: 14
@@ -948,13 +947,3 @@ jobs:
           path: target/verified-production/**
           if-no-files-found: error
           retention-days: 14
-
-      - name: Stop job-owned Driver Verifier checks
-        if: always() && steps.live_io.outcome != 'skipped'
-        timeout-minutes: 2
-        shell: powershell
-        run: |
-          verifier.exe /stop
-          if ($LASTEXITCODE -ne 0) {
-            throw "Driver Verifier stop failed: $LASTEXITCODE"
-          }

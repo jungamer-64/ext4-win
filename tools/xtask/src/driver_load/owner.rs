@@ -569,14 +569,16 @@ fn prepared_identity(session: &Session<DriverState>) -> TaskResult<(&InstalledPa
 }
 
 /// Revalidates a stopped installation before consuming its one initial-start permission.
+/// The stopped action runs under the admitted installation, before SCM start consumes it.
 /// Returns the started artifact identity for evidence and benchmark attribution.
 /// # Errors
-/// Returns stale source, changed package/signer/service/scope, prior start intent or SCM failures.
+/// Returns stale source, changed package/signer/service/scope, stopped-action or SCM failures.
 /// Failure after start intent requires cleanup; it never restores initial-start permission.
 pub(crate) fn start_session(
     root: &Path,
     id: &SessionId,
     scope: Option<&crate::storage::DisposablePartition>,
+    while_stopped: impl FnOnce() -> TaskResult<()>,
 ) -> TaskResult<String> {
     let mut session = recovered(root, id)?;
     let (package, raw) = prepared_identity(&session)?;
@@ -597,6 +599,7 @@ pub(crate) fn start_session(
         )
         .into());
     }
+    while_stopped()?;
     scm(&mut session, Operation::StartDriver, "start")?;
     wait_state(4, Duration::from_secs(15))?;
     let PackageState::Installed(package) = &session.state().package else {
@@ -986,7 +989,7 @@ pub(crate) fn verify_hosted_driver_load(root: &Path) -> TaskResult<()> {
         &root.join("target/live-driver-trace"),
     )?;
     let operation = install_session(root, &bundle, id.clone(), None)
-        .and_then(|()| start_session(root, &id, None).map(|_artifact| ()));
+        .and_then(|()| start_session(root, &id, None, || Ok(())).map(|_artifact| ()));
     let cleanup = if root
         .join("target/driver-load-sessions")
         .join(id.as_str())

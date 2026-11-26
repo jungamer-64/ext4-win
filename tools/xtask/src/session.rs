@@ -96,6 +96,8 @@ pub(crate) enum Operation {
     AttachWsl,
     /// ext4 oracle formatting and independent fixture construction.
     Format,
+    /// Linux integrity and content inspection of the disk written by Windows.
+    InspectFilesystem,
     /// WSL detachment.
     DetachWsl,
     /// WSL oracle shutdown.
@@ -108,7 +110,11 @@ pub(crate) enum Operation {
     IdentityMapping,
     /// Observable file-system workload.
     FilesystemIo,
-    /// Driver Verifier activation.
+    /// Selects the driver for automatic verification before it loads.
+    SelectStartupVerifier,
+    /// Releases the named startup selection after unload.
+    ReleaseStartupVerifier,
+    /// Activates the additional runtime rule classes.
     ActivateVerifier,
     /// Driver Verifier runtime observation.
     ObserveVerifier,

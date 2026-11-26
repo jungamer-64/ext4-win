@@ -284,15 +284,23 @@ start, so an interrupted start requires reconciliation rather than repeating act
 Artifact bytes, signer trust, service configuration, storage scope and source identity
 are revalidated before start. Cleanup remains possible after source changes.
 
-`verify-live-vhdx` additionally requires persisted Windows readback after flush,
-dismount, and VHDX reattachment with the same loaded driver, and runtime Driver
-Verifier evidence identifying active checks and the loaded driver before and after
-filesystem I/O. Unknown Verifier report formats fail validation. Live results apply to
-the generated volume and exercised scenarios, not arbitrary physical volumes or untested
-feature combinations. Disk offline/online cycles must preserve the volume GUID and drive
-letters. The driver must unload with the dismounted VHDX still attached and Driver
-Verifier active. The [live-session owner](tools/xtask/src/live/owner.rs) defines
-scenario execution and evidence collection.
+`verify-live-vhdx` requires persisted Windows readback after flush, dismount, and
+reattachment. After the session driver unloads, WSL exposes the same GPT partition
+for read-only `e2fsck` and `debugfs` inspection. The image must have clean ext4
+metadata with no pending journal recovery. The Windows-created probe must match
+its expected inode metadata and bytes before the session can pass.
+
+The dedicated host must leave `ext4win.sys` unselected before the test acquires
+its volatile Driver Verifier selection. The selection covers automatic checks
+from initial load. Each load has a separate Verifier report before the added
+runtime rule classes, with further reports before and after filesystem I/O and
+before the attached-storage unload. Runtime rules are applied afresh to each
+image load. Cleanup releases the session's named selection after the image
+departs. Unknown report formats fail validation. Disk offline/online cycles
+must preserve the volume GUID and drive letters. Live results apply to the
+generated volume and exercised scenarios. The
+[live-session owner](tools/xtask/src/live/owner.rs) defines execution and evidence
+collection.
 
 Live evaluation creates its own VHDX below `target/live-vhdx-sessions/<session-id>/` and
 accepts no disk path or disk number. WSL access is confined to that VHDX and WSL is shut
@@ -319,7 +327,20 @@ Operational ETW carries no file names, offsets, lengths, pointers, or file data;
 Delivery is buffered, so missing final events do not establish that an operation never
 started.
 
-Live validation requires filesystem validation, driver unload, and service, package, and
-VHDX cleanup. Available evidence is retained after failure and recovery is attempted;
-cleanup cannot turn failed I/O into a passing result. A VM crash or job timeout can
-prevent cleanup and evidence upload, and that run is not acceptance evidence.
+Live validation requires filesystem validation, driver unload, and service,
+package, and VHDX cleanup. Cleanup preserves a failed I/O outcome. The hosted
+workflow uploads preparation evidence before activation and guest reports when
+the runner survives. A run without a completed live result supplies no
+acceptance evidence.
+
+For kernel failure capture, prepare the test in a dedicated Hyper-V guest with
+[serial kernel debugging on COM1](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/attaching-to-a-virtual-machine--kernel-mode-)
+mapped to a local host pipe. On the Hyper-V host, run
+[capture-live-kernel.ps1](tools/xtask/capture-live-kernel.ps1) with the VM's ID,
+the prepared session ID and an evidence directory on the host. In KD, confirm
+the guest connection and continue execution with `g` before activating the
+prepared session inside the guest. Keep KD attached until the live run finishes.
+On a bugcheck or guest hang, collect debugger output and, while the debugger
+can read guest memory, a [small kernel dump](https://learn.microsoft.com/en-us/windows-hardware/drivers/debuggercmds/-dump--create-dump-file-)
+with `.dump /m` into the session's host directory. These files remain on the
+host even if the guest runner stops communicating.
