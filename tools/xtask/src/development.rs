@@ -97,6 +97,7 @@ pub(crate) fn verify_windows_host(root: &Path) -> TaskResult<()> {
             "elevated Windows test suite",
         )?;
         io::stdout().write_all(&output.stdout)?;
+        io::stderr().write_all(&output.stderr)?;
         require_elevated_test_completion(&String::from_utf8(output.stdout)?)?;
         println!("native Windows host contracts: PASS");
         Ok(())

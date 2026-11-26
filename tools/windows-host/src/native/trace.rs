@@ -7,7 +7,8 @@ use alloc::{
 use core::ptr;
 use std::{
     ffi::OsStr,
-    fs, io,
+    fs,
+    io::{self, Write as _},
     path::Path,
     sync::Mutex,
     thread::{self, JoinHandle},
@@ -325,7 +326,7 @@ impl TraceSession {
                 status
             },
         )?);
-        println!("operational ETW capture: {}", filename.display());
+        eprintln!("operational ETW capture: {}", filename.display());
         Ok(owner)
     }
 
@@ -454,11 +455,11 @@ unsafe extern "system" fn event(record: *mut EVENT_RECORD) {
         decode_record(event, bytes, &context.outcomes)
     })();
     if let Ok(mut records) = context.records.lock() {
+        // The native worker bypasses harness output capture. Keep diagnostics off protocol stdout.
         match result {
             Ok(TraceRecord::Operation(event)) => {
-                use std::io::Write as _;
                 if let Err(error) = writeln!(
-                    io::stdout().lock(),
+                    io::stderr().lock(),
                     "kernel {}: {} NTSTATUS=0x{:08X}",
                     event.event,
                     event.outcome,
@@ -472,9 +473,8 @@ unsafe extern "system" fn event(record: *mut EVENT_RECORD) {
                 records.recent.push_back(event);
             }
             Ok(TraceRecord::VpbReferences(references)) => {
-                use std::io::Write as _;
                 if let Err(error) =
-                    writeln!(io::stdout().lock(), "kernel vpb_references: {references}")
+                    writeln!(io::stderr().lock(), "kernel vpb_references: {references}")
                 {
                     records.failure.get_or_insert_with(|| error.to_string());
                 }
