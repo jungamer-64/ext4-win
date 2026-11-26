@@ -176,12 +176,16 @@ impl CreateEa {
 
     /// Replaces the Windows EA set atomically with this create-time list.
     /// # Errors
-    /// Returns persisted EA decoding, xattr conversion, or mutation failures.
+    /// Returns EAs-not-supported when a nonempty list targets a reparse point, or persisted EA
+    /// decoding, xattr conversion, or mutation failures.
     pub(crate) fn replace_existing(
         &self,
         node: ext4_core::NodeId,
         mutation: &mut DriverMutationPass<'_, '_, '_>,
     ) -> DriverResult<()> {
+        if !self.entries.is_empty() {
+            reject_reparse_point(mutation, node)?;
+        }
         store_eas(mutation, node, self.entries.as_slice())
     }
 
@@ -498,8 +502,35 @@ fn set_ea(
     request: SetEaRequest,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
 ) -> DriverResult<IrpCompletion> {
+    reject_reparse_point(mutation, request.node)?;
     apply_set_ea_entries(mutation, request.node, request.entries.as_slice())?;
     Ok(IrpCompletion::EMPTY)
+}
+
+/// Returns whether `node` carries any Windows EA.
+///
+/// Windows EAs and reparse points are mutually exclusive because directory-enumeration records
+/// without a dedicated reparse-tag field report the tag in their EA-size field.
+/// # Errors
+/// Returns malformed persisted EA metadata or an xattr read failure.
+pub(crate) fn has_eas(
+    read: &mut impl CommittedReadPass,
+    node: ext4_core::NodeId,
+) -> DriverResult<bool> {
+    Ok(!stored_eas(&read.read_xattrs(node)?)?.is_empty())
+}
+
+/// Rejects an EA mutation on a reparse point; see [`has_eas`] for the exclusion.
+/// # Errors
+/// Returns EAs-not-supported for a reparse point, or the reparse metadata read failure.
+fn reject_reparse_point(
+    read: &mut impl CommittedReadPass,
+    node: ext4_core::NodeId,
+) -> DriverResult<()> {
+    if crate::request::reparse::NodeSymlinkReparsePoint::load(read, node)?.is_some() {
+        return Err(DriverError::EasNotSupported);
+    }
+    Ok(())
 }
 
 /// Collects Windows EA entries selected by a query request.

@@ -137,6 +137,12 @@ pub(crate) enum DriverError {
     InvalidReparseData,
     /// Reparse tag belongs to another handler.
     ReparseTagNotHandled,
+    /// Requested reparse tag differs from the tag stored on the opened node.
+    ReparseTagMismatch,
+    /// Requested reparse tag is reserved and can never be stored.
+    ReparseTagInvalid,
+    /// Windows EAs and a reparse point cannot coexist on one node.
+    EasNotSupported,
     /// EA name is not representable by the Windows EA boundary.
     InvalidEaName,
     /// EA list structure is internally inconsistent.
@@ -246,6 +252,9 @@ impl DriverError {
             Self::NotAReparsePoint => ntstatus(0xC000_0275),
             Self::InvalidReparseData => ntstatus(0xC000_0278),
             Self::ReparseTagNotHandled => ntstatus(0xC000_0279),
+            Self::ReparseTagMismatch => ntstatus(0xC000_0277),
+            Self::ReparseTagInvalid => ntstatus(0xC000_0276),
+            Self::EasNotSupported => ntstatus(0xC000_004F),
             Self::InvalidEaName => STATUS_INVALID_EA_NAME,
             Self::EaListInconsistent | Self::InvalidEaBuffer { .. } => STATUS_EA_LIST_INCONSISTENT,
             Self::ReparseValidationFailed(status) => status,

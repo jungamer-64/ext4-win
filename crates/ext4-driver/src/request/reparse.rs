@@ -14,6 +14,11 @@ use super::DriverMutationPass;
 
 /// Reparse buffer header before the tag-specific payload.
 const REPARSE_DATA_BUFFER_HEADER_SIZE: usize = 8;
+/// GUID-bearing reparse buffer header before the tag-specific payload.
+const REPARSE_GUID_DATA_BUFFER_HEADER_SIZE: usize =
+    core::mem::offset_of!(wdk_sys::REPARSE_GUID_DATA_BUFFER, GenericReparseBuffer);
+/// Tag bit reserved for Microsoft-owned reparse tags.
+const MICROSOFT_REPARSE_TAG_BIT: u32 = 0x8000_0000;
 /// SymbolicLinkReparseBuffer header before `PathBuffer`.
 const SYMLINK_REPARSE_BUFFER_HEADER_SIZE: usize = 12;
 /// Offset of `PathBuffer` inside `REPARSE_DATA_BUFFER`.
@@ -24,6 +29,12 @@ const MAXIMUM_REPARSE_DATA_BUFFER_SIZE: usize = 16 * 1024;
 /// Maximum target length when substitute and print names share one UTF-16 path region.
 const MAXIMUM_SYMLINK_PATH_CODE_UNITS: usize =
     (MAXIMUM_REPARSE_DATA_BUFFER_SIZE - SYMLINK_PATH_BUFFER_OFFSET) / core::mem::size_of::<u16>();
+/// Smallest `FSCTL_GET_REPARSE_POINT` output that receives any Microsoft-tag reparse data.
+///
+/// Shorter buffers fail without data; larger ones that cannot hold the complete buffer receive a
+/// prefix whose header still reports the complete `ReparseDataLength`.
+const MINIMUM_REPARSE_QUERY_OUTPUT_SIZE: usize =
+    core::mem::size_of::<wdk_sys::REPARSE_DATA_BUFFER>();
 
 /// Reparse metadata attached to one ext4 node without forcing its target into Windows wire form.
 #[derive(Debug, Eq, PartialEq)]
@@ -111,6 +122,20 @@ impl UnparsedPathLength {
     }
 }
 
+/// `FSCTL_GET_REPARSE_POINT` result selected by the caller's output capacity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReparseQueryOutput {
+    /// The complete reparse buffer of this byte length was written.
+    Complete(usize),
+    /// Only this many leading bytes of the complete reparse buffer were written.
+    Truncated(usize),
+    /// The output cannot hold the fixed reparse structure; no data was written.
+    TooSmall {
+        /// Complete reparse buffer byte length.
+        required: usize,
+    },
+}
+
 /// Derived symbolic-link wire lengths used by all output modes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SymlinkReparseLayout {
@@ -155,11 +180,15 @@ pub(crate) fn get_reparse_point(
         })?
     };
     let data = load_node_reparse_data(read, node)?;
-    let written = request.with_active(|active| {
+    let output = request.with_active(|active| {
         let output = active.buffered_output(length)?;
         data.pack_fsctl(output)
     })?;
-    IrpCompletion::from_usize(written)
+    match output {
+        ReparseQueryOutput::Complete(written) => IrpCompletion::from_usize(written),
+        ReparseQueryOutput::Truncated(written) => IrpCompletion::buffer_overflow(written),
+        ReparseQueryOutput::TooSmall { required } => IrpCompletion::buffer_too_small(required),
+    }
 }
 
 /// Handles `FSCTL_SET_REPARSE_POINT` by storing Windows metadata on the opened node.
@@ -198,22 +227,31 @@ pub(crate) fn delete_reparse_point(
     mut request: PendingIrpLease<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
 ) -> DriverResult<IrpCompletion> {
-    let node = {
+    let (tag, node) = {
         request.with_active(|active| {
             let current = active.current_stack()?;
             let file_object = current.file_object()?;
             let stack = current.file_system_control()?;
             let input = active.buffered_input(stack.input_buffer_length())?;
-            parse_delete_reparse_buffer(input)?;
+            let tag = parse_delete_reparse_buffer(input)?;
             let opened = OpenedObject::decode(file_object)?;
             opened.require_reparse_write_access()?;
             let node = opened.node();
             validate_mutable_reparse_node(&opened.location(), node)?;
-            Ok::<_, DriverError>(node)
+            Ok::<_, DriverError>((tag, node))
         })?
     };
-    delete_node_reparse_point(mutation, node)?;
+    delete_node_reparse_point(mutation, node, tag)?;
     Ok(IrpCompletion::EMPTY)
+}
+
+/// Reparse tag named by an `FSCTL_DELETE_REPARSE_POINT` request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeletedReparseTag {
+    /// The only tag this driver stores.
+    Symlink,
+    /// A valid tag that no driver-owned reparse point can carry.
+    Foreign,
 }
 
 /// Packs the reparse point represented by one opened object.
@@ -248,7 +286,8 @@ fn validate_mutable_reparse_node(location: &OpenedLocation, node: NodeId) -> Dri
 /// # Errors
 ///
 /// Returns invalid-reparse-data for nonempty files, directory-not-empty for directories with
-/// children, or the metadata-read/xattr commit failure. Validation uses the mutation epoch.
+/// children, EAs-not-supported when a node without a reparse point carries Windows EAs, or the
+/// metadata-read/xattr commit failure. Validation uses the mutation epoch.
 fn set_node_reparse_point(
     transaction: &mut DriverMutationPass<'_, '_, '_>,
     node: NodeId,
@@ -275,6 +314,11 @@ fn set_node_reparse_point(
         }
         NodeId::Symlink(_) => return Err(DriverError::NotSupported),
     }
+    if crate::metadata::read_symlink(transaction, node)?.is_none()
+        && crate::request::ea::has_eas(transaction, node)?
+    {
+        return Err(DriverError::EasNotSupported);
+    }
     let node = transaction.node(node)?;
     reparse_point.store(transaction, node)?;
     Ok(())
@@ -283,12 +327,22 @@ fn set_node_reparse_point(
 /// Removes Windows reparse metadata from a validated regular file or directory.
 /// # Errors
 ///
-/// Returns an error when the node has no driver-owned reparse metadata or the xattr mutation
-/// cannot be committed.
+/// Returns not-a-reparse-point when the node has no driver-owned reparse metadata, tag mismatch
+/// when `tag` differs from the stored symbolic-link tag, or the xattr mutation failure.
 fn delete_node_reparse_point(
     transaction: &mut DriverMutationPass<'_, '_, '_>,
     node: NodeId,
+    tag: DeletedReparseTag,
 ) -> DriverResult<()> {
+    if tag == DeletedReparseTag::Foreign {
+        return Err(
+            if crate::metadata::read_symlink(transaction, node)?.is_some() {
+                DriverError::ReparseTagMismatch
+            } else {
+                DriverError::NotAReparsePoint
+            },
+        );
+    }
     let node = transaction.node(node)?;
     if WindowsSymlinkReparsePoint::remove(transaction, node)?.is_none() {
         return Err(DriverError::NotAReparsePoint);
@@ -396,11 +450,30 @@ impl SymlinkReparseData {
     }
 
     /// Packs an `FSCTL_GET_REPARSE_POINT` response with the reserved header field cleared.
+    ///
+    /// An output that holds the fixed structure but not the complete buffer receives the leading
+    /// bytes of the complete response; an output shorter than the fixed structure is unchanged.
     /// # Errors
     ///
-    /// Returns an error when a derived length is not representable or `output` is too small.
-    pub(crate) fn pack_fsctl(&self, output: &mut [u8]) -> DriverResult<usize> {
-        self.pack(UnparsedPathLength::ZERO, output)
+    /// Returns an error when a derived length is not representable or allocation fails.
+    pub(crate) fn pack_fsctl(&self, output: &mut [u8]) -> DriverResult<ReparseQueryOutput> {
+        let required = self.required_length()?;
+        if output.len() >= required {
+            return self
+                .pack(UnparsedPathLength::ZERO, output)
+                .map(ReparseQueryOutput::Complete);
+        }
+        if output.len() < MINIMUM_REPARSE_QUERY_OUTPUT_SIZE {
+            return Ok(ReparseQueryOutput::TooSmall { required });
+        }
+        let mut complete = DriverVec::try_repeated_copy(0_u8, required)?;
+        self.pack(UnparsedPathLength::ZERO, complete.as_mut_slice())?;
+        let prefix = complete
+            .as_slice()
+            .get(..output.len())
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        crate::memory::copy_exact(output, prefix)?;
+        Ok(ReparseQueryOutput::Truncated(output.len()))
     }
 
     /// Packs a create redirect carrying the checked byte length of the unparsed UTF-16 suffix.
@@ -513,26 +586,39 @@ impl<'a> ReparseInput<'a> {
     }
 }
 
-/// Parses the exact header accepted by `FSCTL_DELETE_REPARSE_POINT` for symbolic links.
+/// Parses the exact header accepted by `FSCTL_DELETE_REPARSE_POINT`.
+///
+/// The input is either a `REPARSE_DATA_BUFFER` or a `REPARSE_GUID_DATA_BUFFER` header with an
+/// empty payload; a non-Microsoft tag requires the GUID-bearing form.
 /// # Errors
 ///
-/// Returns an error when the input is not exactly a header for a symbolic-link reparse point with
-/// an empty tag-specific payload.
-fn parse_delete_reparse_buffer(input: &[u8]) -> DriverResult<()> {
-    if input.len() < REPARSE_DATA_BUFFER_HEADER_SIZE {
-        return Err(DriverError::BufferTooSmall);
-    }
-    if input.len() != REPARSE_DATA_BUFFER_HEADER_SIZE {
-        return Err(DriverError::InvalidParameter);
-    }
+/// Returns invalid reparse data for any other length or a nonempty payload, or an invalid tag for
+/// the two reserved tag values.
+fn parse_delete_reparse_buffer(input: &[u8]) -> DriverResult<DeletedReparseTag> {
+    let guid_header = match input.len() {
+        REPARSE_DATA_BUFFER_HEADER_SIZE => false,
+        REPARSE_GUID_DATA_BUFFER_HEADER_SIZE => true,
+        _ => return Err(DriverError::InvalidReparseData),
+    };
     let input = LittleEndianInput::new(input);
-    if input.read_u32(wire_offset(0))? != wdk_sys::IO_REPARSE_TAG_SYMLINK {
-        return Err(DriverError::ReparseTagNotHandled);
-    }
     if input.read_u16(wire_offset(4))? != 0 {
-        return Err(DriverError::InvalidParameter);
+        return Err(DriverError::InvalidReparseData);
     }
-    Ok(())
+    let tag = input.read_u32(wire_offset(0))?;
+    if matches!(
+        tag,
+        wdk_sys::IO_REPARSE_TAG_RESERVED_ZERO | wdk_sys::IO_REPARSE_TAG_RESERVED_ONE
+    ) {
+        return Err(DriverError::ReparseTagInvalid);
+    }
+    if tag & MICROSOFT_REPARSE_TAG_BIT == 0 && !guid_header {
+        return Err(DriverError::InvalidReparseData);
+    }
+    Ok(if tag == wdk_sys::IO_REPARSE_TAG_SYMLINK {
+        DeletedReparseTag::Symlink
+    } else {
+        DeletedReparseTag::Foreign
+    })
 }
 
 /// Reads UTF-16 units from a validated symbolic-link path range.
@@ -623,8 +709,9 @@ mod tests {
     use ext4_core::SymlinkTarget;
 
     use super::{
-        MAXIMUM_REPARSE_DATA_BUFFER_SIZE, MAXIMUM_SYMLINK_PATH_CODE_UNITS, ReparseInput,
-        SYMLINK_PATH_BUFFER_OFFSET, SymlinkReparseData, UnparsedPathLength,
+        DeletedReparseTag, MAXIMUM_REPARSE_DATA_BUFFER_SIZE, MAXIMUM_SYMLINK_PATH_CODE_UNITS,
+        MINIMUM_REPARSE_QUERY_OUTPUT_SIZE, REPARSE_GUID_DATA_BUFFER_HEADER_SIZE, ReparseInput,
+        ReparseQueryOutput, SYMLINK_PATH_BUFFER_OFFSET, SymlinkReparseData, UnparsedPathLength,
         parse_delete_reparse_buffer, wire_offset,
     };
 
@@ -655,7 +742,7 @@ mod tests {
         target: &[u8],
         relative: bool,
         output: &mut [u8],
-    ) -> Result<usize, DriverError> {
+    ) -> Result<ReparseQueryOutput, DriverError> {
         windows_symlink_data(target, relative)?.pack_fsctl(output)
     }
 
@@ -670,7 +757,7 @@ mod tests {
 
         assert_eq!(
             pack_fsctl_target(br"dir\file", true, output.as_mut_slice()),
-            Ok(WRITTEN_LENGTH)
+            Ok(ReparseQueryOutput::Complete(WRITTEN_LENGTH))
         );
         assert_eq!(
             LittleEndianInput::new(output.as_slice()).read_u32(wire_offset(0)),
@@ -703,7 +790,7 @@ mod tests {
 
         assert_eq!(
             pack_fsctl_target(br"\??\C:\target", false, output.as_mut_slice()),
-            Ok(WRITTEN_LENGTH)
+            Ok(ReparseQueryOutput::Complete(WRITTEN_LENGTH))
         );
         assert_eq!(
             LittleEndianInput::new(output.as_slice()).read_u32(wire_offset(16)),
@@ -722,7 +809,10 @@ mod tests {
             return;
         };
         let mut output = vec![0; 128];
-        assert_eq!(data.pack_fsctl(output.as_mut_slice()), Ok(36));
+        assert_eq!(
+            data.pack_fsctl(output.as_mut_slice()),
+            Ok(ReparseQueryOutput::Complete(36))
+        );
         assert_eq!(
             LittleEndianInput::new(output.as_slice()).read_u32(wire_offset(16)),
             Ok(wdk_sys::SYMLINK_FLAG_RELATIVE)
@@ -748,7 +838,10 @@ mod tests {
             return;
         };
         let mut output = vec![0; 128];
-        assert_eq!(data.pack_fsctl(output.as_mut_slice()), Ok(38));
+        assert_eq!(
+            data.pack_fsctl(output.as_mut_slice()),
+            Ok(ReparseQueryOutput::Complete(38))
+        );
         assert_eq!(
             LittleEndianInput::new(output.as_slice()).read_u32(wire_offset(16)),
             Ok(wdk_sys::SYMLINK_FLAG_RELATIVE)
@@ -775,7 +868,10 @@ mod tests {
             return;
         };
         let mut output = vec![0; 128];
-        assert_eq!(data.pack_fsctl(output.as_mut_slice()), Ok(42));
+        assert_eq!(
+            data.pack_fsctl(output.as_mut_slice()),
+            Ok(ReparseQueryOutput::Complete(42))
+        );
         let parsed = decode_symlink_fixture(output.as_slice());
         assert!(parsed.is_ok());
         if let Ok(parsed) = parsed {
@@ -800,14 +896,42 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn rejects_too_small_reparse_buffer() {
-        const TOO_SMALL_BUFFER_LENGTH: usize = 19;
-        let mut output = vec![0; TOO_SMALL_BUFFER_LENGTH];
+    fn output_shorter_than_fixed_structure_reports_required_length_without_data() {
+        let mut output = vec![0xA5; MINIMUM_REPARSE_QUERY_OUTPUT_SIZE - 1];
 
         assert_eq!(
             pack_fsctl_target(b"target", true, output.as_mut_slice()),
-            Err(DriverError::BufferTooSmall)
+            Ok(ReparseQueryOutput::TooSmall { required: 32 })
         );
+        assert!(output.iter().all(|byte| *byte == 0xA5));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when a fixed-structure output does not receive the leading bytes of the complete
+    /// response with the complete reparse data length.
+    #[test]
+    fn output_holding_fixed_structure_receives_complete_response_prefix() {
+        let mut complete = vec![0; 32];
+        assert_eq!(
+            pack_fsctl_target(b"target", true, complete.as_mut_slice()),
+            Ok(ReparseQueryOutput::Complete(32))
+        );
+        for length in [MINIMUM_REPARSE_QUERY_OUTPUT_SIZE, 31] {
+            let mut output = vec![0; length];
+            assert_eq!(
+                pack_fsctl_target(b"target", true, output.as_mut_slice()),
+                Ok(ReparseQueryOutput::Truncated(length))
+            );
+            assert_eq!(
+                output.as_slice(),
+                complete.get(..length).unwrap_or_default()
+            );
+            assert_eq!(
+                LittleEndianInput::new(output.as_slice()).read_u16(wire_offset(4)),
+                Ok(24)
+            );
+        }
     }
 
     /// # Panics
@@ -874,7 +998,9 @@ mod tests {
         let mut output = vec![0; MAXIMUM_REPARSE_DATA_BUFFER_SIZE];
         assert_eq!(
             largest.pack_fsctl(output.as_mut_slice()),
-            Ok(MAXIMUM_REPARSE_DATA_BUFFER_SIZE)
+            Ok(ReparseQueryOutput::Complete(
+                MAXIMUM_REPARSE_DATA_BUFFER_SIZE
+            ))
         );
 
         let oversized_target = vec![b'a'; MAXIMUM_SYMLINK_PATH_CODE_UNITS + 1];
@@ -893,7 +1019,7 @@ mod tests {
         let expected = Vec::from(&br"dir\file"[..]);
         assert_eq!(
             pack_fsctl_target(expected.as_slice(), true, input.as_mut_slice()),
-            Ok(36)
+            Ok(ReparseQueryOutput::Complete(36))
         );
 
         let parsed = decode_symlink_fixture(input.as_slice());
@@ -913,7 +1039,7 @@ mod tests {
         let mut input = vec![0; 128];
         assert_eq!(
             pack_fsctl_target(b"target", true, input.as_mut_slice()),
-            Ok(32)
+            Ok(ReparseQueryOutput::Complete(32))
         );
         assert_eq!(
             LittleEndianOutput::new(input.as_mut_slice()).write_u32(wire_offset(0), 0),
@@ -934,7 +1060,7 @@ mod tests {
         let mut input = vec![0; 128];
         assert_eq!(
             pack_fsctl_target(b"target", true, input.as_mut_slice()),
-            Ok(32)
+            Ok(ReparseQueryOutput::Complete(32))
         );
         assert_eq!(
             LittleEndianOutput::new(input.as_mut_slice()).write_u32(wire_offset(16), 2),
@@ -951,42 +1077,68 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn delete_reparse_requires_exact_empty_symlink_header() {
-        let mut input = [0_u8; 8];
-        assert_eq!(
-            LittleEndianOutput::new(&mut input)
-                .write_u32(wire_offset(0), wdk_sys::IO_REPARSE_TAG_SYMLINK),
-            Ok(())
-        );
-        assert_eq!(parse_delete_reparse_buffer(&input), Ok(()));
+    fn delete_reparse_requires_exact_empty_header() {
+        /// Builds an empty-payload delete header of `length` bytes naming `tag`.
+        ///
+        /// # Panics
+        ///
+        /// Panics when the fixed tag field cannot be written.
+        fn header(length: usize, tag: u32) -> Vec<u8> {
+            let mut input = vec![0_u8; length];
+            assert_eq!(
+                LittleEndianOutput::new(input.as_mut_slice()).write_u32(wire_offset(0), tag),
+                Ok(())
+            );
+            input
+        }
+        const THIRD_PARTY_TAG: u32 = 0x0000_1234;
 
+        let symlink = header(8, wdk_sys::IO_REPARSE_TAG_SYMLINK);
         assert_eq!(
-            parse_delete_reparse_buffer(&[0_u8; 7]),
-            Err(DriverError::BufferTooSmall)
+            parse_delete_reparse_buffer(&symlink),
+            Ok(DeletedReparseTag::Symlink)
         );
         assert_eq!(
-            parse_delete_reparse_buffer(&[0_u8; 9]),
-            Err(DriverError::InvalidParameter)
+            parse_delete_reparse_buffer(&header(
+                REPARSE_GUID_DATA_BUFFER_HEADER_SIZE,
+                THIRD_PARTY_TAG
+            )),
+            Ok(DeletedReparseTag::Foreign)
+        );
+        assert_eq!(
+            parse_delete_reparse_buffer(&header(8, wdk_sys::IO_REPARSE_TAG_MOUNT_POINT)),
+            Ok(DeletedReparseTag::Foreign)
         );
 
-        let mut nonempty_payload = input;
+        for length in [7, 9, REPARSE_GUID_DATA_BUFFER_HEADER_SIZE + 1] {
+            assert_eq!(
+                parse_delete_reparse_buffer(&header(length, wdk_sys::IO_REPARSE_TAG_SYMLINK)),
+                Err(DriverError::InvalidReparseData)
+            );
+        }
         assert_eq!(
-            LittleEndianOutput::new(&mut nonempty_payload).write_u16(wire_offset(4), 2),
+            parse_delete_reparse_buffer(&header(8, THIRD_PARTY_TAG)),
+            Err(DriverError::InvalidReparseData)
+        );
+
+        let mut nonempty_payload = symlink;
+        assert_eq!(
+            LittleEndianOutput::new(nonempty_payload.as_mut_slice()).write_u16(wire_offset(4), 2),
             Ok(())
         );
         assert_eq!(
             parse_delete_reparse_buffer(&nonempty_payload),
-            Err(DriverError::InvalidParameter)
+            Err(DriverError::InvalidReparseData)
         );
 
-        let mut unhandled_tag = input;
-        assert_eq!(
-            LittleEndianOutput::new(&mut unhandled_tag).write_u32(wire_offset(0), 0),
-            Ok(())
-        );
-        assert_eq!(
-            parse_delete_reparse_buffer(&unhandled_tag),
-            Err(DriverError::ReparseTagNotHandled)
-        );
+        for reserved in [
+            wdk_sys::IO_REPARSE_TAG_RESERVED_ZERO,
+            wdk_sys::IO_REPARSE_TAG_RESERVED_ONE,
+        ] {
+            assert_eq!(
+                parse_delete_reparse_buffer(&header(8, reserved)),
+                Err(DriverError::ReparseTagInvalid)
+            );
+        }
     }
 }
