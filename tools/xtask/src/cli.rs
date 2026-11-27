@@ -12,8 +12,8 @@ use crate::{
         verify_ro_interop,
     },
     live::{
-        benchmark_multi_file, check_live_driver_host, cleanup_live_vhdx_session, prepare_live_vhdx,
-        verify_live_vhdx,
+        VerifierPlan, benchmark_multi_file, check_live_driver_host, cleanup_live_vhdx_session,
+        prepare_live_vhdx, verify_live_vhdx,
     },
     process::repository_root,
     production::verify_production_driver,
@@ -60,7 +60,7 @@ enum Task {
     /// Builds and installs a verified stopped driver with new disposable storage.
     PrepareLiveVhdx,
     /// Activates a prepared disposable session and requires workload and cleanup completion.
-    VerifyLiveVhdx,
+    VerifyLiveVhdx(VerifierPlan),
     /// Performs one fresh open in an isolated live-remount requester.
     #[cfg(windows)]
     ReadRemountPayload,
@@ -112,7 +112,9 @@ impl Task {
         } else if argument == "check-live-driver-host" {
             Some(Self::CheckLiveDriverHost)
         } else if argument == "verify-live-vhdx" {
-            Some(Self::VerifyLiveVhdx)
+            Some(Self::VerifyLiveVhdx(VerifierPlan::Runtime))
+        } else if argument == "verify-live-vhdx-boot-verifier" {
+            Some(Self::VerifyLiveVhdx(VerifierPlan::ConfiguredAtBoot))
         } else if argument == "prepare-live-vhdx" {
             Some(Self::PrepareLiveVhdx)
         } else if argument == "cleanup-live-vhdx-session" {
@@ -174,9 +176,9 @@ fn execute() -> TaskResult<()> {
             let session_id = task_argument.as_deref().ok_or_else(usage_error)?;
             prepare_live_vhdx(&repository_root, session_id)
         }
-        Task::VerifyLiveVhdx => {
+        Task::VerifyLiveVhdx(verifier) => {
             let session_id = task_argument.as_deref().ok_or_else(usage_error)?;
-            verify_live_vhdx(&repository_root, session_id)
+            verify_live_vhdx(&repository_root, session_id, verifier)
         }
         #[cfg(windows)]
         Task::ReadRemountPayload => {
@@ -221,7 +223,7 @@ fn execute() -> TaskResult<()> {
                 Task::CleanupDriverLoadSession
                 | Task::CleanupLiveVhdxSession
                 | Task::PrepareLiveVhdx
-                | Task::VerifyLiveVhdx
+                | Task::VerifyLiveVhdx(_)
                 | Task::UnloadDriver(_) => {
                     Err(io::Error::other("cleanup task lost its required argument").into())
                 }
@@ -239,7 +241,7 @@ fn execute() -> TaskResult<()> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: cargo xtask <verify-portable|verify-windows-host|verify-driver|verify-fuzz-replay|fuzz|verify-journal-interop|verify-ro-interop|verify-htree-interop|verify-journal-fixture-provenance|verify-production-driver|check-hosted-driver-host|verify-hosted-driver-load|cleanup-driver-load-session SESSION_ID|quiesce-driver-mounts SESSION_ID|prepare-driver-unload SESSION_ID|resolve-driver-store-image OEM_INF|check-live-driver-host|prepare-live-vhdx SESSION_ID|verify-live-vhdx SESSION_ID|benchmark-multi-file|cleanup-live-vhdx-session SESSION_ID>",
+        "usage: cargo xtask <verify-portable|verify-windows-host|verify-driver|verify-fuzz-replay|fuzz|verify-journal-interop|verify-ro-interop|verify-htree-interop|verify-journal-fixture-provenance|verify-production-driver|check-hosted-driver-host|verify-hosted-driver-load|cleanup-driver-load-session SESSION_ID|quiesce-driver-mounts SESSION_ID|prepare-driver-unload SESSION_ID|resolve-driver-store-image OEM_INF|check-live-driver-host|prepare-live-vhdx SESSION_ID|verify-live-vhdx SESSION_ID|verify-live-vhdx-boot-verifier SESSION_ID|benchmark-multi-file|cleanup-live-vhdx-session SESSION_ID>",
     )
 }
 
@@ -318,7 +320,11 @@ mod tests {
         );
         assert_eq!(
             Task::parse(OsStr::new("verify-live-vhdx")),
-            Some(Task::VerifyLiveVhdx)
+            Some(Task::VerifyLiveVhdx(VerifierPlan::Runtime))
+        );
+        assert_eq!(
+            Task::parse(OsStr::new("verify-live-vhdx-boot-verifier")),
+            Some(Task::VerifyLiveVhdx(VerifierPlan::ConfiguredAtBoot))
         );
         assert_eq!(
             Task::parse(OsStr::new("prepare-live-vhdx")),

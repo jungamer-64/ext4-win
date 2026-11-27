@@ -12,6 +12,15 @@ pub(crate) use owner::{
 };
 #[cfg(not(windows))]
 use std::{ffi::OsStr, io, path::Path};
+/// Who establishes Driver Verifier coverage for each image load.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum VerifierPlan {
+    /// The session enables the runtime rule classes on each loaded image.
+    Runtime,
+    /// The dedicated guest boots with the rule classes enabled.
+    ConfiguredAtBoot,
+}
+
 /// Rejects Windows live validation on portable hosts.
 /// # Errors
 /// Always returns Unsupported outside Windows.
@@ -27,7 +36,11 @@ pub(crate) fn check_live_driver_host(_root: &Path) -> TaskResult<()> {
 /// # Errors
 /// Always returns Unsupported outside Windows.
 #[cfg(not(windows))]
-pub(crate) fn verify_live_vhdx(root: &Path, _id: &OsStr) -> TaskResult<()> {
+pub(crate) fn verify_live_vhdx(
+    root: &Path,
+    _id: &OsStr,
+    _verifier: VerifierPlan,
+) -> TaskResult<()> {
     check_live_driver_host(root)
 }
 /// Rejects preparation of disposable Windows storage on portable hosts.

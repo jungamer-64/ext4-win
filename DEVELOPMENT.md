@@ -24,7 +24,8 @@ Cargo commands for a canonical gate.
 | `cargo xtask cleanup-driver-load-session <session-id>` | Elevated Windows host | Reconciles an interrupted service/package session only after its durable bundle, signer, and package identities match. |
 | `cargo xtask check-live-driver-host` | Dedicated host that passes the hosted preflight and also provides Hyper-V PowerShell, WSL/e2fsprogs, and Driver Verifier | Performs the read-only preflight for disposable live VHDX validation. |
 | `cargo xtask prepare-live-vhdx <session-id>` | A host that passes the live preflight; a fresh 32-digit lowercase hexadecimal session ID | Builds one verified bundle, creates disposable ext4 storage and binds its installed service in the stopped state. |
-| `cargo xtask verify-live-vhdx <session-id>` | The same host with a successfully prepared session, unchanged source inputs, and English Windows runtime output | Revalidates the exact prepared installation, activates it and exercises startup discovery, native I/O and remount before required cleanup. |
+| `cargo xtask verify-live-vhdx <session-id>` | The same host with a prepared session, unchanged source inputs, an idle Driver Verifier, and English Windows runtime output | Exercises live I/O and remount with session-owned runtime verification. |
+| `cargo xtask verify-live-vhdx-boot-verifier <session-id>` | A dedicated guest booted with the required Verifier classes for the test driver, with the same preparation and evidence requirements | Exercises the same workload with Driver Verifier enabled from driver initialization. |
 | `cargo xtask benchmark-multi-file` | A host that passes the live preflight | Measures native random reads and writes on independently populated disposable storage, retaining artifact-bound latency and flush evidence. |
 | `cargo xtask cleanup-live-vhdx-session <session-id>` | Dedicated elevated Windows host | Reconciles an interrupted session and removes only resources whose recorded identities still match. |
 
@@ -290,15 +291,28 @@ for read-only `e2fsck` and `debugfs` inspection. The image must have clean ext4
 metadata with no pending journal recovery. The Windows-created probe must match
 its expected inode metadata and bytes before the session can pass.
 
-The dedicated host must leave `ext4win.sys` unselected before the test acquires
-its volatile Driver Verifier selection. The selection covers automatic checks
-from initial load. Each load has a separate Verifier report before the added
-runtime rule classes, with further reports before and after filesystem I/O and
-before the attached-storage unload. Runtime rules are applied afresh to each
-image load. Cleanup releases the session's named selection after the image
-departs. Unknown report formats fail validation. Disk offline/online cycles
-must preserve the volume GUID and drive letters. Live results apply to the
-generated volume and exercised scenarios. The
+The runtime workflow enables DIF rule classes on each loaded image. It requires
+a successful native command status and independently observes the active classes
+before filesystem I/O, before the attached-storage unload, and around hot
+attachment. Cleanup stops the session's runtime rules after confirmed image
+departure and checks that the Verifier is idle. A boot-scoped selection that
+requires a reboot can be reconciled by running the session cleanup command after
+a new boot. Unknown report formats fail validation.
+
+To cover driver startup, configure the dedicated guest before reboot:
+
+```powershell
+verifier.exe /dif 1 2 4 5 9 12 18 /driver ext4win.sys
+verifier.exe /bootmode oneboot
+```
+
+After reboot, prepare the VHDX and run `verify-live-vhdx-boot-verifier` in that
+boot. The boot configuration belongs to the guest operator. The workload
+requires the same rule classes on each load and reads their runtime status
+without reconfiguring them. See the [Driver Verifier command syntax](https://learn.microsoft.com/en-us/windows-hardware/drivers/devtest/verifier-command-line).
+
+Disk offline/online cycles must preserve the volume GUID and drive letters.
+Live results apply to the generated volume and exercised scenarios. The
 [live-session owner](tools/xtask/src/live/owner.rs) defines execution and evidence
 collection.
 

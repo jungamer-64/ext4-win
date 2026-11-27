@@ -110,12 +110,16 @@ pub(crate) enum Operation {
     IdentityMapping,
     /// Observable file-system workload.
     FilesystemIo,
-    /// Selects the driver for automatic verification before it loads.
+    /// Records a boot-scoped startup selection requiring reconciliation.
+    #[serde(skip_serializing)]
     SelectStartupVerifier,
-    /// Releases the named startup selection after unload.
+    /// Records a release request for a boot-scoped startup selection.
+    #[serde(skip_serializing)]
     ReleaseStartupVerifier,
     /// Activates the additional runtime rule classes.
     ActivateVerifier,
+    /// Releases this session's runtime rule classes after unload.
+    DeactivateVerifier,
     /// Driver Verifier runtime observation.
     ObserveVerifier,
     /// Clean filesystem dismount.
