@@ -481,9 +481,12 @@ fn unreliable_writeback_terminates_close_preparation() -> crate::kernel::status:
         access.abandon_session();
         assert!(access.session_work_drained());
         drop(access.finish_abandoned_session());
-        access.fail_volume_state_transition(
-            transition,
-            DriverError::CacheManagerFailure(wdk_sys::STATUS_IO_DEVICE_ERROR),
+        let error = DriverError::CacheManagerFailure(wdk_sys::STATUS_IO_DEVICE_ERROR);
+        let ended = access.finish_volume_close(transition, Err(error));
+        assert_eq!(ended.result, Err(error));
+        assert_eq!(
+            ended.routing,
+            Some(crate::state::SessionEndRouting::Remount)
         );
         assert_eq!(access.ensure_mounted(), Err(DriverError::VolumeDismounted));
         assert_eq!(
@@ -599,7 +602,12 @@ fn dismount_retains_raw_submissions_without_restoring_filesystem_ownership()
         binding.with_access(|access| access.request_mmp_close(durability))?;
         binding.with_access(|access| {
             let _durability = access.finish_mmp_close()?;
-            access.publish_volume_state_transition(transition)?;
+            let ended = access.finish_volume_close(transition, Ok(()));
+            ended.result?;
+            assert_eq!(
+                ended.routing,
+                Some(crate::state::SessionEndRouting::DirectAccess)
+            );
             assert!(matches!(
                 access.authorize_storage_submission(StorageSubmissionSource::Filesystem),
                 Err(DriverError::FileClosed)
@@ -678,7 +686,8 @@ fn unhealthy_sessions_drain_and_retire_without_clean_publication()
             drop(activity);
             assert!(access.session_work_drained());
             assert!(access.finish_abandoned_session().is_none());
-            access.fail_volume_state_transition(transition, DriverError::VolumeDismounted);
+            let ended = access.finish_volume_close(transition, Err(DriverError::VolumeDismounted));
+            assert_eq!(ended.result, Err(DriverError::VolumeDismounted));
             assert_eq!(access.ensure_mounted(), Err(DriverError::VolumeDismounted));
             assert!(
                 access

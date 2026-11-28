@@ -30,7 +30,7 @@ impl VolumeSerialNumber {
 
 /// Device extension stored in mounted volume device objects.
 #[repr(C)]
-pub(crate) struct MountedVolumeDeviceExtension {
+struct MountedVolumeDeviceExtension {
     /// Common driver-owned device extension header.
     header: DeviceExtensionHeader,
     /// Mount-preallocated work item that performs actor-safe physical retirement.
@@ -59,6 +59,127 @@ pub(crate) struct MountedVolumeDeviceExtension {
 /// Mounted volume device object produced by a successful mount FSCTL.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MountedVolumeDevice;
+
+/// Owns an IoCreateDevice allocation until the mount publishes its VPB and dispatch.
+struct UnpublishedMountedDevice {
+    /// Stable device address supplied by the I/O Manager.
+    device: KernelDevice,
+    /// Initialized only after the actor has started at its final address.
+    reactor: Option<NonNull<DeviceExtensionHeader>>,
+    /// The live registration flag, initialized before shutdown IRPs can arrive.
+    shutdown: Option<NonNull<AtomicU8>>,
+    /// Unqueued work item, released here until retirement owns it.
+    #[cfg(not(test))]
+    work_item: Option<NonNull<wdk_sys::_IO_WORKITEM>>,
+}
+
+impl UnpublishedMountedDevice {
+    /// # Errors
+    /// Returns native device allocation or extension-size failure.
+    #[expect(
+        unsafe_code,
+        reason = "mount exclusively owns the new device allocation"
+    )]
+    fn create(driver: PDRIVER_OBJECT) -> DriverResult<Self> {
+        let extension_size =
+            wdk_sys::ULONG::try_from(core::mem::size_of::<MountedVolumeDeviceExtension>())
+                .map_err(|_| DriverError::InvalidParameter)?;
+        let mut device = core::ptr::null_mut();
+        let status = unsafe {
+            // SAFETY: DriverEntry and the mount IRP retain the driver; the output slot is writable.
+            ffi::IoCreateDevice(
+                driver,
+                extension_size,
+                core::ptr::null_mut(),
+                ffi::FILE_DEVICE_DISK_FILE_SYSTEM,
+                0,
+                0,
+                core::ptr::addr_of_mut!(device),
+            )
+        };
+        if status < STATUS_SUCCESS {
+            return Err(DriverError::InsufficientResources);
+        }
+        let device = unsafe {
+            // SAFETY: Success grants the mount exclusive ownership of the new device.
+            KernelDevice::from_raw(device)
+        }
+        .ok_or(DriverError::InternalInvariantViolation)?;
+        Ok(Self {
+            device,
+            reactor: None,
+            shutdown: None,
+            #[cfg(not(test))]
+            work_item: None,
+        })
+    }
+
+    /// Transfers the initialized extension and its resources to dispatch and native retirement.
+    #[expect(
+        unsafe_code,
+        reason = "only the mount can publish initialization of this device"
+    )]
+    fn publish(
+        self,
+        publication_slot: NonNull<UnsafeCell<MaybeUninit<MountedVpb>>>,
+        publication: MountedVpb,
+    ) -> KernelDevice {
+        let destination = unsafe {
+            // SAFETY: Initialization wrote this disjoint field; publication owns its first value.
+            publication_slot.as_ref().get()
+        };
+        unsafe {
+            // SAFETY: This slot uniquely receives the mounted VPB reference.
+            destination.write(MaybeUninit::new(publication));
+        }
+        let device = self.device;
+        core::mem::forget(self);
+        unsafe {
+            // SAFETY: All extension state and VPB routing are ready before dispatch is enabled.
+            (*device.as_ptr()).Flags &= !DO_DEVICE_INITIALIZING;
+        }
+        device
+    }
+}
+
+impl Drop for UnpublishedMountedDevice {
+    #[expect(
+        unsafe_code,
+        reason = "mount rollback releases only the resources acquired by this owner"
+    )]
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let registered = unsafe {
+                // SAFETY: The flag was initialized before registration and lives until deletion.
+                shutdown.as_ref()
+            };
+            consume_shutdown_registration(self.device, registered);
+        }
+        if let Some(header) = self.reactor.take() {
+            let header = unsafe {
+                // SAFETY: The owner records this address only after successful initialization.
+                header.as_ref()
+            };
+            let target = unsafe {
+                // SAFETY: Dispatch is still unpublished and shutdown has been unregistered.
+                // Retirement joins any already admitted work before releasing the binding.
+                header.retire()
+            };
+            drop(target);
+        }
+        #[cfg(not(test))]
+        if let Some(work_item) = self.work_item.take() {
+            unsafe {
+                // SAFETY: Unpublished retirement work was never queued or armed.
+                ffi::IoFreeWorkItem(work_item.as_ptr());
+            }
+        }
+        unsafe {
+            // SAFETY: The unpublished device no longer owns reactor or native work.
+            ffi::IoDeleteDevice(self.device.as_ptr());
+        }
+    }
+}
 
 /// Prevalidated VPB label update consumed only after journal commit visibility.
 #[derive(Debug)]
@@ -194,23 +315,21 @@ impl MountedVolumeDevice {
         })?
     }
 
-    /// Initializes an IoCreateDevice-created mounted device and takes ownership
-    /// of the VCB.
+    /// Creates the device, initializes its native resources, and publishes a recovered volume.
     /// # Errors
-    ///
-    /// Returns an error for invalid device/sector geometry, resource initialization failure,
-    /// or a VPB that has no real device, is occupied, or is being removed. A failed mount leaves
-    /// the supplied VPB unchanged and releases extension-owned resources before device deletion.
+    /// Fails before dispatch publication on invalid geometry, resource failure or a rejected VPB.
     #[expect(
         unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        reason = "this mount initializes disjoint native fields before publishing the owned device"
     )]
-    pub(crate) fn initialize(
-        device: KernelDevice,
+    pub(crate) fn publish_mount(
+        driver: PDRIVER_OBJECT,
         binding: MountedVolumeBinding,
         vpb: KernelVpb,
         target_device: KernelDevice,
-    ) -> DriverResult<()> {
+    ) -> DriverResult<KernelDevice> {
+        let mut unpublished = UnpublishedMountedDevice::create(driver)?;
+        let device = unpublished.device;
         let stack_size = target_device
             .stack_size()
             .ok_or(DriverError::InvalidParameter)?
@@ -332,24 +451,14 @@ impl MountedVolumeDevice {
                 trace,
             )?;
         }
-        let header = unsafe {
-            // SAFETY: The complete header is independently synchronized after final placement.
-            &*header_slot
-        };
-        if let Err(error) = register_shutdown_notification(device) {
-            unsafe {
-                // SAFETY: Shutdown registration failed before this device was
-                // published, so no actor continuation can still own the executor.
-                let target = header.retire();
-                drop(target);
-            }
-            return Err(error);
-        }
+        unpublished.reactor = NonNull::new(header_slot);
+        register_shutdown_notification(device)?;
         let shutdown_registered = unsafe {
-            // SAFETY: Registration ownership uses this disjoint atomic at its final address.
+            // SAFETY: Registration ownership uses this initialized atomic at its final address.
             &*shutdown_slot
         };
         shutdown_registered.store(1, Ordering::Release);
+        unpublished.shutdown = NonNull::new(shutdown_slot);
         #[cfg(not(test))]
         let retirement_work_item = unsafe {
             // SAFETY: The new mounted device remains live and unpublished during allocation.
@@ -357,25 +466,21 @@ impl MountedVolumeDevice {
         };
         #[cfg(test)]
         let retirement_work_item = NonNull::<wdk_sys::_IO_WORKITEM>::dangling().as_ptr();
-        if retirement_work_item.is_null() {
-            Self::unregister_shutdown_notification(device);
-            unsafe {
-                // SAFETY: Work-item allocation failed before publication; no request can race
-                // executor teardown.
-                let target = header.retire();
-                drop(target);
-            }
-            return Err(DriverError::InsufficientResources);
+        let retirement_work_item =
+            NonNull::new(retirement_work_item).ok_or(DriverError::InsufficientResources)?;
+        #[cfg(not(test))]
+        {
+            unpublished.work_item = Some(retirement_work_item);
         }
         unsafe {
             // SAFETY: The device remains unpublished and the work item cannot yet be queued.
-            retirement_slot.write(retirement_work_item);
+            retirement_slot.write(retirement_work_item.as_ptr());
         }
         #[cfg(not(test))]
         unsafe {
             // SAFETY: The unpublished allocation contains these disjoint retirement fields; the
             // timer and DPC are initialized at their final nonpaged addresses before any arming.
-            Self::initialize_retirement_retry(extension_pointer, retirement_work_item);
+            Self::initialize_retirement_retry(extension_pointer, retirement_work_item.as_ptr());
         }
 
         unsafe {
@@ -395,48 +500,16 @@ impl MountedVolumeDevice {
             (*device.as_ptr()).SectorSize = sector_bytes;
         }
 
-        let publication = match (|| {
-            if publication_reliability.policy()
-                == crate::kernel::io_reliability::NativeIoPolicy::Unavailable
-            {
-                return Err(DriverError::Core(ext4_core::Error::MmpOwnershipLost));
-            }
-            MountedVpb::publish(vpb, device, serial_number, volume_label, replacement_vpb)
-        })() {
-            Ok(publication) => publication,
-            Err(error) => {
-                Self::unregister_shutdown_notification(device);
-                unsafe {
-                    // SAFETY: Publication failed without changing the VPB. This mount still owns
-                    // the unpublished device; retire joins any shutdown dispatch before VCB release.
-                    let target = header.retire();
-                    drop(target);
-                }
-                #[cfg(not(test))]
-                unsafe {
-                    // SAFETY: This work item was allocated above and was never queued.
-                    ffi::IoFreeWorkItem(retirement_work_item);
-                }
-                unsafe {
-                    // SAFETY: Retirement joined the actor; the unqueued work item was freed above.
-                    retirement_slot.write(core::ptr::null_mut());
-                }
-                return Err(error);
-            }
-        };
-        let publication_destination = unsafe {
-            // SAFETY: The projected UnsafeCell field is initialized and disjoint from actor storage.
-            (*publication_slot).get()
-        };
-        unsafe {
-            // SAFETY: This slot is uninitialized; publication owns the unique mounted reference.
-            publication_destination.write(MaybeUninit::new(publication));
+        if publication_reliability.policy()
+            == crate::kernel::io_reliability::NativeIoPolicy::Unavailable
+        {
+            return Err(DriverError::Core(ext4_core::Error::MmpOwnershipLost));
         }
-        unsafe {
-            // SAFETY: Mount owns initialization; VPB publication completed and its lock is released.
-            (*device.as_ptr()).Flags &= !DO_DEVICE_INITIALIZING;
-        }
-        Ok(())
+        let publication_slot =
+            NonNull::new(publication_slot).ok_or(DriverError::InternalInvariantViolation)?;
+        let publication =
+            MountedVpb::publish(vpb, device, serial_number, volume_label, replacement_vpb)?;
+        Ok(unpublished.publish(publication_slot, publication))
     }
 
     /// Initializes the retirement retry timer whose DPC re-queues the retirement work item.
@@ -758,17 +831,7 @@ impl MountedVolumeDevice {
             // SAFETY: The live mounted device owns its initialized extension throughout this call.
             &*extension.cast::<MountedVolumeDeviceExtension>()
         };
-        if extension.shutdown_registered.swap(0, Ordering::AcqRel) == 0 {
-            return;
-        }
-        #[cfg(not(test))]
-        unsafe {
-            // SAFETY: Successful mount registered this live mounted device exactly once, and the
-            // actor's one-way dismount transition calls this exactly once.
-            ffi::IoUnregisterShutdownNotification(device.as_ptr());
-        }
-        #[cfg(test)]
-        let _device = device;
+        consume_shutdown_registration(device, &extension.shutdown_registered);
     }
 
     /// Forwards a PnP IRP while mounted state remains retained by dispatch rundown. Terminal
@@ -1922,6 +1985,27 @@ unsafe extern "C" fn mounted_volume_retirement_dpc(
     let work_item = NonNull::new(context.cast::<wdk_sys::_IO_WORKITEM>())
         .unwrap_or_else(|| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
     queue_retirement_work_item(work_item);
+}
+
+/// Unregisters only a live shutdown notification, including during prepublication rollback.
+#[cfg_attr(
+    not(test),
+    expect(
+        unsafe_code,
+        reason = "consuming the registered flag owns native unregistration"
+    )
+)]
+fn consume_shutdown_registration(device: KernelDevice, registered: &AtomicU8) {
+    if registered.swap(0, Ordering::AcqRel) == 0 {
+        return;
+    }
+    #[cfg(not(test))]
+    unsafe {
+        // SAFETY: The successful exchange consumed this live device's registered notification.
+        ffi::IoUnregisterShutdownNotification(device.as_ptr());
+    }
+    #[cfg(test)]
+    let _device = device;
 }
 
 /// Registers a mounted filesystem device for shutdown delivery.

@@ -3,7 +3,8 @@
 use super::*;
 use crate::memory::DriverVec;
 use crate::state::{
-    KernelDevice, KernelFileObject, PreparedVolumeClose, StreamCacheLease, VolumeCloseTarget,
+    KernelDevice, KernelFileObject, PreparedVolumeClose, SealedVolumeClose, StreamCacheLease,
+    VolumeCloseTarget,
 };
 
 /// External request selecting the terminal close outcome.
@@ -103,30 +104,30 @@ enum CloseState {
     /// New paging mutations are sealed; earlier writeback must drain before marker clearance.
     Sealed {
         owned: OwnedIrp,
-        transition: PreparedVolumeStateTransition,
+        transition: SealedVolumeClose,
         close: Box<CleanCloseOperation>,
     },
     /// Only the non-cancellable core durability continuation may submit lower storage I/O.
     Closing {
         owned: OwnedIrp,
-        transition: PreparedVolumeStateTransition,
+        transition: SealedVolumeClose,
         close: Box<CleanCloseOperation>,
     },
     /// Filesystem durability is complete; its retained proof awaits final MMP release.
     ReleasingOwnership {
         owned: OwnedIrp,
-        transition: PreparedVolumeStateTransition,
+        transition: SealedVolumeClose,
     },
     /// Failure revokes session authority and joins physical work without clearing recovery.
     Abandoning {
         owned: OwnedIrp,
-        transition: PreparedVolumeStateTransition,
+        transition: SealedVolumeClose,
         error: DriverError,
     },
     /// Filesystem writes ended; a passive worker must release journal sharing before remount.
     ReleasingJournal {
         owned: OwnedIrp,
-        transition: PreparedVolumeStateTransition,
+        transition: SealedVolumeClose,
         outcome: DriverResult<()>,
     },
     /// Completion or failure consumed the request and its publication authority.
@@ -258,20 +259,15 @@ impl VolumeCloseOperation {
     fn publish(
         self,
         owned: OwnedIrp,
-        transition: PreparedVolumeStateTransition,
+        transition: SealedVolumeClose,
         outcome: DriverResult<()>,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
         let target = self.requester.target();
-        let result = match outcome {
-            Ok(()) => access.publish_volume_state_transition(transition),
-            Err(error) => {
-                access.fail_volume_state_transition(transition, error);
-                Err(error)
-            }
-        };
-        if !matches!(target, VolumeCloseTarget::Shutdown) && access.authorize_storage().is_ok() {
-            MountedVolumeDevice::publish_session_end(self.device, access.session_end_routing());
+        let publication = access.finish_volume_close(transition, outcome);
+        let result = publication.result;
+        if let Some(routing) = publication.routing {
+            MountedVolumeDevice::publish_session_end(self.device, routing);
             MountedVolumeDevice::unregister_shutdown_notification(self.device);
             if matches!(target, VolumeCloseTarget::Dismount(_)) {
                 MountedVolumeDevice::complete_dismount(
@@ -315,7 +311,7 @@ impl VolumeCloseOperation {
     fn fail(
         mut self: Box<Self>,
         owned: OwnedIrp,
-        transition: PreparedVolumeStateTransition,
+        transition: SealedVolumeClose,
         error: DriverError,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
@@ -339,7 +335,7 @@ impl VolumeCloseOperation {
     fn release_journal(
         mut self: Box<Self>,
         owned: OwnedIrp,
-        transition: PreparedVolumeStateTransition,
+        transition: SealedVolumeClose,
         outcome: DriverResult<()>,
         exclusion: Option<crate::kernel::storage::ExternalJournalExclusion>,
         access: &mut MountedVolumeAccess<'_>,
@@ -411,7 +407,7 @@ impl VolumeCloseOperation {
     fn drive(
         mut self: Box<Self>,
         owned: OwnedIrp,
-        transition: PreparedVolumeStateTransition,
+        transition: SealedVolumeClose,
         result: CleanCloseTransition,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
@@ -672,13 +668,13 @@ impl MountedVolumeOperation for VolumeCloseOperation {
             ) => match result {
                 Ok(()) => self.publish(owned, transition, outcome, access),
                 Err((error, exclusion)) => {
-                    access.retain_external_journal_exclusion(exclusion);
-                    access.fail_volume_state_transition(transition, error);
+                    let result =
+                        access.fail_volume_close_retaining_journal(transition, error, exclusion);
                     MountedVolumeDevice::unregister_shutdown_notification(self.device);
                     if matches!(self.requester.target(), VolumeCloseTarget::Dismount(_)) {
                         MountedVolumeDevice::complete_dismount(self.device, error.ntstatus());
                     }
-                    self.complete(owned, Err(error))
+                    self.complete(owned, result.map(|()| IrpCompletion::EMPTY))
                 }
             },
             (

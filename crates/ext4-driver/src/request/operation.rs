@@ -29,7 +29,6 @@ use crate::irp::{
 use crate::irp::{MountAdmission, PreparedOplockControl};
 use crate::kernel::cng::CngOperation;
 use crate::kernel::external_journal::{ExclusiveExternalJournal, ExternalJournalCandidates};
-use crate::kernel::ffi;
 use crate::kernel::operational_trace::{OperationalOutcome, OperationalPath, OperationalTrace};
 use crate::kernel::status::{DriverError, DriverResult, STATUS_FILE_LOCK_CONFLICT, STATUS_RETRY};
 use crate::kernel::storage::{
@@ -39,9 +38,8 @@ use crate::kernel::storage::{
 use crate::memory;
 use crate::state::{
     EpochLease, EpochPublicationSlot, EpochPublicationSlots, MountedVolumeAccess,
-    MountedVolumeDevice, MountedVolumeDeviceExtension, MutationActivityLease, PendingCheckpoint,
-    PreparedVolumeStateTransition, RawVolumeOperationKind, RawVolumeTarget,
-    StreamProjectionOutcome,
+    MountedVolumeDevice, MutationActivityLease, PendingCheckpoint, RawVolumeOperationKind,
+    RawVolumeTarget, StreamProjectionOutcome, VolumeLockTransition,
 };
 
 /// Faults the mounted mutation authority only for real Cc/MM failures, not ordinary conflicts or
@@ -644,10 +642,6 @@ impl MountRequestOperation {
     ///
     /// Returns an error when VCB/provider allocation, notifier or device initialization, or WDK
     /// publication fails.
-    #[expect(
-        unsafe_code,
-        reason = "mount publication owns the audited IoCreateDevice and unpublished-device rollback boundary"
-    )]
     fn publish_mount(
         admission: MountAdmission,
         reservation: crate::state::MountReservation<'static>,
@@ -667,52 +661,14 @@ impl MountRequestOperation {
             catalog.identities,
         )?;
 
-        let extension_size =
-            wdk_sys::ULONG::try_from(core::mem::size_of::<MountedVolumeDeviceExtension>())
-                .map_err(|_| DriverError::InvalidParameter)?;
-        let mut device = core::ptr::null_mut();
-        let status = unsafe {
-            // SAFETY: The control device's driver object creates one unpublished mounted device;
-            // `device` is writable out storage until this call returns.
-            ffi::IoCreateDevice(
-                driver_object,
-                extension_size,
-                core::ptr::null_mut(),
-                ffi::FILE_DEVICE_DISK_FILE_SYSTEM,
-                0,
-                0,
-                core::ptr::addr_of_mut!(device),
-            )
-        };
-        if status < STATUS_SUCCESS {
-            return Err(DriverError::InsufficientResources);
-        }
-
-        let Some(device) = (unsafe {
-            // SAFETY: Successful IoCreateDevice returned this unpublished live mounted device.
-            crate::state::KernelDevice::from_raw(device)
-        }) else {
-            return Err(DriverError::InternalInvariantViolation);
-        };
-        match MountedVolumeDevice::initialize(
-            device,
+        let device = MountedVolumeDevice::publish_mount(
+            driver_object,
             binding,
             admission.vpb(),
             admission.target_device(),
-        ) {
-            Ok(()) => {
-                reservation.publish();
-                Ok(device)
-            }
-            Err(error) => {
-                unsafe {
-                    // SAFETY: Initialization rejected the unpublished device and retained no VCB
-                    // ownership in its extension.
-                    ffi::IoDeleteDevice(device.as_ptr());
-                }
-                Err(error)
-            }
-        }
+        )?;
+        reservation.publish();
+        Ok(device)
     }
 }
 
@@ -2639,7 +2595,7 @@ enum VolumeControlOperationState {
         /// Stable direct-volume identities.
         target: crate::request::file_system_control::DirectVolumeTarget,
         /// Reversible lock publication retained through the full durability sequence.
-        transition: PreparedVolumeStateTransition,
+        transition: VolumeLockTransition,
         /// Concrete lower devices already selected from the mounted runtime.
         devices: MountedStorageRoute,
         /// Remaining preallocated shared-stream cache leases.
@@ -2652,7 +2608,7 @@ enum VolumeControlOperationState {
         /// Stable direct-volume identities.
         target: crate::request::file_system_control::DirectVolumeTarget,
         /// State publication prepared before suspension.
-        transition: PreparedVolumeStateTransition,
+        transition: VolumeLockTransition,
         /// Concrete lower devices already selected from the mounted runtime.
         devices: MountedStorageRoute,
     },
@@ -2663,7 +2619,7 @@ enum VolumeControlOperationState {
         /// Stable direct-volume identities.
         target: crate::request::file_system_control::DirectVolumeTarget,
         /// State publication prepared before suspension.
-        transition: PreparedVolumeStateTransition,
+        transition: VolumeLockTransition,
         /// Exact lower completion identity.
         expected: StorageRequestIdentity,
     },
@@ -2730,40 +2686,28 @@ impl VolumeControlOperation {
         OperationTransition::Complete(completion)
     }
 
-    /// Publishes the prevalidated lock or dismount transition after successful lower flush.
-    fn publish(
-        kind: VolumeControlRequestKind,
+    /// Publishes the volume lock after successful lower flush.
+    fn publish_lock(
         owned: OwnedIrp,
         target: crate::request::file_system_control::DirectVolumeTarget,
-        transition: PreparedVolumeStateTransition,
+        transition: VolumeLockTransition,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
-        if let Err(error) = access.publish_volume_state_transition(transition) {
+        if let Err(error) = access.finish_volume_lock(transition) {
             return Self::complete(owned, Err(error));
         }
-        match kind {
-            VolumeControlRequestKind::Lock => {
-                MountedVolumeDevice::publish_volume_lock(target.device(), true);
-            }
-            VolumeControlRequestKind::Unlock
-            | VolumeControlRequestKind::IsMounted
-            | VolumeControlRequestKind::AllowExtendedDasdIo => {
-                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption(
-                )
-                .bugcheck();
-            }
-        }
+        MountedVolumeDevice::publish_volume_lock(target.device(), true);
         Self::complete(owned, Ok(IrpCompletion::EMPTY))
     }
 
     /// Ends a failed attempt, reopening admission only for a reversible volume lock.
     fn fail_transition(
         owned: OwnedIrp,
-        transition: PreparedVolumeStateTransition,
+        transition: VolumeLockTransition,
         error: DriverError,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
-        access.fail_volume_state_transition(transition, error);
+        access.abort_volume_lock(transition);
         Self::complete(owned, Err(error))
     }
 
@@ -2772,7 +2716,7 @@ impl VolumeControlOperation {
         mut self: Box<Self>,
         owned: OwnedIrp,
         target: crate::request::file_system_control::DirectVolumeTarget,
-        transition: PreparedVolumeStateTransition,
+        transition: VolumeLockTransition,
         devices: MountedStorageRoute,
         mut drain: crate::state::PreparedStreamCacheDrain,
         access: &mut MountedVolumeAccess<'_>,
@@ -2813,7 +2757,7 @@ impl VolumeControlOperation {
     /// failure before aborting the reversible volume-lock attempt.
     fn fail_lock_cache_drain(
         owned: OwnedIrp,
-        transition: PreparedVolumeStateTransition,
+        transition: VolumeLockTransition,
         error: DriverError,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
@@ -2875,7 +2819,7 @@ impl MountedVolumeOperation for VolumeControlOperation {
                     );
                 }
                 if access.mounted_profile().access() == ext4_core::MediaAccess::ReadOnly {
-                    return Self::publish(self.kind, owned, target, transition, access);
+                    return Self::publish_lock(owned, target, transition, access);
                 }
                 let request = StorageRequest::Flush {
                     target: ext4_core::StorageTarget::Filesystem,
@@ -3058,7 +3002,7 @@ impl MountedVolumeOperation for VolumeControlOperation {
                     );
                 };
                 match expected.complete(completion) {
-                    Ok(()) => Self::publish(self.kind, owned, target, transition, access),
+                    Ok(()) => Self::publish_lock(owned, target, transition, access),
                     Err(error) => {
                         Self::fail_transition(owned, transition, DriverError::from(error), access)
                     }

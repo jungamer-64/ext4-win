@@ -903,6 +903,32 @@ pub(crate) struct VolumeCloseOutcome {
     retirement: VolumeRetirement,
 }
 
+/// An admitted lock may finish or reopen only for the exact initiating FILE_OBJECT.
+#[derive(Debug)]
+pub(crate) struct VolumeLockTransition {
+    /// Mount that excluded new namespace work.
+    volume: MountedVolumeRef,
+    /// Direct-volume handle that requested the lock.
+    owner: KernelFileObject,
+}
+
+/// Terminal close authority after paging has been sealed.
+#[derive(Debug)]
+pub(crate) struct SealedVolumeClose {
+    /// Mount that sealed paging and drained session work.
+    volume: MountedVolumeRef,
+    /// Dismount, raw-write handoff, or shutdown selected before seal.
+    target: VolumeCloseTarget,
+}
+
+/// Completion status and the native routing update still owed by logical close.
+pub(crate) struct SessionEndPublication {
+    /// The original close result, including a terminal durability failure.
+    pub(crate) result: DriverResult<()>,
+    /// A revoked device or shutdown has no session-end routing update.
+    pub(crate) routing: Option<SessionEndRouting>,
+}
+
 /// Unique reversible exclusion; sealing consumes it into terminal close authority.
 #[derive(Debug)]
 pub(crate) struct PreparedVolumeClose {
@@ -916,14 +942,14 @@ pub(crate) struct PreparedVolumeClose {
 #[derive(Debug)]
 pub(crate) struct PreparedVolumeLock {
     /// State publication retained until journal and lower-device durability complete.
-    transition: PreparedVolumeStateTransition,
+    transition: VolumeLockTransition,
     /// Preallocated shared-stream cache drain.
     cache_drain: PreparedStreamCacheDrain,
 }
 
 impl PreparedVolumeLock {
     /// Separates the state publication from the sequential cache-work plan.
-    pub(crate) fn into_parts(self) -> (PreparedVolumeStateTransition, PreparedStreamCacheDrain) {
+    pub(crate) fn into_parts(self) -> (VolumeLockTransition, PreparedStreamCacheDrain) {
         (self.transition, self.cache_drain)
     }
 }
@@ -1120,9 +1146,9 @@ impl MountedVolumeAccess<'_> {
             .prepare_volume_lock_cache_drain()?;
         self.volume_control.state = next_state;
         Ok(PreparedVolumeLock {
-            transition: PreparedVolumeStateTransition {
+            transition: VolumeLockTransition {
                 volume: MountedVolumeRef::new(NonNull::from(self.volume)),
-                kind: PreparedVolumeStateTransitionKind::Lock { owner },
+                owner,
             },
             cache_drain,
         })
@@ -1193,7 +1219,7 @@ impl MountedVolumeAccess<'_> {
     pub(crate) fn abort_or_seal_close(
         &mut self,
         preparation: PreparedVolumeClose,
-    ) -> Option<PreparedVolumeStateTransition> {
+    ) -> Option<SealedVolumeClose> {
         self.require_close_preparation(&preparation);
         if self.authorize_storage().is_err() {
             return None;
@@ -1220,7 +1246,7 @@ impl MountedVolumeAccess<'_> {
     pub(crate) fn seal_volume_close(
         &mut self,
         preparation: PreparedVolumeClose,
-    ) -> DriverResult<PreparedVolumeStateTransition> {
+    ) -> DriverResult<SealedVolumeClose> {
         self.require_close_preparation(&preparation);
         self.authorize_storage()?;
         self.volume_control.state = self
@@ -1231,11 +1257,9 @@ impl MountedVolumeAccess<'_> {
                 KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
             });
         self.storage_access().seal_close_writeback();
-        Ok(PreparedVolumeStateTransition {
+        Ok(SealedVolumeClose {
             volume: preparation.volume,
-            kind: PreparedVolumeStateTransitionKind::SessionEnd {
-                target: preparation.target,
-            },
+            target: preparation.target,
         })
     }
 
@@ -1253,58 +1277,103 @@ impl MountedVolumeAccess<'_> {
         self.volume.file_control_blocks.prepare_cache_writeback()
     }
 
-    /// Publishes one previously validated lifecycle transition after its barrier succeeds.
+    /// Publishes an admitted lock after all required writes are durable.
     /// # Errors
-    ///
-    /// Device removal revokes earlier prepared lock/close publication authority.
-    pub(crate) fn publish_volume_state_transition(
+    /// Returns a storage revocation that won while the lock attempt was suspended.
+    pub(crate) fn finish_volume_lock(
         &mut self,
-        transition: PreparedVolumeStateTransition,
+        transition: VolumeLockTransition,
     ) -> DriverResult<()> {
         if !self.owns_volume(transition.volume.as_non_null()) {
             KernelWideInconsistency::mounted_volume_state_corruption().bugcheck();
         }
         self.authorize_storage()?;
-        let control = &mut self.volume_control;
-        match transition.kind {
-            PreparedVolumeStateTransitionKind::Lock { owner } => {
-                control.state = control.state.finish_lock(owner).unwrap_or_else(|| {
-                    KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
-                });
-            }
-            PreparedVolumeStateTransitionKind::SessionEnd { target } => {
-                control.state = control.state.finish_close(target).unwrap_or_else(|| {
-                    KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
-                });
-                self.volume.directory_change_notifier.cleanup_all();
-            }
-        }
+        self.volume_control.state = self
+            .volume_control
+            .state
+            .finish_lock(transition.owner)
+            .unwrap_or_else(|| {
+                KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
+            });
         Ok(())
     }
 
-    /// Consumes a failed lifecycle publication while preserving one-way clean-close semantics.
-    pub(crate) fn fail_volume_state_transition(
-        &mut self,
-        transition: PreparedVolumeStateTransition,
-        error: DriverError,
-    ) {
+    /// Reopens admission after a reversible lock attempt, unless media revocation won.
+    pub(crate) fn abort_volume_lock(&mut self, transition: VolumeLockTransition) {
         if !self.owns_volume(transition.volume.as_non_null()) {
             KernelWideInconsistency::mounted_volume_state_corruption().bugcheck();
         }
-        if self.authorize_storage().is_err() {
-            return;
+        if self.authorize_storage().is_ok() {
+            self.volume_control.state = self
+                .volume_control
+                .state
+                .abort_lock(transition.owner)
+                .unwrap_or_else(|| {
+                    KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
+                });
         }
-        let storage = self.storage_access();
-        let control = &mut self.volume_control;
-        control.state = match transition.kind {
-            PreparedVolumeStateTransitionKind::Lock { owner } => control.state.abort_lock(owner),
-            PreparedVolumeStateTransitionKind::SessionEnd { target } => {
-                storage.seal_close_writeback();
+    }
+
+    /// Consumes close authority after the journal and lower I/O have been joined.
+    /// Even a failed clean close is terminal; native routing depends on the retained raw owner.
+    pub(crate) fn finish_volume_close(
+        &mut self,
+        transition: SealedVolumeClose,
+        outcome: DriverResult<()>,
+    ) -> SessionEndPublication {
+        let target = transition.target;
+        let result = self.end_volume_session(transition, outcome);
+        let routing = if target != VolumeCloseTarget::Shutdown && self.authorize_storage().is_ok() {
+            Some(self.session_end_routing())
+        } else {
+            None
+        };
+        SessionEndPublication { result, routing }
+    }
+
+    /// Ends the session while keeping a journal handle whose release failed.
+    /// The retained exclusion still owns native routing until retirement.
+    /// # Errors
+    /// Returns the original close failure after recording it on the session.
+    pub(crate) fn fail_volume_close_retaining_journal(
+        &mut self,
+        transition: SealedVolumeClose,
+        error: DriverError,
+        exclusion: crate::kernel::storage::ExternalJournalExclusion,
+    ) -> DriverResult<()> {
+        self.runtime.retain_external_journal_exclusion(exclusion);
+        self.end_volume_session(transition, Err(error))
+    }
+
+    /// # Errors
+    /// Preserves a close failure or reports storage revocation before successful publication.
+    fn end_volume_session(
+        &mut self,
+        transition: SealedVolumeClose,
+        outcome: DriverResult<()>,
+    ) -> DriverResult<()> {
+        if !self.owns_volume(transition.volume.as_non_null()) {
+            KernelWideInconsistency::mounted_volume_state_corruption().bugcheck();
+        }
+        if let Err(revoked) = self.authorize_storage() {
+            return outcome.and(Err(revoked));
+        }
+        let state = self.volume_control.state;
+        let next = match outcome {
+            Ok(()) => state.finish_close(transition.target),
+            Err(error) => {
+                self.storage_access().seal_close_writeback();
                 self.volume.directory_change_notifier.cleanup_all();
-                control.state.fail_close(target, error)
+                state.fail_close(transition.target, error)
             }
+        };
+        self.volume_control.state = next.unwrap_or_else(|| {
+            KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
+        });
+        if outcome.is_ok() {
+            self.volume.directory_change_notifier.cleanup_all();
         }
-        .unwrap_or_else(|| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
+        outcome
     }
 
     /// Reports whether the volume remains logically mounted.
@@ -2113,13 +2182,6 @@ impl MountedVolumeAccess<'_> {
     ) -> DriverResult<Option<crate::kernel::storage::ExternalJournalExclusion>> {
         self.runtime.finish_mmp_close()
     }
-    /// Keeps exclusion after a failed close without reauthorizing filesystem I/O.
-    pub(crate) fn retain_external_journal_exclusion(
-        &mut self,
-        exclusion: crate::kernel::storage::ExternalJournalExclusion,
-    ) {
-        self.runtime.retain_external_journal_exclusion(exclusion);
-    }
     /// Irreversibly retires the session while retaining all outstanding completion owners.
     pub(crate) fn fail_mmp(&mut self, reason: ext4_core::Error) {
         self.runtime.fail_mmp(reason);
@@ -2145,7 +2207,7 @@ impl MountedVolumeAccess<'_> {
     /// Projects direct access and remount exclusion from the terminal session state.
     ///
     /// Must follow publication or failure of a session-end transition on still-authorized storage.
-    pub(crate) fn session_end_routing(&self) -> SessionEndRouting {
+    fn session_end_routing(&self) -> SessionEndRouting {
         match self.volume_control.state {
             MountedVolumeState::Dismounted {
                 access: DismountedAccess::DismountOwner(_) | DismountedAccess::Locked(_),
