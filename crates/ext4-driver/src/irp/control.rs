@@ -300,22 +300,6 @@ impl FsControlCode {
         }
     }
 
-    /// Returns whether FsRtl owns this standard oplock control operation.
-    pub(crate) const fn is_oplock(self) -> bool {
-        matches!(
-            self,
-            Self::RequestOplockLevel1
-                | Self::RequestOplockLevel2
-                | Self::RequestBatchOplock
-                | Self::OplockBreakAcknowledge
-                | Self::OplockBatchAckClosePending
-                | Self::OplockBreakNotify
-                | Self::OplockBreakAckNoLevel2
-                | Self::RequestFilterOplock
-                | Self::RequestOplock
-        )
-    }
-
     /// Classifies an oplock FSCTL without duplicating FsRtl's complete payload validation.
     ///
     /// Malformed or truncated structured input is classified as a grant. FsRtl remains the

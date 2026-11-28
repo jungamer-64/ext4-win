@@ -12,13 +12,13 @@ use crate::{
     memory,
     memory::DriverVec,
     security_descriptor::SecuritySelection,
-    state::KernelFileObject,
+    state::{KernelDevice, KernelFileObject, KernelVpb},
 };
 
 use super::{
     ActiveIrp, DataIoKind, DirectoryControlMinorFunction, DispatchMajor,
-    FileSystemControlMinorFunction, IrpBufferLength, IrpCompletion, QueryDirectoryStack,
-    QueryEaStack, ReadStack, WriteStack,
+    FileSystemControlMinorFunction, FsControlCode, IrpBufferLength, IrpCompletion,
+    OplockControlAction, QueryDirectoryStack, QueryEaStack, ReadStack, WriteStack,
 };
 
 mod cluster_control;
@@ -851,38 +851,7 @@ impl QueueContext {
             _ => {}
         }
         let (prepared, cancellation_key) = PreparedRequest::capture(target, stack, major)?;
-        let paging = prepared.is_paging();
-        let release = if major == DispatchMajor::LockControl {
-            stack.releases_byte_range_lock()
-        } else if major == DispatchMajor::FileSystemControl
-            && stack.file_system_control_minor() == FileSystemControlMinorFunction::UserFsRequest
-        {
-            let control = stack
-                .file_system_control()
-                .map_err(IrpCompletion::from_error)?;
-            let code = control.fs_control_code;
-            code.is_oplock()
-                && code != super::super::FsControlCode::OplockBreakNotify
-                && code
-                    .oplock_action(
-                        target
-                            .buffered_input(control.input_buffer_length)
-                            .map_err(IrpCompletion::from_error)?,
-                    )
-                    .map_err(IrpCompletion::from_error)?
-                    == super::super::OplockControlAction::BreakContinuation
-        } else {
-            false
-        };
-        let execution = if paging {
-            super::scheduler::ExecutionClass::Paging
-        } else if matches!(prepared, PreparedRequest::VerifyVolume(_)) {
-            super::scheduler::ExecutionClass::Verification
-        } else if release {
-            super::scheduler::ExecutionClass::Release
-        } else {
-            super::scheduler::ExecutionClass::Ordinary
-        };
+        let execution = prepared.execution_class();
         memory::boxed_try_with(|| {
             Ok(Self {
                 prepared,
@@ -1073,6 +1042,113 @@ pub(crate) enum PreparedKeyControl {
     Remove,
 }
 
+/// Pointer-free mount scalars plus stable kernel object identities.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MountAdmission {
+    /// Filesystem control device receiving the mount.
+    file_system_device: KernelDevice,
+    /// VPB supplied by the I/O Manager.
+    vpb: KernelVpb,
+    /// Lower storage target.
+    target_device: KernelDevice,
+    /// Caller output capacity.
+    output_buffer_length: IrpBufferLength,
+}
+
+#[expect(
+    unsafe_code,
+    reason = "the captured mount identities cross the queue with their owning mount IRP"
+)]
+// SAFETY: The mount IRP pins the VPB and both device identities through capture and completion.
+// Accessing mutable native VPB fields still requires the native VPB synchronization protocol.
+unsafe impl Send for MountAdmission {}
+
+impl MountAdmission {
+    /// Filesystem control device that owns completion code.
+    pub(crate) const fn file_system_device(self) -> KernelDevice {
+        self.file_system_device
+    }
+
+    /// I/O Manager VPB retained by the mount IRP.
+    pub(crate) const fn vpb(self) -> KernelVpb {
+        self.vpb
+    }
+
+    /// Lower filesystem device selected for mount.
+    pub(crate) const fn target_device(self) -> KernelDevice {
+        self.target_device
+    }
+
+    /// Mount output capacity supplied by the I/O Manager.
+    pub(crate) const fn output_buffer_length(self) -> IrpBufferLength {
+        self.output_buffer_length
+    }
+}
+
+/// User FSCTLs whose raw code cannot stand in for requestor-context authorization.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(
+    not(test),
+    expect(
+        clippy::missing_docs_in_private_items,
+        reason = "each variant names its FSCTL; capture owns any additional admission contract"
+    )
+)]
+pub(crate) enum PreparedFsControl {
+    QueryVolumeIdentity,
+    QueryFeatures,
+    QueryDirectoryCasefold,
+    SetDirectoryCasefold,
+    IsVolumeDirty,
+    SetZeroOnDeallocation,
+    GetReparsePoint,
+    SetReparsePoint,
+    DeleteReparsePoint,
+    EnableVerity,
+    GetEncryptionKeyStatus,
+    LockVolume,
+    UnlockVolume,
+    DismountVolume,
+    IsVolumeMounted,
+    IsPathnameValid,
+    AllowExtendedDasdIo,
+    Unsupported,
+}
+
+/// Set-information admission that requires a different operation or an actor-time error.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PreparedSetInformation {
+    /// Ordinary filesystem metadata change.
+    Mutation,
+    /// Cache Manager notification that can bypass handle ordering.
+    AdvanceValidDataLength,
+    /// Explicit user request subject to handle ordering and access checks.
+    ValidDataLength,
+    /// Report this error after the usual device preflight.
+    Rejected(DriverError),
+}
+
+/// Oplock routing is sealed together with the separate right to occupy a release slot.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PreparedOplockControl {
+    /// Takes the ordinary lane and checks for an active grant exclusion.
+    Grant,
+    /// Can wait for a break, so it uses ordinary capacity.
+    ObserveBreak,
+    /// Allows the break to advance while ordinary admission is blocked.
+    ReleaseBreak,
+}
+
+impl PreparedOplockControl {
+    /// Only a new grant conflicts with the actor's oplock mutation exclusion.
+    pub(crate) const fn action(self) -> OplockControlAction {
+        match self {
+            Self::Grant => OplockControlAction::Grant,
+            Self::ObserveBreak | Self::ReleaseBreak => OplockControlAction::BreakContinuation,
+        }
+    }
+}
+
 /// Complete set of requests accepted by the asynchronous device lane.
 #[derive(Debug)]
 pub(crate) enum PreparedRequest {
@@ -1090,7 +1166,7 @@ pub(crate) enum PreparedRequest {
     /// synchronous requester may own the stream's section synchronization.
     QueryInformation(DataIoKind),
     /// File information mutation.
-    SetInformation,
+    SetInformation(PreparedSetInformation),
     /// Memory Manager end-of-file extension from a synchronous paging requester, with the
     /// section synchronization that requester owned when it dispatched this IRP.
     SectionEndOfFile(crate::kernel::stream::RequesterSectionExclusion),
@@ -1102,8 +1178,13 @@ pub(crate) enum PreparedRequest {
     SetVolumeInformation,
     /// Directory request with all requestor-owned auxiliary input captured.
     DirectoryControl(PreparedDirectoryControl),
-    /// File-system control with a sealed minor-function classification.
-    FileSystemControl(FileSystemControlMinorFunction),
+    /// Mount parameters decoded while the kernel still owns the original request stack.
+    /// An invalid mount retains its ordinary actor-time completion order.
+    Mount(Result<MountAdmission, DriverError>),
+    /// User control authorized and classified in requestor context.
+    FileSystemControl(PreparedFsControl),
+    /// Sealed scheduling and FsRtl delegation semantics.
+    OplockControl(PreparedOplockControl),
     /// Kernel-captured mounted association for a physical verification read.
     VerifyVolume(super::VerifyVolumeTarget),
     /// Embedded handle reference and immutable cluster-control scalars captured before deferral.
@@ -1124,7 +1205,10 @@ pub(crate) enum PreparedRequest {
         output: CapturedRequestorOutput,
     },
     /// Byte-range lock or unlock request whose live lock parameters remain IRP-owned.
-    LockControl,
+    LockControl {
+        /// Unlock requests have independent capacity so a wait cannot starve them.
+        releases: bool,
+    },
     /// Flush request.
     FlushBuffers,
     /// Extended-attribute query with an owned selection list.
@@ -1164,6 +1248,110 @@ impl PreparedRequest {
             Self::QueryInformation(kind) => *kind == DataIoKind::Paging,
             Self::SectionEndOfFile(_) => true,
             _ => false,
+        }
+    }
+
+    /// # Errors
+    /// Rejects requestor privilege, handle, or buffer capture failures before queueing.
+    fn capture_user_control(
+        target: &ActiveIrp<'_>,
+        control: super::FileSystemControlStack,
+        key: QueueCancellationKey,
+    ) -> Result<(Self, QueueCancellationKey), IrpCompletion> {
+        let code = control.fs_control_code();
+        let ordinary = match code {
+            FsControlCode::MarkVolumeDirty => {
+                authorize_volume_management(target)?;
+                return Ok((Self::MarkVolumeDirty, key));
+            }
+            FsControlCode::MoveFile | FsControlCode::MarkHandle => {
+                if code == FsControlCode::MoveFile {
+                    authorize_volume_management(target)?;
+                }
+                let captured = PreparedClusterControl::capture(target, code)
+                    .map_err(IrpCompletion::from_error)?;
+                return Ok((Self::ClusterControl(captured), key));
+            }
+            FsControlCode::GetRetrievalPointers | FsControlCode::GetVolumeBitmap => {
+                return capture_allocation_query(target, control, key);
+            }
+            FsControlCode::TrimVolume => {
+                authorize_volume_management(target)?;
+                return Ok((Self::Trim, key));
+            }
+            FsControlCode::GetRetrievalPointerBase => {
+                authorize_volume_management(target)?;
+                return Ok((Self::RetrievalPointerBase, key));
+            }
+            FsControlCode::AddEncryptionKey | FsControlCode::RemoveEncryptionKey => {
+                authorize_volume_management(target)?;
+                let control = if code == FsControlCode::AddEncryptionKey {
+                    PreparedKeyControl::Add
+                } else {
+                    PreparedKeyControl::Remove
+                };
+                return Ok((Self::KeyControl(control), key));
+            }
+            FsControlCode::OplockBreakNotify => {
+                return Ok((
+                    Self::OplockControl(PreparedOplockControl::ObserveBreak),
+                    key,
+                ));
+            }
+            FsControlCode::RequestOplockLevel1
+            | FsControlCode::RequestOplockLevel2
+            | FsControlCode::RequestBatchOplock
+            | FsControlCode::OplockBreakAcknowledge
+            | FsControlCode::OplockBatchAckClosePending
+            | FsControlCode::OplockBreakAckNoLevel2
+            | FsControlCode::RequestFilterOplock
+            | FsControlCode::RequestOplock => {
+                let input = target
+                    .buffered_input(control.input_buffer_length())
+                    .map_err(IrpCompletion::from_error)?;
+                let route = match code
+                    .oplock_action(input)
+                    .map_err(IrpCompletion::from_error)?
+                {
+                    OplockControlAction::Grant => PreparedOplockControl::Grant,
+                    OplockControlAction::BreakContinuation => PreparedOplockControl::ReleaseBreak,
+                };
+                return Ok((Self::OplockControl(route), key));
+            }
+            FsControlCode::SetReparsePoint => {
+                authorize_symbolic_link(target)?;
+                PreparedFsControl::SetReparsePoint
+            }
+            FsControlCode::QueryVolumeIdentity => PreparedFsControl::QueryVolumeIdentity,
+            FsControlCode::QueryFeatures => PreparedFsControl::QueryFeatures,
+            FsControlCode::QueryDirectoryCasefold => PreparedFsControl::QueryDirectoryCasefold,
+            FsControlCode::SetDirectoryCasefold => PreparedFsControl::SetDirectoryCasefold,
+            FsControlCode::IsVolumeDirty => PreparedFsControl::IsVolumeDirty,
+            FsControlCode::SetZeroOnDeallocation => PreparedFsControl::SetZeroOnDeallocation,
+            FsControlCode::GetReparsePoint => PreparedFsControl::GetReparsePoint,
+            FsControlCode::DeleteReparsePoint => PreparedFsControl::DeleteReparsePoint,
+            FsControlCode::EnableVerity => PreparedFsControl::EnableVerity,
+            FsControlCode::GetEncryptionKeyStatus => PreparedFsControl::GetEncryptionKeyStatus,
+            FsControlCode::LockVolume => PreparedFsControl::LockVolume,
+            FsControlCode::UnlockVolume => PreparedFsControl::UnlockVolume,
+            FsControlCode::DismountVolume => PreparedFsControl::DismountVolume,
+            FsControlCode::IsVolumeMounted => PreparedFsControl::IsVolumeMounted,
+            FsControlCode::IsPathnameValid => PreparedFsControl::IsPathnameValid,
+            FsControlCode::AllowExtendedDasdIo => PreparedFsControl::AllowExtendedDasdIo,
+            FsControlCode::SetPurgeFailureMode => PreparedFsControl::Unsupported,
+        };
+        Ok((Self::FileSystemControl(ordinary), key))
+    }
+
+    /// Derives queue capacity from the sealed request.
+    fn execution_class(&self) -> super::scheduler::ExecutionClass {
+        use super::scheduler::ExecutionClass;
+        match self {
+            Self::VerifyVolume(_) => ExecutionClass::Verification,
+            Self::LockControl { releases: true }
+            | Self::OplockControl(PreparedOplockControl::ReleaseBreak) => ExecutionClass::Release,
+            request if request.is_paging() => ExecutionClass::Paging,
+            _ => ExecutionClass::Ordinary,
         }
     }
 
@@ -1294,7 +1482,17 @@ impl PreparedRequest {
                     .map_err(IrpCompletion::from_error)?;
                     Ok((Self::NamespaceInformation(subject), generic_key()))
                 } else {
-                    Ok((Self::SetInformation, generic_key()))
+                    let kind = match operation {
+                        Ok(super::SetFileOperation::AdvanceValidDataLength) => {
+                            PreparedSetInformation::AdvanceValidDataLength
+                        }
+                        Ok(super::SetFileOperation::ValidDataLength) => {
+                            PreparedSetInformation::ValidDataLength
+                        }
+                        Ok(_) => PreparedSetInformation::Mutation,
+                        Err(error) => PreparedSetInformation::Rejected(error),
+                    };
+                    Ok((Self::SetInformation(kind), generic_key()))
                 }
             }
             DispatchMajor::QueryVolumeInformation => {
@@ -1353,85 +1551,45 @@ impl PreparedRequest {
                 },
                 generic_key(),
             )),
-            DispatchMajor::FileSystemControl => {
-                let minor = stack.file_system_control_minor();
-                let key = match minor {
-                    FileSystemControlMinorFunction::MountVolume => {
-                        if target.requestor_mode() != 0 {
-                            return Err(IrpCompletion::from_error(DriverError::AccessDenied));
-                        }
-                        QueueCancellationKey::Device
+            DispatchMajor::FileSystemControl => match stack.file_system_control_minor() {
+                FileSystemControlMinorFunction::MountVolume => {
+                    if target.requestor_mode() != 0 {
+                        return Err(IrpCompletion::from_error(DriverError::AccessDenied));
                     }
-                    FileSystemControlMinorFunction::VerifyVolume => {
-                        if target.requestor_mode() != 0 {
-                            return Err(IrpCompletion::from_error(DriverError::AccessDenied));
-                        }
-                        let verify = stack.verify_volume().map_err(IrpCompletion::from_error)?;
-                        if verify.device != target.device() {
-                            return Err(IrpCompletion::from_error(DriverError::InvalidParameter));
-                        }
-                        return Ok((Self::VerifyVolume(verify), QueueCancellationKey::Device));
+                    let mount = stack.mount_volume().map(|mount| MountAdmission {
+                        file_system_device: target.device(),
+                        vpb: mount.vpb(),
+                        target_device: mount.target_device(),
+                        output_buffer_length: mount.output_buffer_length(),
+                    });
+                    Ok((Self::Mount(mount), QueueCancellationKey::Device))
+                }
+                FileSystemControlMinorFunction::VerifyVolume => {
+                    if target.requestor_mode() != 0 {
+                        return Err(IrpCompletion::from_error(DriverError::AccessDenied));
                     }
-                    FileSystemControlMinorFunction::UserFsRequest => {
-                        let control = stack
-                            .file_system_control()
-                            .map_err(IrpCompletion::from_error)?;
-                        if control.fs_control_code() == super::FsControlCode::MarkVolumeDirty {
-                            authorize_volume_management(target)?;
-                            return Ok((Self::MarkVolumeDirty, generic_key()));
-                        }
-                        if matches!(
-                            control.fs_control_code(),
-                            super::FsControlCode::MoveFile | super::FsControlCode::MarkHandle
-                        ) {
-                            if control.fs_control_code() == super::FsControlCode::MoveFile {
-                                authorize_volume_management(target)?;
-                            }
-                            let captured =
-                                PreparedClusterControl::capture(target, control.fs_control_code())
-                                    .map_err(IrpCompletion::from_error)?;
-                            return Ok((Self::ClusterControl(captured), generic_key()));
-                        }
-                        if control.fs_control_code() == super::FsControlCode::SetReparsePoint {
-                            authorize_symbolic_link(target)?;
-                        }
-                        if matches!(
-                            control.fs_control_code(),
-                            super::FsControlCode::GetRetrievalPointers
-                                | super::FsControlCode::GetVolumeBitmap
-                        ) {
-                            return capture_allocation_query(target, control, generic_key());
-                        }
-                        if control.fs_control_code() == super::FsControlCode::TrimVolume {
-                            authorize_volume_management(target)?;
-                            return Ok((Self::Trim, generic_key()));
-                        }
-                        if control.fs_control_code()
-                            == super::FsControlCode::GetRetrievalPointerBase
-                        {
-                            authorize_volume_management(target)?;
-                            return Ok((Self::RetrievalPointerBase, generic_key()));
-                        }
-                        let key_control = match control.fs_control_code() {
-                            super::FsControlCode::AddEncryptionKey => Some(PreparedKeyControl::Add),
-                            super::FsControlCode::RemoveEncryptionKey => {
-                                Some(PreparedKeyControl::Remove)
-                            }
-                            _ => None,
-                        };
-                        if let Some(key_control) = key_control {
-                            authorize_volume_management(target)?;
-                            return Ok((Self::KeyControl(key_control), generic_key()));
-                        }
-                        generic_key()
+                    let verify = stack.verify_volume().map_err(IrpCompletion::from_error)?;
+                    if verify.device != target.device() {
+                        return Err(IrpCompletion::from_error(DriverError::InvalidParameter));
                     }
-                    FileSystemControlMinorFunction::Unsupported => {
-                        return Err(IrpCompletion::from_error(DriverError::InvalidDeviceRequest));
-                    }
-                };
-                Ok((Self::FileSystemControl(minor), key))
-            }
-            DispatchMajor::LockControl => Ok((Self::LockControl, generic_key())),
+                    Ok((Self::VerifyVolume(verify), QueueCancellationKey::Device))
+                }
+                FileSystemControlMinorFunction::UserFsRequest => {
+                    let control = stack
+                        .file_system_control()
+                        .map_err(IrpCompletion::from_error)?;
+                    Self::capture_user_control(target, control, generic_key())
+                }
+                FileSystemControlMinorFunction::Unsupported => {
+                    Err(IrpCompletion::from_error(DriverError::InvalidDeviceRequest))
+                }
+            },
+            DispatchMajor::LockControl => Ok((
+                Self::LockControl {
+                    releases: stack.releases_byte_range_lock(),
+                },
+                generic_key(),
+            )),
             DispatchMajor::FlushBuffers => Ok((Self::FlushBuffers, generic_key())),
             DispatchMajor::QueryEa => {
                 let query = stack.query_ea().map_err(IrpCompletion::from_error)?;
@@ -1923,8 +2081,7 @@ mod tests {
         QueueContextOwnership, decode_directory_pattern,
     };
     use crate::irp::{
-        DispatchMajor, FileSystemControlMinorFunction, IrpCompletion, KernelIrp, PendingIrp,
-        PreparedDirectoryControl, ReceivedIrp,
+        DispatchMajor, IrpCompletion, KernelIrp, PendingIrp, PreparedDirectoryControl, ReceivedIrp,
     };
 
     /// # Errors
@@ -2312,7 +2469,10 @@ mod tests {
                 ..
             }) = context
             {
-                assert!(matches!(context.prepared(), PreparedRequest::LockControl));
+                assert!(matches!(
+                    context.prepared(),
+                    PreparedRequest::LockControl { releases: false }
+                ));
                 assert!(context.matches_cancellation_context(
                     core::ptr::addr_of_mut!(file_object).cast::<c_void>()
                 ));
@@ -2423,9 +2583,7 @@ mod tests {
                     QueueContextOwnership::Captured(context)
                         if matches!(
                             context.prepared(),
-                            PreparedRequest::FileSystemControl(
-                                FileSystemControlMinorFunction::MountVolume
-                            )
+                            PreparedRequest::Mount(Err(crate::kernel::status::DriverError::InvalidParameter))
                         )
                 ));
             }
@@ -3054,6 +3212,11 @@ mod tests {
                 );
                 if let Ok(captured) = captured {
                     assert_eq!(captured.execution_class(), expected);
+                    if major == DispatchMajor::FileSystemControl {
+                        // The reactor selects the request using sealed semantics.
+                        stack.MinorFunction = u8::MAX;
+                        assert_eq!(stack.MinorFunction, u8::MAX);
+                    }
                     let device = captured.target.device;
                     let irp = captured.publish();
                     let mut owned = unsafe {

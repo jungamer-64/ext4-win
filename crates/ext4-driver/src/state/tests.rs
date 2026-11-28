@@ -9,7 +9,7 @@ use ext4_core::{ByteOffset, DeviceLength, DirectoryNodeId, FileOffset, NodeId};
 
 use crate::irp::{
     ActiveFileObject, CreateDeletion, DataIoKind, DeleteAccess, FileAttributesWriteAccess,
-    OplockControlAction, ReceivedIrp, RegularFileWriteAccess,
+    ReceivedIrp, RegularFileWriteAccess,
 };
 use crate::kernel::fatal::KernelWideInconsistency;
 use crate::kernel::status::DriverError;
@@ -1347,10 +1347,7 @@ fn oplock_control_accepts_the_exact_directory_stream() {
     if let Ok(mut received) = received {
         assert_eq!(
             received.with_active(crate::request::file_info::oplock_control),
-            Ok(crate::request::file_info::OplockControlTarget {
-                file_control_block: expected,
-                action: OplockControlAction::Grant,
-            })
+            Ok(expected)
         );
     }
 }

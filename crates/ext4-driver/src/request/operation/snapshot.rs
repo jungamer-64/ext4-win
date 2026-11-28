@@ -1,7 +1,7 @@
 //! Reversible snapshot exclusion retains one owner through Cc, journal drain and lower completion.
 
 use super::*;
-use crate::irp::{ActorRequest, DataIoKind, ExecutionClass, PreparedRequest};
+use crate::irp::{ActorRequest, DataIoKind, PreparedRequest};
 use crate::kernel::stream::{SnapshotLease, SnapshotPhase};
 use crate::memory::DriverVec;
 use crate::state::StreamCacheLease;
@@ -15,7 +15,6 @@ pub(crate) fn snapshot_should_wait(owned: &mut OwnedIrp, phase: SnapshotPhase) -
     if phase == SnapshotPhase::Open {
         return false;
     }
-    let execution = owned.execution_class();
     match owned.actor_request() {
         ActorRequest::Cleanup
         | ActorRequest::Close
@@ -26,9 +25,7 @@ pub(crate) fn snapshot_should_wait(owned: &mut OwnedIrp, phase: SnapshotPhase) -
         ActorRequest::Captured(PreparedRequest::SectionEndOfFile(_)) => {
             phase == SnapshotPhase::Frozen
         }
-        ActorRequest::Captured(PreparedRequest::LockControl) => {
-            execution != ExecutionClass::Release
-        }
+        ActorRequest::Captured(PreparedRequest::LockControl { releases }) => !releases,
         ActorRequest::Captured(PreparedRequest::Read(read))
             if read.kind() == DataIoKind::Paging =>
         {
@@ -39,25 +36,7 @@ pub(crate) fn snapshot_should_wait(owned: &mut OwnedIrp, phase: SnapshotPhase) -
         {
             phase == SnapshotPhase::Frozen
         }
-        ActorRequest::Captured(PreparedRequest::FileSystemControl(minor)) => {
-            let minor = *minor;
-            !matches!(
-                crate::request::file_system_control::classify(owned.request(), minor),
-                Ok(
-                    crate::request::file_system_control::FsControlAdmission::User(
-                        crate::irp::FsControlCode::RequestOplockLevel1
-                            | crate::irp::FsControlCode::RequestOplockLevel2
-                            | crate::irp::FsControlCode::RequestBatchOplock
-                            | crate::irp::FsControlCode::OplockBreakAcknowledge
-                            | crate::irp::FsControlCode::OplockBatchAckClosePending
-                            | crate::irp::FsControlCode::OplockBreakNotify
-                            | crate::irp::FsControlCode::OplockBreakAckNoLevel2
-                            | crate::irp::FsControlCode::RequestFilterOplock
-                            | crate::irp::FsControlCode::RequestOplock
-                    )
-                )
-            )
-        }
+        ActorRequest::Captured(PreparedRequest::OplockControl(_)) => false,
         _ => true,
     }
 }

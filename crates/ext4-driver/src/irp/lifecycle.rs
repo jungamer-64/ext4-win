@@ -8,9 +8,10 @@ mod capture;
 #[cfg(not(test))]
 pub(crate) use capture::DiskAccounting;
 pub(crate) use capture::{
-    AllocationStart, CapturedRequestorOutput, PreparedClusterControl, PreparedDirectoryControl,
-    PreparedDirectoryPattern, PreparedEaSelection, PreparedKeyControl, PreparedQueryDirectory,
-    PreparedQueryEa, PreparedRead, PreparedRequest, PreparedWrite,
+    AllocationStart, CapturedRequestorOutput, MountAdmission, PreparedClusterControl,
+    PreparedDirectoryControl, PreparedDirectoryPattern, PreparedEaSelection, PreparedFsControl,
+    PreparedKeyControl, PreparedOplockControl, PreparedQueryDirectory, PreparedQueryEa,
+    PreparedRead, PreparedRequest, PreparedSetInformation, PreparedWrite,
 };
 use capture::{QueueContext, QueueContextOwnership};
 

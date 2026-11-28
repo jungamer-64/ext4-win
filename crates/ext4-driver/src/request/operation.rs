@@ -26,6 +26,7 @@ use crate::irp::{
     NamespaceParentOplock, NamespaceParentOplockEffect, OplockCheck, OplockContinuation, OwnedIrp,
     PassiveWorkCompletion, PendingIrpLease,
 };
+use crate::irp::{MountAdmission, PreparedOplockControl};
 use crate::kernel::cng::CngOperation;
 use crate::kernel::external_journal::{ExclusiveExternalJournal, ExternalJournalCandidates};
 use crate::kernel::ffi;
@@ -36,7 +37,6 @@ use crate::kernel::storage::{
     StorageFailureClass,
 };
 use crate::memory;
-use crate::request::file_system_control::MountAdmission;
 use crate::state::{
     EpochLease, EpochPublicationSlot, EpochPublicationSlots, MountedVolumeAccess,
     MountedVolumeDevice, MountedVolumeDeviceExtension, MutationActivityLease, PendingCheckpoint,
@@ -2483,7 +2483,10 @@ impl OplockControlOperation {
     /// # Errors
     ///
     /// Returns the still-owned IRP when the target is malformed or operation allocation fails.
-    fn try_new(mut owned: OwnedIrp) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
+    fn try_new(
+        mut owned: OwnedIrp,
+        control: PreparedOplockControl,
+    ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
         let target = match owned
             .request()
             .with_active(crate::request::file_info::oplock_control)
@@ -2495,8 +2498,8 @@ impl OplockControlOperation {
             admission: crate::irp::NativeAdmissionBudget::new(),
             state: OplockControlOperationState::Ready {
                 owned,
-                file_control_block: target.file_control_block,
-                action: target.action,
+                file_control_block: target,
+                action: control.action(),
             },
         }) {
             Ok(operation) => Ok(operation),
@@ -2527,7 +2530,7 @@ impl OplockControlOperation {
             Ok(observed) => observed,
             Err(error) => return Self::complete(owned, error),
         };
-        if observed.file_control_block != expected || observed.action != action {
+        if observed != expected {
             return Self::complete(owned, DriverError::InternalInvariantViolation);
         }
         if action == crate::irp::OplockControlAction::Grant
@@ -7550,8 +7553,9 @@ pub(crate) fn byte_range_lock(
 /// Returns the still-owned IRP when target validation or allocation fails.
 pub(crate) fn oplock_control(
     owned: OwnedIrp,
+    control: PreparedOplockControl,
 ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
-    OplockControlOperation::try_new(owned)
+    OplockControlOperation::try_new(owned, control)
 }
 
 /// Allocates one barrier-driven direct-volume lifecycle operation.

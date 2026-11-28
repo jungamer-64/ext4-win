@@ -5,7 +5,8 @@ use wdk_sys::{DRIVER_OBJECT, NTSTATUS, PDEVICE_OBJECT, PDRIVER_OBJECT, PIRP};
 use crate::{
     irp::{
         ActorRequest, DataIoKind, DispatchMajor, ExecutionClass, IrpCompletion, OwnedIrp,
-        PreparedDirectoryControl, PreparedIrpCompletion, PreparedRequest, ReceivedIrp,
+        PreparedDirectoryControl, PreparedFsControl, PreparedIrpCompletion, PreparedOplockControl,
+        PreparedRequest, PreparedSetInformation, ReceivedIrp,
     },
     kernel::status::{DriverError, DriverResult},
 };
@@ -794,7 +795,7 @@ pub(crate) fn admit_owned(
         Cleanup,
         Close,
         Mdl(crate::irp::MdlTransfer),
-        Mount(super::file_system_control::MountAdmission),
+        Mount(crate::irp::MountAdmission),
         Verify(crate::irp::VerifyVolumeTarget),
         Read(ReadRequestKind),
         Directory,
@@ -805,10 +806,9 @@ pub(crate) fn admit_owned(
         Immediate(ImmediateRequestKind),
         Notification,
         ByteRangeLock,
-        OplockControl,
+        OplockControl(PreparedOplockControl),
         VolumeControl(super::operation::VolumeControlRequestKind),
         VolumeQuery,
-        FsControl(crate::irp::FileSystemControlMinorFunction),
         Unsupported,
     }
 
@@ -845,27 +845,23 @@ pub(crate) fn admit_owned(
         ActorRequest::Captured(PreparedRequest::Write(_)) => {
             Admission::Mutation(MutationRequestKind::Write)
         }
-        ActorRequest::Captured(
-            PreparedRequest::SetInformation
-            | PreparedRequest::NamespaceInformation(_)
-            | PreparedRequest::SectionEndOfFile(_),
-        ) => {
-            let admission = owned.request().with_active(|active| {
-                Ok(match active.current_stack()?.set_file()?.operation() {
-                    crate::irp::SetFileOperation::AdvanceValidDataLength => {
-                        Admission::Immediate(ImmediateRequestKind::AdvanceValidDataLength)
-                    }
-                    crate::irp::SetFileOperation::ValidDataLength => {
-                        Admission::Immediate(ImmediateRequestKind::ValidDataLength)
-                    }
-                    _ => Admission::Mutation(MutationRequestKind::SetInformation),
-                })
-            });
-            match admission {
-                Ok(admission) => admission,
-                Err(error) => return Err(AdmitOperationError::new(error, owned)),
+        ActorRequest::Captured(PreparedRequest::SetInformation(kind)) => match kind {
+            PreparedSetInformation::AdvanceValidDataLength => {
+                Admission::Immediate(ImmediateRequestKind::AdvanceValidDataLength)
             }
-        }
+            PreparedSetInformation::ValidDataLength => {
+                Admission::Immediate(ImmediateRequestKind::ValidDataLength)
+            }
+            PreparedSetInformation::Mutation => {
+                Admission::Mutation(MutationRequestKind::SetInformation)
+            }
+            PreparedSetInformation::Rejected(error) => {
+                return Err(AdmitOperationError::new(*error, owned));
+            }
+        },
+        ActorRequest::Captured(
+            PreparedRequest::NamespaceInformation(_) | PreparedRequest::SectionEndOfFile(_),
+        ) => Admission::Mutation(MutationRequestKind::SetInformation),
         ActorRequest::Captured(PreparedRequest::SetEa) => {
             Admission::Mutation(MutationRequestKind::SetEa)
         }
@@ -885,16 +881,72 @@ pub(crate) fn admit_owned(
         ActorRequest::Captured(PreparedRequest::DirectoryControl(
             PreparedDirectoryControl::NotifyChangeDirectory(_),
         )) => Admission::Notification,
-        ActorRequest::Captured(PreparedRequest::LockControl) => Admission::ByteRangeLock,
+        ActorRequest::Captured(PreparedRequest::LockControl { .. }) => Admission::ByteRangeLock,
         ActorRequest::Captured(PreparedRequest::AllocationQuery { start, .. }) => {
             Admission::Read(match start {
                 crate::irp::AllocationStart::FileVcn(_) => ReadRequestKind::GetRetrievalPointers,
                 crate::irp::AllocationStart::VolumeCluster(_) => ReadRequestKind::GetVolumeBitmap,
             })
         }
-        ActorRequest::Captured(PreparedRequest::FileSystemControl(minor)) => {
-            Admission::FsControl(*minor)
+        ActorRequest::Captured(PreparedRequest::Mount(mount)) => match mount {
+            Ok(mount) => Admission::Mount(*mount),
+            Err(error) => return Err(AdmitOperationError::new(*error, owned)),
+        },
+        ActorRequest::Captured(PreparedRequest::OplockControl(control)) => {
+            Admission::OplockControl(*control)
         }
+        ActorRequest::Captured(PreparedRequest::FileSystemControl(code)) => match code {
+            PreparedFsControl::QueryVolumeIdentity => {
+                Admission::Immediate(ImmediateRequestKind::QueryVolumeIdentity)
+            }
+            PreparedFsControl::QueryFeatures => {
+                Admission::Immediate(ImmediateRequestKind::QueryFeatures)
+            }
+            PreparedFsControl::QueryDirectoryCasefold => {
+                Admission::Read(ReadRequestKind::QueryDirectoryCasefold)
+            }
+            PreparedFsControl::SetDirectoryCasefold => {
+                Admission::Mutation(MutationRequestKind::SetDirectoryCasefold)
+            }
+            PreparedFsControl::IsVolumeDirty => {
+                Admission::Immediate(ImmediateRequestKind::IsVolumeDirty)
+            }
+            PreparedFsControl::SetZeroOnDeallocation => {
+                Admission::Mutation(MutationRequestKind::SetZeroOnDeallocation)
+            }
+            PreparedFsControl::Unsupported => Admission::Unsupported,
+            PreparedFsControl::GetReparsePoint => Admission::Read(ReadRequestKind::GetReparsePoint),
+            PreparedFsControl::SetReparsePoint => {
+                Admission::Mutation(MutationRequestKind::SetReparsePoint)
+            }
+            PreparedFsControl::DeleteReparsePoint => {
+                Admission::Mutation(MutationRequestKind::DeleteReparsePoint)
+            }
+            PreparedFsControl::EnableVerity => {
+                Admission::Mutation(MutationRequestKind::EnableVerity)
+            }
+            PreparedFsControl::GetEncryptionKeyStatus => {
+                Admission::Immediate(ImmediateRequestKind::GetEncryptionKeyStatus)
+            }
+            PreparedFsControl::LockVolume => {
+                Admission::VolumeControl(super::operation::VolumeControlRequestKind::Lock)
+            }
+            PreparedFsControl::UnlockVolume => {
+                Admission::VolumeControl(super::operation::VolumeControlRequestKind::Unlock)
+            }
+            PreparedFsControl::DismountVolume => {
+                Admission::VolumeClose(super::operation::VolumeCloseRequest::Dismount)
+            }
+            PreparedFsControl::IsVolumeMounted => {
+                Admission::VolumeControl(super::operation::VolumeControlRequestKind::IsMounted)
+            }
+            PreparedFsControl::IsPathnameValid => {
+                Admission::Immediate(ImmediateRequestKind::IsPathnameValid)
+            }
+            PreparedFsControl::AllowExtendedDasdIo => Admission::VolumeControl(
+                super::operation::VolumeControlRequestKind::AllowExtendedDasdIo,
+            ),
+        },
         ActorRequest::Captured(PreparedRequest::ClusterControl(control)) => match control {
             crate::irp::PreparedClusterControl::Move { .. } => {
                 Admission::Mutation(MutationRequestKind::MoveFile)
@@ -916,97 +968,6 @@ pub(crate) fn admit_owned(
                 crate::irp::PreparedKeyControl::Remove => MutationRequestKind::RemoveEncryptionKey,
             })
         }
-    };
-
-    let admission = match admission {
-        Admission::FsControl(minor) => {
-            let classified = match super::file_system_control::classify(owned.request(), minor) {
-                Ok(classified) => classified,
-                Err(error) => return Err(AdmitOperationError::new(error, owned)),
-            };
-            match classified {
-                super::file_system_control::FsControlAdmission::Mount(mount) => {
-                    Admission::Mount(mount)
-                }
-                super::file_system_control::FsControlAdmission::Unsupported => {
-                    Admission::Unsupported
-                }
-                super::file_system_control::FsControlAdmission::User(code) => match code {
-                    crate::irp::FsControlCode::TrimVolume => Admission::Unsupported,
-                    crate::irp::FsControlCode::QueryVolumeIdentity => {
-                        Admission::Immediate(ImmediateRequestKind::QueryVolumeIdentity)
-                    }
-                    crate::irp::FsControlCode::QueryFeatures => {
-                        Admission::Immediate(ImmediateRequestKind::QueryFeatures)
-                    }
-                    crate::irp::FsControlCode::QueryDirectoryCasefold => {
-                        Admission::Read(ReadRequestKind::QueryDirectoryCasefold)
-                    }
-                    crate::irp::FsControlCode::SetDirectoryCasefold => {
-                        Admission::Mutation(MutationRequestKind::SetDirectoryCasefold)
-                    }
-                    crate::irp::FsControlCode::RequestOplockLevel1
-                    | crate::irp::FsControlCode::RequestOplockLevel2
-                    | crate::irp::FsControlCode::RequestBatchOplock
-                    | crate::irp::FsControlCode::OplockBreakAcknowledge
-                    | crate::irp::FsControlCode::OplockBatchAckClosePending
-                    | crate::irp::FsControlCode::OplockBreakNotify
-                    | crate::irp::FsControlCode::OplockBreakAckNoLevel2
-                    | crate::irp::FsControlCode::RequestFilterOplock
-                    | crate::irp::FsControlCode::RequestOplock => Admission::OplockControl,
-                    crate::irp::FsControlCode::GetRetrievalPointers => Admission::Unsupported,
-                    crate::irp::FsControlCode::GetVolumeBitmap => Admission::Unsupported,
-                    crate::irp::FsControlCode::GetRetrievalPointerBase => Admission::Unsupported,
-                    crate::irp::FsControlCode::MoveFile | crate::irp::FsControlCode::MarkHandle => {
-                        Admission::Unsupported
-                    }
-                    crate::irp::FsControlCode::IsVolumeDirty => {
-                        Admission::Immediate(ImmediateRequestKind::IsVolumeDirty)
-                    }
-                    crate::irp::FsControlCode::MarkVolumeDirty => Admission::Unsupported,
-                    crate::irp::FsControlCode::SetZeroOnDeallocation => {
-                        Admission::Mutation(MutationRequestKind::SetZeroOnDeallocation)
-                    }
-                    crate::irp::FsControlCode::SetPurgeFailureMode => Admission::Unsupported,
-                    crate::irp::FsControlCode::GetReparsePoint => {
-                        Admission::Read(ReadRequestKind::GetReparsePoint)
-                    }
-                    crate::irp::FsControlCode::SetReparsePoint => {
-                        Admission::Mutation(MutationRequestKind::SetReparsePoint)
-                    }
-                    crate::irp::FsControlCode::DeleteReparsePoint => {
-                        Admission::Mutation(MutationRequestKind::DeleteReparsePoint)
-                    }
-                    crate::irp::FsControlCode::EnableVerity => {
-                        Admission::Mutation(MutationRequestKind::EnableVerity)
-                    }
-                    crate::irp::FsControlCode::AddEncryptionKey
-                    | crate::irp::FsControlCode::RemoveEncryptionKey => Admission::Unsupported,
-                    crate::irp::FsControlCode::GetEncryptionKeyStatus => {
-                        Admission::Immediate(ImmediateRequestKind::GetEncryptionKeyStatus)
-                    }
-                    crate::irp::FsControlCode::LockVolume => {
-                        Admission::VolumeControl(super::operation::VolumeControlRequestKind::Lock)
-                    }
-                    crate::irp::FsControlCode::UnlockVolume => {
-                        Admission::VolumeControl(super::operation::VolumeControlRequestKind::Unlock)
-                    }
-                    crate::irp::FsControlCode::DismountVolume => {
-                        Admission::VolumeClose(super::operation::VolumeCloseRequest::Dismount)
-                    }
-                    crate::irp::FsControlCode::IsVolumeMounted => Admission::VolumeControl(
-                        super::operation::VolumeControlRequestKind::IsMounted,
-                    ),
-                    crate::irp::FsControlCode::IsPathnameValid => {
-                        Admission::Immediate(ImmediateRequestKind::IsPathnameValid)
-                    }
-                    crate::irp::FsControlCode::AllowExtendedDasdIo => Admission::VolumeControl(
-                        super::operation::VolumeControlRequestKind::AllowExtendedDasdIo,
-                    ),
-                },
-            }
-        }
-        admission => admission,
     };
 
     let data_io_kind = match owned.actor_request() {
@@ -1075,9 +1036,9 @@ pub(crate) fn admit_owned(
         | Admission::Immediate(_)
         | Admission::Notification
         | Admission::ByteRangeLock
-        | Admission::OplockControl
+        | Admission::OplockControl(_)
         | Admission::VolumeControl(_) => HandleRequestClass::Ordinary,
-        Admission::FsControl(_) | Admission::Unsupported => HandleRequestClass::Device,
+        Admission::Unsupported => HandleRequestClass::Device,
     };
 
     let (operation_admission, lifecycle_publication) = if matches!(
@@ -1220,8 +1181,8 @@ pub(crate) fn admit_owned(
         Admission::ByteRangeLock => {
             target.with_mounted_access(|access| super::operation::byte_range_lock(owned, access))
         }
-        Admission::OplockControl => {
-            target.with_mounted_access(|_| super::operation::oplock_control(owned))
+        Admission::OplockControl(control) => {
+            target.with_mounted_access(|_| super::operation::oplock_control(owned, control))
         }
         Admission::Trim => {
             target.with_mounted_access(|access| super::operation::trim(owned, access))
@@ -1229,10 +1190,6 @@ pub(crate) fn admit_owned(
         Admission::VolumeControl(kind) => {
             target.with_mounted_access(|_| super::operation::volume_control(owned, kind))
         }
-        Admission::FsControl(_) => Err(AdmitOperationError::new(
-            DriverError::InternalInvariantViolation,
-            owned,
-        )),
         Admission::Unsupported => Err(AdmitOperationError::new(
             DriverError::InvalidDeviceRequest,
             owned,

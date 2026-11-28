@@ -1,48 +1,13 @@
 //! File-system-control admission and mounted lifecycle boundaries.
 
-use crate::irp::{IrpBufferLength, PendingIrpLease};
+use crate::irp::PendingIrpLease;
 use crate::kernel::status::{DriverError, DriverResult};
 use core::ptr::NonNull;
 
 use crate::state::{
-    KernelDevice, KernelFileObject, KernelVpb, MountedVolumeAccess, OpenedFileObject, OpenedVolume,
+    KernelDevice, KernelFileObject, MountedVolumeAccess, OpenedFileObject, OpenedVolume,
     VolumeControlBlock,
 };
-
-/// Pointer-free mount scalars plus stable kernel object identities.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct MountAdmission {
-    /// Filesystem control device receiving the mount.
-    file_system_device: KernelDevice,
-    /// VPB supplied by the I/O Manager.
-    vpb: KernelVpb,
-    /// Lower storage target.
-    target_device: KernelDevice,
-    /// Caller output capacity.
-    output_buffer_length: IrpBufferLength,
-}
-
-impl MountAdmission {
-    /// Filesystem control device that owns completion code.
-    pub(crate) const fn file_system_device(self) -> KernelDevice {
-        self.file_system_device
-    }
-
-    /// I/O Manager VPB retained by the mount IRP.
-    pub(crate) const fn vpb(self) -> KernelVpb {
-        self.vpb
-    }
-
-    /// Lower filesystem device selected for mount.
-    pub(crate) const fn target_device(self) -> KernelDevice {
-        self.target_device
-    }
-
-    /// Mount output capacity supplied by the I/O Manager.
-    pub(crate) const fn output_buffer_length(self) -> IrpBufferLength {
-        self.output_buffer_length
-    }
-}
 
 /// Stable direct-volume identities selected from a lifecycle FSCTL.
 #[derive(Clone, Copy, Debug)]
