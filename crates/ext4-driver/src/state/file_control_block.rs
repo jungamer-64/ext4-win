@@ -14,7 +14,7 @@ pub(crate) struct FileControlBlock {
     ///
     /// This field precedes the lock package so native callbacks are withdrawn before their bound
     /// FILE_LOCK storage is uninitialized during terminal FCB destruction.
-    pub(super) stream_context: StreamContext,
+    pub(super) stream_context: NodeStream,
     /// FsRtl-owned byte-range lock state for this opened inode identity.
     byte_range_locks: FileByteRangeLocks,
     /// Ledger-owned mutable state; accessed only under `owner`'s exclusive resource.
@@ -115,7 +115,7 @@ impl FileControlBlock {
             volume,
             owner,
             node,
-            stream_context: StreamContext::try_new_staged_node(sizes, trace)?,
+            stream_context: NodeStream::try_new_staged_node(sizes, trace)?,
             byte_range_locks: FileByteRangeLocks::new(),
             open_state: UnsafeCell::new(FileControlBlockOpenState::new()),
             _pin: PhantomPinned,
@@ -136,7 +136,7 @@ impl FileControlBlock {
             volume,
             owner,
             node: stream.node(),
-            stream_context: StreamContext::try_new_committed_node(
+            stream_context: NodeStream::try_new_committed_node(
                 stream.sizes(),
                 stream.snapshot(),
                 stream.epoch(),
@@ -157,13 +157,13 @@ impl FileControlBlock {
         unsafe_code,
         reason = "Pin and private construction establish the native FCB and FILE_LOCK lifetime"
     )]
-    pub(super) fn bind_stream_owner(self: Pin<&Self>, volume: &StreamContext) -> DriverResult<()> {
+    pub(super) fn bind_stream_owner(self: Pin<&Self>, volume: &VolumeStream) -> DriverResult<()> {
         let fcb = self.get_ref();
         unsafe {
             // SAFETY: `PhantomPinned` prevents safe relocation after this call. Field declaration
             // order keeps the native stream alive until after its bound FILE_LOCK is withdrawn.
             fcb.stream_context.bind_node_owner(
-                NonNull::from(fcb).cast::<c_void>(),
+                NonNull::from(fcb),
                 fcb.byte_range_locks.native_pointer(),
                 volume,
             )

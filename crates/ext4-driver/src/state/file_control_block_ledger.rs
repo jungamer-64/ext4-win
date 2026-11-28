@@ -370,7 +370,7 @@ impl OplockStreamLease {
         unsafe_code,
         reason = "the deferred ledger lease retains the exact FCB behind this raw stable identity"
     )]
-    pub(crate) fn stream_context(&self) -> &StreamContext {
+    pub(crate) fn stream_context(&self) -> &NodeStream {
         let fcb = unsafe {
             // SAFETY: This deferred lease prevents ledger removal of the exact retained FCB.
             self.retained.fcb.as_ref()
@@ -1824,7 +1824,7 @@ impl FileControlBlockLedger {
     pub(super) fn staged_file_control_block(
         &self,
         volume: NonNull<VolumeControlBlock>,
-        volume_stream: &StreamContext,
+        volume_stream: &VolumeStream,
         stream: StagedNodeStreamMetadata,
         trace: OperationalTrace,
     ) -> DriverResult<Pin<Box<FileControlBlock>>> {
@@ -1843,7 +1843,7 @@ impl FileControlBlockLedger {
     fn committed_file_control_block(
         &self,
         volume: NonNull<VolumeControlBlock>,
-        volume_stream: &StreamContext,
+        volume_stream: &VolumeStream,
         stream: CommittedNodeStreamMetadata,
         trace: OperationalTrace,
     ) -> DriverResult<Pin<Box<FileControlBlock>>> {
@@ -3242,9 +3242,8 @@ impl FileControlBlockLedger {
         let fcb = unsafe {
             // SAFETY: The active IRP retains its FILE_OBJECT while the caller-held ledger resource
             // prevents concurrent removal of the decoded stream owner.
-            StreamContext::decode_owner(header, StreamOwnerKind::Node)?
-        }
-        .cast::<FileControlBlock>();
+            NodeStream::decode_owner(header)?
+        };
         if !table.pointer_index(fcb).is_some() {
             return Err(DriverError::InvalidParameter);
         }
@@ -3486,7 +3485,7 @@ impl VolumeControlBlock {
             // SAFETY: `PhantomPinned` prevents safe relocation and the stream is destroyed before
             // the enclosing pinned VCB allocation is released.
             vcb.stream_context
-                .bind_volume_owner(NonNull::from(vcb).cast::<c_void>(), control_device)
+                .bind_volume_owner(NonNull::from(vcb), control_device)
         }
     }
 
@@ -3812,7 +3811,7 @@ mod index_tests {
         reason = "assertions observe current allocation identity independently from native lifetime"
     )]
     fn inode_reuse_preserves_retired_streams_until_their_own_release() -> DriverResult<()> {
-        let volume_stream = StreamContext::try_new_volume(
+        let volume_stream = VolumeStream::try_new_volume(
             StreamSizes::EMPTY,
             OperationalTrace::host_test(),
             crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,

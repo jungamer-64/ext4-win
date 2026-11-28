@@ -1345,9 +1345,8 @@ impl<'owner> OpenedObject<'owner> {
         };
         let fcb = unsafe {
             // SAFETY: The active FILE_OBJECT retains the native header and its bound inode owner.
-            StreamContext::decode_owner(header, StreamOwnerKind::Node)?
-        }
-        .cast::<FileControlBlock>();
+            NodeStream::decode_owner(header)?
+        };
         let sections = unsafe {
             // SAFETY: The same FILE_OBJECT lease retains the header's embedded section storage.
             StreamContext::decode_section_objects(header)?
@@ -1905,7 +1904,7 @@ impl<'owner> OpenedVolume<'owner> {
             .ok_or(DriverError::InternalInvariantViolation)?;
         unsafe {
             // SAFETY: Decode validated this header. FILE_OBJECT retains it and its mount target.
-            StreamContext::decode_volume_control_device(header)
+            VolumeStream::decode_volume_control_device(header)
         }
     }
     /// Decodes a direct-volume FILE_OBJECT through its advanced-header owner identity.
@@ -1931,9 +1930,8 @@ impl<'owner> OpenedVolume<'owner> {
         };
         let volume = unsafe {
             // SAFETY: The active volume FILE_OBJECT retains the native header and its VCB owner.
-            StreamContext::decode_owner(header, StreamOwnerKind::Volume)?
-        }
-        .cast::<VolumeControlBlock>();
+            VolumeStream::decode_owner(header)?
+        };
         let sections = unsafe {
             // SAFETY: The same FILE_OBJECT lease retains the header's embedded section storage.
             StreamContext::decode_section_objects(header)?

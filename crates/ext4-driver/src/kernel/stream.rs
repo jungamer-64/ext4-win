@@ -51,7 +51,7 @@ extern "system" fn ext4win_paging_ownership_corruption() -> ! {
 /// Native stream owner domain encoded beside the advanced FCB header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
-pub(crate) enum StreamOwnerKind {
+enum StreamOwnerKind {
     /// One inode-wide file stream owned by the VCB FCB ledger.
     Node = 1,
     /// The mounted raw-volume stream owned by the VCB itself.
@@ -307,8 +307,9 @@ pub(crate) struct StreamContext {
     trace: OperationalTrace,
     /// Sole section admission authority, retained by callbacks and unique mutation permits.
     sections: Shared<SectionSynchronization>,
-    /// Immutable ownership domain validated by the native boundary.
-    runtime: StreamRuntime,
+    /// Host fixtures mirror the native owner tag.
+    #[cfg(test)]
+    kind: StreamOwnerKind,
     /// Nonpaged allocation whose leading bytes are the advanced header.
     #[cfg(not(test))]
     header: NonNull<c_void>,
@@ -330,6 +331,49 @@ pub(crate) struct StreamContext {
     /// Host equivalent of the ledger-derived native metadata query fallback gate.
     #[cfg(test)]
     namespace_query_fallback: AtomicBool,
+}
+
+/// Node stream with native paging and MDL state.
+pub(crate) struct NodeStream {
+    /// Destroyed first so native callbacks release their pointers before Rust drops the state.
+    native: StreamContext,
+    /// Exact paging-map owner retained through native transfers.
+    paging: NativeAllocation<super::paging_file::PagingFile>,
+    /// Address-stable owner reserved before cache pages are exposed.
+    #[cfg(not(test))]
+    completion: core::pin::Pin<Box<crate::irp::mdl_completion::MdlCompletionQueue>>,
+}
+
+/// Direct-volume stream and its independent storage admission.
+#[derive(Debug)]
+pub(crate) struct VolumeStream {
+    /// Destroyed before storage admission, which is referenced by the native header.
+    native: StreamContext,
+    /// The native header borrows the original address of this allocation.
+    storage: NativeAllocation<StorageAdmission>,
+}
+
+impl core::fmt::Debug for NodeStream {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("NodeStream")
+            .field("native", &self.native)
+            .finish_non_exhaustive()
+    }
+}
+
+impl core::ops::Deref for NodeStream {
+    type Target = StreamContext;
+    fn deref(&self) -> &Self::Target {
+        &self.native
+    }
+}
+
+impl core::ops::Deref for VolumeStream {
+    type Target = StreamContext;
+    fn deref(&self) -> &Self::Target {
+        &self.native
+    }
 }
 
 /// Terminal PnP observations carry different mounted-device retirement authority.
@@ -743,17 +787,81 @@ impl core::fmt::Debug for StreamContext {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter
             .debug_struct("StreamContext")
-            .field("kind", &self.runtime.kind())
             .field("header", &self.header())
             .finish()
     }
 }
 
-#[expect(
-    unsafe_code,
-    reason = "the audited wrapper is the sole Rust boundary for the opaque native advanced FCB header"
+#[cfg_attr(
+    not(test),
+    expect(
+        unsafe_code,
+        reason = "the audited wrapper is the sole Rust boundary for the opaque native advanced FCB header"
+    )
 )]
 impl StreamContext {
+    /// Allocates the opaque native stream with its owner-domain-specific metadata state.
+    /// # Errors
+    ///
+    /// Returns an allocation or invariant error when the native stream cannot be constructed.
+    fn try_new(
+        kind: StreamOwnerKind,
+        #[cfg(not(test))] runtime: *mut c_void,
+        #[cfg(not(test))] paging: *mut c_void,
+        sizes: StreamSizes,
+        metadata: Option<StreamMetadata>,
+        trace: OperationalTrace,
+    ) -> DriverResult<Self> {
+        let sections = SectionSynchronization::try_new()?;
+        #[cfg(not(test))]
+        {
+            let mut header = core::ptr::null_mut();
+            let metadata_pointer = metadata
+                .as_ref()
+                .map_or(core::ptr::null(), core::ptr::from_ref);
+            let status = unsafe {
+                // SAFETY: Native code borrows the optional fixed input for this call, writes one
+                // opaque pointer on success, and owns every partial-allocation cleanup path.
+                // RustState retains the runtime's original allocation pointer; moving the runtime
+                // preserves that pointer, and StreamContext destroys the native header first.
+                ext4win_stream_create(
+                    kind.native_tag(),
+                    sizes.allocation_size,
+                    sizes.file_size,
+                    sizes.valid_data_length,
+                    sizes.allocation_charge,
+                    metadata_pointer,
+                    trace.handle(),
+                    runtime,
+                    core::ptr::from_ref(sections.get()).cast(),
+                    paging,
+                    core::ptr::addr_of_mut!(header),
+                )
+            };
+            native_status(status)?;
+            let header = NonNull::new(header).ok_or(DriverError::InternalInvariantViolation)?;
+            Ok(Self {
+                trace,
+                sections,
+                header,
+            })
+        }
+        #[cfg(test)]
+        {
+            Ok(Self {
+                trace,
+                sections,
+                kind,
+                owner: AtomicPtr::new(core::ptr::null_mut()),
+                control_device: AtomicPtr::new(core::ptr::null_mut()),
+                section_objects: UnsafeCell::new(wdk_sys::SECTION_OBJECT_POINTERS::default()),
+                sizes: Mutex::new(sizes),
+                metadata: Mutex::new(metadata),
+                namespace_query_fallback: AtomicBool::new(false),
+            })
+        }
+    }
+
     /// Balances a Filter Manager data-scan section independently of ordinary I/O admission.
     /// # Errors
     /// Returns unmatched-disable or finite section-count exhaustion before changing state.
@@ -790,6 +898,13 @@ impl StreamContext {
             }
         }
     }
+}
+
+#[expect(
+    unsafe_code,
+    reason = "the node owns the header and runtime allocations across native calls"
+)]
+impl NodeStream {
     /// Observes the archive bit from the sole coherent committed metadata projection.
     #[cfg_attr(
         not(test),
@@ -821,7 +936,7 @@ impl StreamContext {
         sizes: StreamSizes,
         trace: OperationalTrace,
     ) -> DriverResult<Self> {
-        Self::try_new(StreamRuntime::try_node()?, sizes, None, trace)
+        Self::try_new(sizes, None, trace)
     }
 
     /// Allocates a node advanced header with one coherent committed metadata projection.
@@ -838,107 +953,43 @@ impl StreamContext {
         trace: OperationalTrace,
     ) -> DriverResult<Self> {
         Self::try_new(
-            StreamRuntime::try_node()?,
             sizes,
             Some(StreamMetadata::from_snapshot(snapshot, epoch)),
             trace,
         )
     }
 
-    /// Allocates the raw-volume advanced header without a node metadata projection.
     /// # Errors
-    ///
-    /// Returns an allocation or invariant error when the native FCB boundary cannot be built.
-    pub(crate) fn try_new_volume(
-        sizes: StreamSizes,
-        trace: OperationalTrace,
-        reliability: super::io_reliability::IoReliabilityObservation,
-    ) -> DriverResult<Self> {
-        let runtime = StreamRuntime::Volume(NativeAllocation::from_box(
-            crate::memory::boxed_try_with(|| Ok(StorageAdmission::new(reliability)))?,
-        ));
-        Self::try_new(runtime, sizes, None, trace)
-    }
-
-    /// Allocates the opaque native stream with its owner-domain-specific metadata state.
-    /// # Errors
-    ///
-    /// Returns an allocation or invariant error when the native stream cannot be constructed.
+    /// Returns a native or Rust allocation failure before publishing a FILE_OBJECT.
     fn try_new(
-        runtime: StreamRuntime,
         sizes: StreamSizes,
         metadata: Option<StreamMetadata>,
         trace: OperationalTrace,
     ) -> DriverResult<Self> {
-        let sections = SectionSynchronization::try_new()?;
+        let paging = super::paging_file::PagingFile::try_new()?;
         #[cfg(not(test))]
-        {
-            let mut header = core::ptr::null_mut();
-            let metadata_pointer = metadata
-                .as_ref()
-                .map_or(core::ptr::null(), core::ptr::from_ref);
-            let status = unsafe {
-                // SAFETY: Native code borrows the optional fixed input for this call, writes one
-                // opaque pointer on success, and owns every partial-allocation cleanup path.
-                // RustState retains the runtime's original allocation pointer; moving the runtime
-                // preserves that pointer, and StreamContext destroys the native header first.
-                ext4win_stream_create(
-                    runtime.kind().native_tag(),
-                    sizes.allocation_size,
-                    sizes.file_size,
-                    sizes.valid_data_length,
-                    sizes.allocation_charge,
-                    metadata_pointer,
-                    trace.handle(),
-                    runtime.as_ptr(),
-                    core::ptr::from_ref(sections.get()).cast(),
-                    match &runtime {
-                        StreamRuntime::Node { paging, .. } => paging.address().as_ptr().cast(),
-                        StreamRuntime::Volume(_) => core::ptr::null_mut(),
-                    },
-                    core::ptr::addr_of_mut!(header),
-                )
-            };
-            native_status(status)?;
-            let header = NonNull::new(header).ok_or(DriverError::InternalInvariantViolation)?;
-            Ok(Self {
-                trace,
-                sections,
-                runtime,
-                header,
-            })
-        }
-        #[cfg(test)]
-        {
-            if (runtime.kind() == StreamOwnerKind::Volume) && metadata.is_some() {
-                return Err(DriverError::InternalInvariantViolation);
-            }
-            Ok(Self {
-                trace,
-                sections,
-                runtime,
-                owner: AtomicPtr::new(core::ptr::null_mut()),
-                control_device: AtomicPtr::new(core::ptr::null_mut()),
-                section_objects: UnsafeCell::new(wdk_sys::SECTION_OBJECT_POINTERS::default()),
-                sizes: Mutex::new(sizes),
-                metadata: Mutex::new(metadata),
-                namespace_query_fallback: AtomicBool::new(false),
-            })
-        }
+        let completion = crate::irp::mdl_completion::MdlCompletionQueue::try_new()?;
+        let native = StreamContext::try_new(
+            StreamOwnerKind::Node,
+            #[cfg(not(test))]
+            completion.as_ref().as_ptr(),
+            #[cfg(not(test))]
+            paging.address().as_ptr().cast(),
+            sizes,
+            metadata,
+            trace,
+        )?;
+        Ok(Self {
+            native,
+            paging,
+            #[cfg(not(test))]
+            completion,
+        })
     }
 
     /// Observes special-file ownership from the sole shared Rust lifecycle.
     pub(crate) fn is_paging_file(&self) -> bool {
-        self.paging_state()
-            .is_some_and(|state| state.get().is_special())
-    }
-
-    /// Borrows the node-only paging owner without granting setup or mutation authority.
-    fn paging_state(&self) -> Option<&NativeAllocation<super::paging_file::PagingFile>> {
-        match &self.runtime {
-            StreamRuntime::Node { paging, .. } => Some(paging),
-            StreamRuntime::Volume(_) => None,
-        }
+        self.paging.get().is_special()
     }
 
     /// Reserves setup while the enclosing deferred FCB lease retains every callback pointer.
@@ -969,15 +1020,13 @@ impl StreamContext {
                 return Err(DriverError::InvalidParameter);
             }
         }
-        let state = self.paging_state().ok_or(DriverError::InvalidParameter)?;
         // SAFETY: The caller's deferred FCB lease retains state and header through consumption.
-        unsafe { PagingFileReservation::acquire(state, self.header(), file, extension) }
+        unsafe { PagingFileReservation::acquire(&self.paging, self.header(), file, extension) }
     }
 
     /// Returns the acknowledged direct-I/O prefix, independently of logical EOF.
     pub(crate) fn paging_file_length(&self) -> u64 {
-        self.paging_state()
-            .map_or(0, |state| state.get().length().bytes())
+        self.paging.get().length().bytes()
     }
 
     /// Atomically binds one pinned FCB and its embedded byte-range lock package.
@@ -993,22 +1042,17 @@ impl StreamContext {
     /// Returns an invariant error if the native node stream is malformed or already bound.
     pub(crate) unsafe fn bind_node_owner(
         &self,
-        owner: NonNull<c_void>,
+        owner: NonNull<crate::state::FileControlBlock>,
         locks: NonNull<wdk_sys::FILE_LOCK>,
-        volume: &StreamContext,
+        volume: &VolumeStream,
     ) -> DriverResult<()> {
-        if self.runtime.kind() != StreamOwnerKind::Node
-            || volume.runtime.kind() != StreamOwnerKind::Volume
-        {
-            return Err(DriverError::InternalInvariantViolation);
-        }
         #[cfg(not(test))]
         {
             let status = unsafe {
                 // SAFETY: The caller establishes the pinned common lifetime documented above.
                 ext4win_stream_bind_node_owner(
                     self.header.as_ptr(),
-                    owner.as_ptr(),
+                    owner.as_ptr().cast(),
                     locks.as_ptr(),
                     volume.header.as_ptr(),
                 )
@@ -1021,7 +1065,7 @@ impl StreamContext {
             self.owner
                 .compare_exchange(
                     core::ptr::null_mut(),
-                    owner.as_ptr(),
+                    owner.as_ptr().cast(),
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
@@ -1030,26 +1074,62 @@ impl StreamContext {
         }
     }
 
+    /// Decodes the enclosing FCB through the native owner tag.
+    /// # Safety
+    /// The attached FILE_OBJECT or stream lease must retain the header and FCB.
+    /// # Errors
+    /// Rejects an unbound header or another native owner kind.
+    pub(crate) unsafe fn decode_owner(
+        header: NonNull<c_void>,
+    ) -> DriverResult<NonNull<crate::state::FileControlBlock>> {
+        unsafe {
+            // SAFETY: The caller retains this native header and the requested owner.
+            StreamContext::decode_owner(header, StreamOwnerKind::Node)
+        }
+        .map(NonNull::cast)
+    }
+}
+
+#[expect(
+    unsafe_code,
+    reason = "only the mounted volume owns storage admission and the lower route"
+)]
+impl VolumeStream {
+    /// Allocates the direct-volume header and its storage admission.
+    /// # Errors
+    /// Returns allocation or native stream initialization failure before mount publication.
+    pub(crate) fn try_new_volume(
+        sizes: StreamSizes,
+        trace: OperationalTrace,
+        reliability: super::io_reliability::IoReliabilityObservation,
+    ) -> DriverResult<Self> {
+        let storage = NativeAllocation::from_box(crate::memory::boxed_try_with(|| {
+            Ok(StorageAdmission::new(reliability))
+        })?);
+        let native = StreamContext::try_new(
+            StreamOwnerKind::Volume,
+            #[cfg(not(test))]
+            storage.address().as_ptr().cast(),
+            #[cfg(not(test))]
+            core::ptr::null_mut(),
+            sizes,
+            None,
+            trace,
+        )?;
+        Ok(Self { native, storage })
+    }
+
     /// Captures storage authority from a pinned mounted volume. Every copy must be used only
     /// while an actor/dispatch lease retains this native stream, and withdrawn before it drops.
     /// # Safety
     ///
     /// The caller must retain this volume at its current address through every capability use.
-    /// # Errors
-    ///
-    /// Rejects node streams, which cannot grant volume-wide storage submission or revocation.
-    pub(crate) unsafe fn storage_access(&self) -> DriverResult<VolumeStorageAccess> {
-        if self.runtime.kind() != StreamOwnerKind::Volume {
-            return Err(DriverError::InternalInvariantViolation);
-        }
-        let StreamRuntime::Volume(state) = &self.runtime else {
-            return Err(DriverError::InternalInvariantViolation);
-        };
-        Ok(VolumeStorageAccess {
-            state: state.address(),
+    pub(crate) unsafe fn storage_access(&self) -> VolumeStorageAccess {
+        VolumeStorageAccess {
+            state: self.storage.address(),
             #[cfg(not(test))]
             header: self.header,
-        })
+        }
     }
 
     /// Reserves the reversible PnP create gate for the sole mounted query-remove operation.
@@ -1061,7 +1141,7 @@ impl StreamContext {
         let storage = unsafe {
             // SAFETY: The caller retains this pinned volume through the returned preparation.
             self.storage_access()
-        }?;
+        };
         storage.authorize()?;
         let acquired = storage.state().prepare_query();
         if !acquired {
@@ -1075,14 +1155,12 @@ impl StreamContext {
     /// # Safety
     /// The caller must own the mounted device's PnP dispatch boundary and retain this volume
     /// at its current address through every publication under dispatch rundown.
-    /// # Errors
-    /// Rejects a node stream, which has no volume-wide removal authority.
-    pub(crate) unsafe fn storage_removal_publisher(&self) -> DriverResult<StorageRemovalPublisher> {
+    pub(crate) unsafe fn storage_removal_publisher(&self) -> StorageRemovalPublisher {
         let access = unsafe {
             // SAFETY: The caller establishes the enclosing mounted-device lifetime above.
             self.storage_access()
-        }?;
-        Ok(StorageRemovalPublisher { access })
+        };
+        StorageRemovalPublisher { access }
     }
 
     /// Excludes lower submissions while the actor commits a verified media replacement.
@@ -1098,7 +1176,7 @@ impl StreamContext {
         let access = unsafe {
             // SAFETY: The caller retains this pinned volume through the publication.
             self.storage_access()
-        }?;
+        };
         #[cfg(not(test))]
         if unsafe {
             // SAFETY: The actor holds no submission lease and the volume header is retained.
@@ -1132,19 +1210,16 @@ impl StreamContext {
     /// Returns an invariant error if the native volume stream is malformed or already bound.
     pub(crate) unsafe fn bind_volume_owner(
         &self,
-        owner: NonNull<c_void>,
+        owner: NonNull<crate::state::VolumeControlBlock>,
         control_device: crate::state::KernelDevice,
     ) -> DriverResult<()> {
-        if self.runtime.kind() != StreamOwnerKind::Volume {
-            return Err(DriverError::InternalInvariantViolation);
-        }
         #[cfg(not(test))]
         {
             let status = unsafe {
                 // SAFETY: The caller establishes the pinned enclosing lifetime documented above.
                 ext4win_stream_bind_volume_owner(
                     self.header.as_ptr(),
-                    owner.as_ptr(),
+                    owner.as_ptr().cast(),
                     control_device.as_ptr(),
                 )
             };
@@ -1155,7 +1230,7 @@ impl StreamContext {
             self.owner
                 .compare_exchange(
                     core::ptr::null_mut(),
-                    owner.as_ptr(),
+                    owner.as_ptr().cast(),
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
@@ -1186,9 +1261,9 @@ impl StreamContext {
         let device = {
             let stream = unsafe {
                 // SAFETY: Host headers identify the retained StreamContext itself.
-                header.cast::<Self>().as_ref()
+                header.cast::<StreamContext>().as_ref()
             };
-            if stream.runtime.kind() != StreamOwnerKind::Volume {
+            if stream.kind != StreamOwnerKind::Volume {
                 return Err(DriverError::InternalInvariantViolation);
             }
             stream.control_device.load(Ordering::Acquire)
@@ -1200,6 +1275,27 @@ impl StreamContext {
         .ok_or(DriverError::InternalInvariantViolation)
     }
 
+    /// Decodes the enclosing VCB through the native owner tag.
+    /// # Safety
+    /// A live FILE_OBJECT or volume lease must retain the header and VCB.
+    /// # Errors
+    /// Rejects an unbound header or another native owner kind.
+    pub(crate) unsafe fn decode_owner(
+        header: NonNull<c_void>,
+    ) -> DriverResult<NonNull<crate::state::VolumeControlBlock>> {
+        unsafe {
+            // SAFETY: The caller retains this native header and the requested owner.
+            StreamContext::decode_owner(header, StreamOwnerKind::Volume)
+        }
+        .map(NonNull::cast)
+    }
+}
+
+#[expect(
+    unsafe_code,
+    reason = "common operations require the retained advanced stream header"
+)]
+impl StreamContext {
     /// Admits a short actor control call while preserving its input on resource contention.
     /// Native callbacks may reacquire this same-thread exclusive resource recursively.
     /// # Errors
@@ -1434,7 +1530,16 @@ impl StreamContext {
                 .map_err(|_| DriverError::InternalInvariantViolation)
         }
     }
+}
 
+#[cfg_attr(
+    not(test),
+    expect(
+        unsafe_code,
+        reason = "node publication and cache transfer own their retained stream and system buffers"
+    )
+)]
+impl NodeStream {
     /// Commits one epoch-tagged node projection and reports Cache Manager separately.
     ///
     /// The native header is the commit point. A Cache Manager failure occurs after that point and
@@ -1453,9 +1558,6 @@ impl StreamContext {
         epoch: EpochSequence,
         projection: SizeProjection,
     ) -> DriverResult<StreamMetadataPublication> {
-        if self.runtime.kind() != StreamOwnerKind::Node {
-            return Err(DriverError::InternalInvariantViolation);
-        }
         let metadata = StreamMetadata::from_snapshot(snapshot, epoch);
         #[cfg(not(test))]
         {
@@ -1516,9 +1618,6 @@ impl StreamContext {
     ///
     /// Returns an invariant error when this is not a live node stream.
     pub(crate) fn set_namespace_query_fallback(&self, pending: bool) -> DriverResult<()> {
-        if self.runtime.kind() != StreamOwnerKind::Node {
-            return Err(DriverError::InternalInvariantViolation);
-        }
         #[cfg(not(test))]
         {
             let status = unsafe {
@@ -1723,7 +1822,10 @@ impl StreamContext {
             }
             let status = unsafe {
                 // SAFETY: The retained acquisition IRP owns file/stream lifetime before pages are exposed.
-                ext4win_prepare_mdl_completion(self.runtime.as_ptr(), _file_object.as_ptr())
+                ext4win_prepare_mdl_completion(
+                    self.completion.as_ref().as_ptr(),
+                    _file_object.as_ptr(),
+                )
             };
             cache_status(status)?;
             let mut admission = super::cache_transfer::WriteAdmission::new(_retrying);
@@ -1822,117 +1924,6 @@ impl StreamContext {
         }
     }
 
-    /// Flushes all dirty cached pages for this stream and observes the Cache Manager result.
-    /// # Errors
-    ///
-    /// Returns the exact Cache Manager flush status.
-    pub(crate) fn flush_cache(&self) -> DriverResult<()> {
-        #[cfg(not(test))]
-        {
-            let status = unsafe {
-                // SAFETY: `self` owns the live shared section-object set for this call.
-                ext4win_stream_cache_flush(self.header.as_ptr())
-            };
-            cache_status(status)
-        }
-        #[cfg(test)]
-        {
-            Ok(())
-        }
-    }
-
-    /// Flushes terminal cached data under exclusive stream ownership without closing handles.
-    /// # Errors
-    /// Returns native writeback failure or mapped/pinned-page conflict.
-    pub(crate) fn close_cache_writeback(&self) -> DriverResult<()> {
-        loop {
-            match self.close_cache_attempt() {
-                Ok(()) => return Ok(()),
-                Err(error) => self.await_scan_conflict(error, PurgeFailurePolicy::WaitForScans)?,
-            }
-        }
-    }
-
-    /// Releases every native resource before a mapped-section conflict may wait for scan release.
-    /// # Errors
-    /// Returns the exact native writeback or purge status.
-    fn close_cache_attempt(&self) -> DriverResult<()> {
-        #[cfg(not(test))]
-        {
-            let status = unsafe {
-                // SAFETY: The owning stream lease retains this shared native section set.
-                ext4win_stream_cache_close_writeback(self.header.as_ptr())
-            };
-            cache_status(status)
-        }
-        #[cfg(test)]
-        {
-            Ok(())
-        }
-    }
-
-    /// Flushes and purges cached data before a coherent direct mutation or size change.
-    /// # Errors
-    ///
-    /// Returns the exact Cache Manager coherency status.
-    pub(crate) fn coherency_flush_and_purge(&self, policy: PurgeFailurePolicy) -> DriverResult<()> {
-        loop {
-            match self.coherency_attempt() {
-                Ok(()) => return Ok(()),
-                Err(error) => self.await_scan_conflict(error, policy)?,
-            }
-        }
-    }
-
-    /// Performs one coherency attempt, releasing every native resource before returning.
-    /// # Errors
-    /// Returns the exact Cc/MM failure or the internal plan-revalidation status.
-    fn coherency_attempt(&self) -> DriverResult<()> {
-        #[cfg(not(test))]
-        {
-            let status = unsafe {
-                // SAFETY: `self` owns the live shared section-object set for this call.
-                ext4win_stream_cache_coherency_flush_and_purge(self.header.as_ptr())
-            };
-            cache_status(status)
-        }
-        #[cfg(test)]
-        {
-            Ok(())
-        }
-    }
-
-    /// Flushes cached data and rejects any live data or image section before volume lock.
-    /// # Errors
-    ///
-    /// Returns the exact Cache Manager exception or mapped-section conflict status.
-    pub(crate) fn drain_cache_for_volume_lock(&self) -> DriverResult<()> {
-        loop {
-            match self.drain_cache_attempt() {
-                Ok(()) => return Ok(()),
-                Err(error) => self.await_scan_conflict(error, PurgeFailurePolicy::WaitForScans)?,
-            }
-        }
-    }
-
-    /// Drains one retained native section set without retaining resources after failure.
-    /// # Errors
-    /// Returns the exact native flush or mapping conflict.
-    fn drain_cache_attempt(&self) -> DriverResult<()> {
-        #[cfg(not(test))]
-        {
-            let status = unsafe {
-                // SAFETY: `self` owns the live shared section-object set for this call.
-                ext4win_stream_cache_drain_for_volume_lock(self.header.as_ptr())
-            };
-            cache_status(status)
-        }
-        #[cfg(test)]
-        {
-            Ok(())
-        }
-    }
-
     /// Acquires one operation-specific, uniquely owned section gate through committed publication.
     /// # Errors
     /// Returns invalid execution context, storage removal, mapped/image conflict or the exact Cc/MM failure.
@@ -1941,7 +1932,8 @@ impl StreamContext {
         operation: SectionMutationOperation,
         policy: PurgeFailurePolicy,
     ) -> DriverResult<SealedSectionMutation> {
-        if let Some(state) = self.paging_state().filter(|state| state.get().is_special()) {
+        let state = self.paging.get();
+        if state.is_special() {
             let mutation = match operation {
                 SectionMutationOperation::Resize(sizes)
                 | SectionMutationOperation::Reset(sizes) => {
@@ -1953,7 +1945,7 @@ impl StreamContext {
                 SectionMutationOperation::Delete => super::paging_file::PagingMutation::Delete,
                 _ => return Err(DriverError::NotSupported),
             };
-            if !state.get().permits_mutation(mutation) {
+            if !state.permits_mutation(mutation) {
                 return Err(DriverError::NotSupported);
             }
         }
@@ -2081,6 +2073,123 @@ impl StreamContext {
         self.trace
             .record_result(OperationalPath::MappedSection, &result);
         result
+    }
+}
+
+#[expect(
+    unsafe_code,
+    reason = "native stream resources stay live through synchronous common operations"
+)]
+impl StreamContext {
+    /// Flushes all dirty cached pages for this stream and observes the Cache Manager result.
+    /// # Errors
+    ///
+    /// Returns the exact Cache Manager flush status.
+    pub(crate) fn flush_cache(&self) -> DriverResult<()> {
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: `self` owns the live shared section-object set for this call.
+                ext4win_stream_cache_flush(self.header.as_ptr())
+            };
+            cache_status(status)
+        }
+        #[cfg(test)]
+        {
+            Ok(())
+        }
+    }
+
+    /// Flushes terminal cached data under exclusive stream ownership without closing handles.
+    /// # Errors
+    /// Returns native writeback failure or mapped/pinned-page conflict.
+    pub(crate) fn close_cache_writeback(&self) -> DriverResult<()> {
+        loop {
+            match self.close_cache_attempt() {
+                Ok(()) => return Ok(()),
+                Err(error) => self.await_scan_conflict(error, PurgeFailurePolicy::WaitForScans)?,
+            }
+        }
+    }
+
+    /// Releases every native resource before a mapped-section conflict may wait for scan release.
+    /// # Errors
+    /// Returns the exact native writeback or purge status.
+    fn close_cache_attempt(&self) -> DriverResult<()> {
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: The owning stream lease retains this shared native section set.
+                ext4win_stream_cache_close_writeback(self.header.as_ptr())
+            };
+            cache_status(status)
+        }
+        #[cfg(test)]
+        {
+            Ok(())
+        }
+    }
+
+    /// Flushes and purges cached data before a coherent direct mutation or size change.
+    /// # Errors
+    ///
+    /// Returns the exact Cache Manager coherency status.
+    pub(crate) fn coherency_flush_and_purge(&self, policy: PurgeFailurePolicy) -> DriverResult<()> {
+        loop {
+            match self.coherency_attempt() {
+                Ok(()) => return Ok(()),
+                Err(error) => self.await_scan_conflict(error, policy)?,
+            }
+        }
+    }
+
+    /// Performs one coherency attempt, releasing every native resource before returning.
+    /// # Errors
+    /// Returns the exact Cc/MM failure or the internal plan-revalidation status.
+    fn coherency_attempt(&self) -> DriverResult<()> {
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: `self` owns the live shared section-object set for this call.
+                ext4win_stream_cache_coherency_flush_and_purge(self.header.as_ptr())
+            };
+            cache_status(status)
+        }
+        #[cfg(test)]
+        {
+            Ok(())
+        }
+    }
+
+    /// Flushes cached data and rejects any live data or image section before volume lock.
+    /// # Errors
+    ///
+    /// Returns the exact Cache Manager exception or mapped-section conflict status.
+    pub(crate) fn drain_cache_for_volume_lock(&self) -> DriverResult<()> {
+        loop {
+            match self.drain_cache_attempt() {
+                Ok(()) => return Ok(()),
+                Err(error) => self.await_scan_conflict(error, PurgeFailurePolicy::WaitForScans)?,
+            }
+        }
+    }
+
+    /// Drains one retained native section set without retaining resources after failure.
+    /// # Errors
+    /// Returns the exact native flush or mapping conflict.
+    fn drain_cache_attempt(&self) -> DriverResult<()> {
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: `self` owns the live shared section-object set for this call.
+                ext4win_stream_cache_drain_for_volume_lock(self.header.as_ptr())
+            };
+            cache_status(status)
+        }
+        #[cfg(test)]
+        {
+            Ok(())
+        }
     }
 
     /// Borrows the exact native main resource from this retained opaque header.
@@ -2270,7 +2379,7 @@ impl StreamContext {
     ///
     /// `header` must come from a live `StreamContext`. The corresponding FILE_OBJECT/stream
     /// lease must retain both that context and its bound owner while the returned pointer is used.
-    pub(crate) unsafe fn decode_owner(
+    unsafe fn decode_owner(
         header: NonNull<c_void>,
         expected_kind: StreamOwnerKind,
     ) -> DriverResult<NonNull<c_void>> {
@@ -2295,7 +2404,7 @@ impl StreamContext {
                 // SAFETY: Test FILE_OBJECT fixtures only receive a pointer from `Self::header`.
                 stream.as_ref()
             };
-            if stream.runtime.kind() != expected_kind {
+            if stream.kind != expected_kind {
                 return Err(DriverError::InternalInvariantViolation);
             }
             NonNull::new(stream.owner.load(Ordering::Acquire))
@@ -2334,9 +2443,8 @@ pub(crate) fn fast_io_dispatch(
     unsafe_code,
     reason = "the opaque native header uses internally synchronized resources and immutable owner identity after publication"
 )]
-// SAFETY: Native FsRtl/ERESOURCE/OPLOCK state supplies its own synchronization. Rust only reads the
-// immutable kind/header identity after the single construction-time owner binding. Runtime
-// storage keeps its original allocation pointer across owner moves and outlives native destruction.
+// SAFETY: FsRtl and the native resources synchronize shared header state. The containing node or
+// volume owner destroys the header before releasing the allocations it borrows.
 unsafe impl Send for StreamContext {}
 
 #[expect(
@@ -2648,7 +2756,7 @@ mod tests {
                 crate::state::KernelDevice::from_raw(core::ptr::from_mut(&mut raw_device))
             }
             .ok_or(DriverError::InvalidParameter)?;
-            let volume = StreamContext::try_new_volume(
+            let volume = VolumeStream::try_new_volume(
                 StreamSizes::EMPTY,
                 OperationalTrace::host_test(),
                 crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
@@ -2656,7 +2764,7 @@ mod tests {
             let storage = unsafe {
                 // SAFETY: This volume stays live and unmoved through every captured capability.
                 volume.storage_access()
-            }?;
+            };
             storage.bind_verification_device(
                 crate::kernel::volume_verify::VerificationDevice::reference(device),
             )?;
@@ -2667,7 +2775,7 @@ mod tests {
             let publisher = unsafe {
                 // SAFETY: The fixture owns PnP publication until its volume is dropped.
                 volume.storage_removal_publisher()
-            }?;
+            };
             if remove_before_confirmation {
                 publisher.publish(super::StorageRemovalNotification::Surprise);
                 assert_eq!(storage.authorize_create(), Err(DriverError::DeviceRemoved));
@@ -2700,7 +2808,7 @@ mod tests {
     fn scan_conflicts_follow_the_windows_request_policy() -> DriverResult<()> {
         use super::{PurgeFailurePolicy, ScanSectionChange};
         let stream =
-            StreamContext::try_new_staged_node(StreamSizes::EMPTY, OperationalTrace::host_test())?;
+            NodeStream::try_new_staged_node(StreamSizes::EMPTY, OperationalTrace::host_test())?;
         let conflict = DriverError::CacheManagerFailure(wdk_sys::STATUS_USER_MAPPED_FILE);
         assert_eq!(
             stream.await_scan_conflict(conflict, PurgeFailurePolicy::FilterRetry),
@@ -2743,7 +2851,7 @@ mod tests {
     )]
     fn key_removal_exclusion_lasts_until_lease_release() -> DriverResult<()> {
         let owner = crate::kernel::io_reliability::IoReliabilityOwner::try_new()?;
-        let volume = StreamContext::try_new_volume(
+        let volume = VolumeStream::try_new_volume(
             StreamSizes::EMPTY,
             OperationalTrace::host_test(),
             owner.observe()?,
@@ -2751,7 +2859,7 @@ mod tests {
         let storage = unsafe {
             // SAFETY: The local volume remains unmoved and alive until its last lease is released.
             volume.storage_access()
-        }?;
+        };
         let lease = storage.begin_key_removal()?;
         assert!(!storage.state().creates_admitted());
         assert_eq!(
@@ -2770,7 +2878,9 @@ mod tests {
     }
     use ext4_core::{ClusterSize, FileAllocationSize, FileSize};
 
-    use super::{OperationalTrace, Ordering, StreamContext, StreamMetadata, StreamSizes};
+    use super::{
+        NodeStream, OperationalTrace, Ordering, StreamMetadata, StreamSizes, VolumeStream,
+    };
     use crate::kernel::status::{DriverError, DriverResult};
 
     /// # Errors
@@ -2787,7 +2897,7 @@ mod tests {
         reason = "fallible fixture setup precedes semantic admission assertions"
     )]
     fn close_admission_drains_paging_before_sealing() -> DriverResult<()> {
-        let volume = StreamContext::try_new_volume(
+        let volume = VolumeStream::try_new_volume(
             StreamSizes::EMPTY,
             OperationalTrace::host_test(),
             crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
@@ -2795,7 +2905,7 @@ mod tests {
         let storage = unsafe {
             // SAFETY: This fixture remains live and unmoved until all captured access ends.
             volume.storage_access()
-        }?;
+        };
         storage.begin_close_writeback()?;
         assert_eq!(storage.authorize_create(), Err(DriverError::AccessDenied));
         assert_eq!(storage.authorize_paging(), Ok(()));
@@ -2831,7 +2941,7 @@ mod tests {
     )]
     fn query_removal_closes_creates_and_cancellation_preserves_terminal_removal() -> DriverResult<()>
     {
-        let volume = StreamContext::try_new_volume(
+        let volume = VolumeStream::try_new_volume(
             StreamSizes::EMPTY,
             OperationalTrace::host_test(),
             crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
@@ -2839,11 +2949,11 @@ mod tests {
         let storage = unsafe {
             // SAFETY: The fixture stays at this address until all capabilities are consumed.
             volume.storage_access()
-        }?;
+        };
         let publisher = unsafe {
             // SAFETY: The fixture owns PnP publication and retains its volume throughout the test.
             volume.storage_removal_publisher()
-        }?;
+        };
         let mut lower_device = wdk_sys::DEVICE_OBJECT::default();
         let lower = unsafe {
             // SAFETY: This local device remains live through every host lower-reply observation.
@@ -2915,7 +3025,7 @@ mod tests {
         reason = "fixture construction is fallible; assertions verify removal semantics"
     )]
     fn storage_removal_is_terminal_and_distinguishes_final_remove() -> DriverResult<()> {
-        let volume = StreamContext::try_new_volume(
+        let volume = VolumeStream::try_new_volume(
             StreamSizes::EMPTY,
             OperationalTrace::host_test(),
             crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
@@ -2923,11 +3033,11 @@ mod tests {
         let storage = unsafe {
             // SAFETY: The volume remains live at this stack location until all accesses end.
             volume.storage_access()
-        }?;
+        };
         let publisher = unsafe {
             // SAFETY: The fixture is the sole removal owner and retains its local volume.
             volume.storage_removal_publisher()
-        }?;
+        };
         assert_eq!(storage.authorize(), Ok(()));
         drop(storage.acquire_submission()?);
         publisher.publish(super::StorageRemovalNotification::Surprise);
@@ -2971,7 +3081,7 @@ mod tests {
         reason = "fixture construction is fallible; assertions verify replacement semantics"
     )]
     fn media_replacement_is_terminal_and_permits_retirement_without_removal() -> DriverResult<()> {
-        let volume = StreamContext::try_new_volume(
+        let volume = VolumeStream::try_new_volume(
             StreamSizes::EMPTY,
             OperationalTrace::host_test(),
             crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
@@ -2979,11 +3089,11 @@ mod tests {
         let storage = unsafe {
             // SAFETY: The volume remains live at this stack location until all accesses end.
             volume.storage_access()
-        }?;
+        };
         let publisher = unsafe {
             // SAFETY: The fixture is the sole removal owner and retains its local volume.
             volume.storage_removal_publisher()
-        }?;
+        };
         let replace = || unsafe {
             // SAFETY: The fixture is the sole actor and retains its local volume.
             volume.with_media_replacement(|replacement| {
@@ -3141,7 +3251,7 @@ mod tests {
     )]
     fn staged_stream_withholds_fast_query_metadata() -> DriverResult<()> {
         let stream =
-            StreamContext::try_new_staged_node(StreamSizes::EMPTY, OperationalTrace::host_test())?;
+            NodeStream::try_new_staged_node(StreamSizes::EMPTY, OperationalTrace::host_test())?;
         assert_eq!(stream.sizes()?, StreamSizes::EMPTY);
         assert!(!stream.archive_is_set());
         assert!(
@@ -3178,7 +3288,7 @@ mod tests {
     )]
     fn namespace_query_fallback_projection_tracks_each_requested_state() -> DriverResult<()> {
         let stream =
-            StreamContext::try_new_staged_node(StreamSizes::EMPTY, OperationalTrace::host_test())?;
+            NodeStream::try_new_staged_node(StreamSizes::EMPTY, OperationalTrace::host_test())?;
         assert!(!stream.namespace_query_fallback.load(Ordering::Acquire));
         stream.set_namespace_query_fallback(true)?;
         assert!(stream.namespace_query_fallback.load(Ordering::Acquire));
@@ -3235,13 +3345,13 @@ mod tests {
         reason = "fallible native setup precedes lease assertions"
     )]
     fn snapshot_lease_releases_only_its_own_reversible_gate() -> DriverResult<()> {
-        let volume = StreamContext::try_new_volume(
+        let volume = VolumeStream::try_new_volume(
             StreamSizes::EMPTY,
             OperationalTrace::host_test(),
             crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
         )?;
         // SAFETY: The volume allocation outlives every admission lease and observation below.
-        let storage = unsafe { volume.storage_access() }?;
+        let storage = unsafe { volume.storage_access() };
         let lease = storage.begin_snapshot()?;
         assert_eq!(storage.snapshot_phase(), super::SnapshotPhase::Draining);
         assert!(storage.begin_snapshot().is_err());
@@ -3251,7 +3361,7 @@ mod tests {
         lease.seal();
         assert_eq!(storage.snapshot_phase(), super::SnapshotPhase::Frozen);
         // SAFETY: This same scoped volume retains the independent PnP publisher.
-        unsafe { volume.storage_removal_publisher() }?
+        unsafe { volume.storage_removal_publisher() }
             .publish(super::StorageRemovalNotification::Surprise);
         drop(lease);
         assert_eq!(storage.snapshot_phase(), super::SnapshotPhase::Open);

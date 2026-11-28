@@ -170,7 +170,7 @@ mod tests {
         reason = "setup returns errors while assertions verify terminal writeback retention"
     )]
     fn close_writeback_retains_active_streams_through_last_close() -> DriverResult<()> {
-        let volume_stream = StreamContext::try_new_volume(
+        let volume_stream = VolumeStream::try_new_volume(
             StreamSizes::EMPTY,
             OperationalTrace::host_test(),
             crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
@@ -234,7 +234,7 @@ mod tests {
         reason = "fallible setup surrounds dismount-admission assertions"
     )]
     fn paging_setup_excludes_dismount_until_its_reservation_is_aborted() -> DriverResult<()> {
-        let stream = StreamContext::try_new_volume(
+        let stream = VolumeStream::try_new_volume(
             StreamSizes::EMPTY,
             OperationalTrace::host_test(),
             crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,

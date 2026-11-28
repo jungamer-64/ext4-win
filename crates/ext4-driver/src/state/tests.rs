@@ -825,10 +825,10 @@ fn test_file_control_block(
     node: NodeId,
 ) -> (
     Pin<Box<FileControlBlock>>,
-    Box<crate::kernel::stream::StreamContext>,
+    Box<crate::kernel::stream::VolumeStream>,
 ) {
     let volume_stream = crate::memory::boxed_try_with(|| {
-        crate::kernel::stream::StreamContext::try_new_volume(
+        crate::kernel::stream::VolumeStream::try_new_volume(
             crate::kernel::stream::StreamSizes::EMPTY,
             crate::kernel::operational_trace::OperationalTrace::host_test(),
             crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
@@ -1872,7 +1872,7 @@ fn stream_lifetime_separates_handles_native_residency_and_deferred_leases() {
 )]
 fn volume_lock_cache_drain_retains_every_stream_until_worker_completion() -> Result<(), DriverError>
 {
-    let volume_stream = crate::kernel::stream::StreamContext::try_new_volume(
+    let volume_stream = crate::kernel::stream::VolumeStream::try_new_volume(
         crate::kernel::stream::StreamSizes::EMPTY,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
         crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
@@ -1931,7 +1931,7 @@ fn volume_lock_cache_drain_retains_every_stream_until_worker_completion() -> Res
     reason = "fixture failures use Result; assertions verify the paging stream boundary"
 )]
 fn paging_stream_admission_uses_shared_fcb_identity_without_a_ccb() -> Result<(), DriverError> {
-    let volume_stream = crate::kernel::stream::StreamContext::try_new_volume(
+    let volume_stream = crate::kernel::stream::VolumeStream::try_new_volume(
         crate::kernel::stream::StreamSizes::EMPTY,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
         crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
@@ -1979,7 +1979,7 @@ fn paging_stream_admission_uses_shared_fcb_identity_without_a_ccb() -> Result<()
     reason = "fixture failures return Result while assertions check exact FILE_OBJECT authority"
 )]
 fn private_cache_teardown_requires_the_retained_file_object() -> Result<(), DriverError> {
-    let volume_stream = crate::kernel::stream::StreamContext::try_new_volume(
+    let volume_stream = crate::kernel::stream::VolumeStream::try_new_volume(
         crate::kernel::stream::StreamSizes::EMPTY,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
         crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
@@ -2036,7 +2036,7 @@ fn private_cache_teardown_requires_the_retained_file_object() -> Result<(), Driv
     reason = "fixture failures use Result; assertions verify deferred oplock stream residency"
 )]
 fn oplock_stream_lease_retains_fcb_until_continuation_releases() -> Result<(), DriverError> {
-    let volume_stream = crate::kernel::stream::StreamContext::try_new_volume(
+    let volume_stream = crate::kernel::stream::VolumeStream::try_new_volume(
         crate::kernel::stream::StreamSizes::EMPTY,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
         crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
@@ -2089,7 +2089,7 @@ fn oplock_stream_lease_retains_fcb_until_continuation_releases() -> Result<(), D
     reason = "fixture failures use Result; assertions verify atomic oplock mutation admission"
 )]
 fn oplock_mutation_pair_blocks_grants_until_mutation_release() -> Result<(), DriverError> {
-    let volume_stream = crate::kernel::stream::StreamContext::try_new_volume(
+    let volume_stream = crate::kernel::stream::VolumeStream::try_new_volume(
         crate::kernel::stream::StreamSizes::EMPTY,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
         crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
@@ -2161,7 +2161,7 @@ fn oplock_mutation_pair_blocks_grants_until_mutation_release() -> Result<(), Dri
     reason = "fixture failures use Result; assertions verify node-scoped parent oplock authority"
 )]
 fn parent_oplock_mutation_spans_zero_fcb_residency() -> Result<(), DriverError> {
-    let volume_stream = crate::kernel::stream::StreamContext::try_new_volume(
+    let volume_stream = crate::kernel::stream::VolumeStream::try_new_volume(
         crate::kernel::stream::StreamSizes::EMPTY,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
         crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,

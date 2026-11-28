@@ -367,7 +367,7 @@ impl MountedVolumeDevice {
                 .ok_or(DriverError::InvalidParameter)?;
         let storage = unsafe {
             // SAFETY: The pinned VCB outlives every reactor/dispatch lease on this extension.
-            binding.volume().stream_context.storage_access()?
+            binding.volume().stream_context.storage_access()
         };
         let verification_device = {
             let _lock = VpbSpinLock::acquire();
@@ -381,10 +381,7 @@ impl MountedVolumeDevice {
         storage.bind_verification_device(verification_device)?;
         let removal = unsafe {
             // SAFETY: This mount installs the sole PnP publisher under device dispatch rundown.
-            binding
-                .volume()
-                .stream_context
-                .storage_removal_publisher()?
+            binding.volume().stream_context.storage_removal_publisher()
         };
         let lower = binding.actor.runtime.storage().filesystem_control_device();
         let storage_slot = unsafe {
@@ -2254,7 +2251,7 @@ mod tests {
                 }
                 let withdrawn = fixture.real.Vpb;
                 fixture.real.Flags = wdk_sys::DO_VERIFY_VOLUME | 0x4000;
-                let stream = crate::kernel::stream::StreamContext::try_new_volume(
+                let stream = crate::kernel::stream::VolumeStream::try_new_volume(
                     crate::kernel::stream::StreamSizes::EMPTY,
                     crate::kernel::operational_trace::OperationalTrace::host_test(),
                     crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
@@ -2262,7 +2259,7 @@ mod tests {
                 let storage = unsafe {
                     // SAFETY: The local stream remains live through the test.
                     stream.storage_access()
-                }?;
+                };
                 let result = unsafe {
                     // SAFETY: The fixture is the sole actor and retains the local stream.
                     stream.with_media_replacement(|replacement| {

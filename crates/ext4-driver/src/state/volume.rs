@@ -19,7 +19,7 @@ pub(crate) struct VolumeControlBlock {
     /// the mounted volume because every FCB retains that volume as its data-plane owner.
     pub(super) file_control_blocks: FileControlBlockLedger,
     /// Header-based stream identity used by every direct volume FILE_OBJECT.
-    pub(super) stream_context: StreamContext,
+    pub(super) stream_context: VolumeStream,
     /// Prevents the native direct-volume owner address from being invalidated by a safe move.
     pub(super) _pin: PhantomPinned,
 }
@@ -605,7 +605,7 @@ impl MountedVolumeBinding {
                 trace,
                 directory_change_notifier: DirectoryChangeNotifier::uninitialized(),
                 file_control_blocks: FileControlBlockLedger::try_new()?,
-                stream_context: StreamContext::try_new_volume(
+                stream_context: VolumeStream::try_new_volume(
                     StreamSizes::EMPTY,
                     trace,
                     actor.runtime.observe_reliability()?,
@@ -752,7 +752,6 @@ impl MountedVolumeAccess<'_> {
             // SAFETY: The mounted actor owns the pinned VCB until terminal reactor join.
             self.volume.stream_context.storage_access()
         }
-        .unwrap_or_else(|_| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck())
     }
 
     /// Rejects native storage that has received a terminal PnP notification.

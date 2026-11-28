@@ -46,7 +46,7 @@ use crate::kernel::operational_trace::OperationalTrace;
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::kernel::storage::{MountedStorage, MountedStorageRoute};
 use crate::kernel::stream::{
-    SizeProjection, StreamContext, StreamMetadataPublication, StreamOwnerKind, StreamSizes,
+    NodeStream, SizeProjection, StreamContext, StreamMetadataPublication, StreamSizes, VolumeStream,
 };
 use crate::memory::{self, DriverVec, InPlaceInitialization};
 
