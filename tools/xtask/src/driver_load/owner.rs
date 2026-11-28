@@ -563,23 +563,25 @@ fn install_bundle(
     session.publish(Phase::Observed(Operation::InstallPackage))
 }
 
-/// Reinstalls the exact completed session's package for a new load without disposable storage.
+/// Reinstalls the exact completed session's package for a new disposable volume.
 /// # Errors
 /// Returns incomplete prior cleanup, stale package identity, or install failures.
 pub(crate) fn reinstall_completed_package(
     root: &Path,
     completed: &SessionId,
     id: SessionId,
+    scope: &crate::storage::DisposablePartition,
 ) -> TaskResult<()> {
     let session = recovered(root, completed)?;
     if session.phase() != Phase::Complete
         || !matches!(session.state().package, PackageState::Removed(_))
     {
-        return Err(
-            io::Error::other("startup verification requires a completed package session").into(),
-        );
+        return Err(io::Error::other(
+            "package reuse requires a completed installation and removal",
+        )
+        .into());
     }
-    install_bundle(root, session.state().bundle.clone(), id, None)
+    install_bundle(root, session.state().bundle.clone(), id, Some(scope))
 }
 
 /// Admits activation only from a completed, independently bound installation.

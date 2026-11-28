@@ -851,25 +851,14 @@ jobs:
           ./.github/scripts/invoke-cargo-with-log.ps1 -LogPath target/live-vhdx-ci.log -CargoArguments @('xtask', 'verify-live-vhdx', $env:LIVE_VHDX_SESSION)
           exit $LASTEXITCODE
 
-      - name: Verify startup with Driver Verifier active before image load
+      - name: Verify live filesystem I/O with Deadlock Detection active from driver load
         if: env.EXT4WIN_DRIVER_SCENARIO == 'live'
-        timeout-minutes: 10
+        timeout-minutes: 150
         shell: pwsh
         run: |
-          $startupId = [Guid]::NewGuid().ToString("N")
-          "DRIVER_STARTUP_SESSION=$startupId" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          ./.github/scripts/invoke-cargo-with-log.ps1 -LogPath target/driver-startup-ci.log -CargoArguments @('xtask', 'verify-hosted-driver-startup', $env:LIVE_VHDX_SESSION, $startupId)
+          $deadlockId = [Guid]::NewGuid().ToString("N")
+          ./.github/scripts/invoke-cargo-with-log.ps1 -LogPath target/live-deadlock-ci.log -CargoArguments @('xtask', 'verify-live-vhdx-deadlock', $env:LIVE_VHDX_SESSION, $deadlockId)
           exit $LASTEXITCODE
-
-      - name: Reconcile interrupted startup session
-        if: always() && env.DRIVER_STARTUP_SESSION != ''
-        timeout-minutes: 10
-        shell: pwsh
-        run: |
-          if (Test-Path -LiteralPath "target/driver-load-sessions/$env:DRIVER_STARTUP_SESSION") {
-            cargo xtask cleanup-driver-load-session $env:DRIVER_STARTUP_SESSION
-            exit $LASTEXITCODE
-          }
 
       - name: Reconcile interrupted live sessions
         if: always()
@@ -908,7 +897,7 @@ jobs:
           path: |
             target/sdk*.log
             target/driver-load-ci.log
-            target/driver-startup-ci.log
+            target/live-deadlock-ci.log
             target/live-vhdx-ci.log
             target/live-driver-trace/*.etl
             target/live-vhdx-sessions/**/*.json
