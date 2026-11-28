@@ -360,10 +360,7 @@ pub(crate) struct StorageTranscript {
     length: DeviceLength,
     /// Completed exact reads available to later resolve passes.
     completed_reads: Vec<CompletedRead>,
-    /// Request built by the current pass but not yet moved into an envelope.
-    pending_request: Option<(StorageRequest, Option<crate::volume::CacheReadStamp>)>,
-    /// Request currently owned by a lower-I/O envelope.
-    in_flight: Option<InFlightRead>,
+
 }
 
 impl StorageTranscript {
