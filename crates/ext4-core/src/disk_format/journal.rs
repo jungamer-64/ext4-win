@@ -1008,18 +1008,7 @@ impl JournalRecoveryOperation {
             return Err(Error::ChecksumMismatch);
         }
         let phase = if already_clean {
-            match (policy, journal.data.geometry.fast_commits()?) {
-                (RecoveryPolicy::Replay, Some(area)) if area.first < area.end => {
-                    RecoveryPhase::InspectFastCommit {
-                        logical: area.first,
-                        authenticator: FrameAuthenticator::new(
-                            start_sequence,
-                            journal.data.geometry.block_size,
-                        )?,
-                    }
-                }
-                _ => RecoveryPhase::Complete,
-            }
+            RecoveryPhase::Complete
         } else {
             RecoveryPhase::Scan
         };
