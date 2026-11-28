@@ -1,6 +1,6 @@
 //! File-system-control admission and mounted lifecycle boundaries.
 
-use crate::irp::{FileSystemControlMinorFunction, FsControlCode, IrpBufferLength, PendingIrpLease};
+use crate::irp::{IrpBufferLength, PendingIrpLease};
 use crate::kernel::status::{DriverError, DriverResult};
 use core::ptr::NonNull;
 
@@ -8,17 +8,6 @@ use crate::state::{
     KernelDevice, KernelFileObject, KernelVpb, MountedVolumeAccess, OpenedFileObject, OpenedVolume,
     VolumeControlBlock,
 };
-
-/// Owned classification copied from an FSCTL stack before operation allocation.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum FsControlAdmission {
-    /// I/O Manager mount request with stable kernel identities pinned by the top-level IRP.
-    Mount(MountAdmission),
-    /// User request selected by its typed control code.
-    User(FsControlCode),
-    /// Minor function not owned by ext4win.
-    Unsupported,
-}
 
 /// Pointer-free mount scalars plus stable kernel object identities.
 #[derive(Clone, Copy, Debug)]
@@ -81,33 +70,6 @@ impl DirectVolumeTarget {
     pub(crate) const fn owner(self) -> KernelFileObject {
         self.owner
     }
-}
-
-/// Classifies one captured filesystem-control request without retaining an IRP-internal pointer.
-/// # Errors
-///
-/// Returns an error when the current stack cannot be decoded as its captured minor function.
-pub(crate) fn classify(
-    mut request: PendingIrpLease<'_>,
-    minor: FileSystemControlMinorFunction,
-) -> DriverResult<FsControlAdmission> {
-    request.with_active(|active| match minor {
-        FileSystemControlMinorFunction::MountVolume => {
-            let stack = active.current_stack()?.mount_volume()?;
-            Ok(FsControlAdmission::Mount(MountAdmission {
-                file_system_device: active.device(),
-                vpb: stack.vpb(),
-                target_device: stack.target_device(),
-                output_buffer_length: stack.output_buffer_length(),
-            }))
-        }
-        FileSystemControlMinorFunction::UserFsRequest => {
-            let stack = active.current_stack()?.file_system_control()?;
-            Ok(FsControlAdmission::User(stack.fs_control_code()))
-        }
-        FileSystemControlMinorFunction::Unsupported => Ok(FsControlAdmission::Unsupported),
-        FileSystemControlMinorFunction::VerifyVolume => Err(DriverError::InvalidDeviceRequest),
-    })
 }
 
 /// Authorizes one path-scoped FSCTL against the live opened handle.
