@@ -3772,8 +3772,6 @@ struct PendingDriverPublication {
 /// Post-commit driver publication whose durable path cannot allocate or fail.
 #[derive(Debug)]
 struct PreparedDriverPublication {
-    /// Every changed live inode's complete projection, derived from the reserved core mutation.
-    stream_metadata: crate::state::PreparedStreamMetadataPublications,
     /// Handle, cursor, notification, or volume state published after stream metadata.
     effect: PreparedDriverEffect,
     /// Prepared notifications become observable only after durable epoch publication.
@@ -3869,7 +3867,6 @@ impl PendingDriverPublication {
     /// state. No partially prepared value has publication authority on failure.
     fn prepare(
         self,
-        stream_metadata: crate::state::PreparedStreamMetadataPublications,
         operations: &MountedVolumeAccess<'_>,
     ) -> DriverResult<PreparedDriverPublication> {
         let effect = match self.effect {
@@ -3889,7 +3886,6 @@ impl PendingDriverPublication {
             PendingDriverEffect::Normal(completion) => PreparedDriverEffect::Normal(completion),
         };
         Ok(PreparedDriverPublication {
-            stream_metadata,
             effect,
             changes: self.changes,
         })
@@ -3945,10 +3941,8 @@ struct CommitContext {
     durable_slot: EpochPublicationSlot,
     /// Pre-reserved checkpoint epoch slot.
     checkpoint_slot: EpochPublicationSlot,
-    /// Native cache/section gate retained until durable stream-size publication completes.
-    size_changes: Option<crate::state::PreparedStreamSizeChanges>,
-    /// Native image/data-section gate retained until durable cleanup deletion publishes.
-    deletion: Option<crate::state::PreparedStreamDeletion>,
+    /// Windows stream updates and their exact retained gates.
+    streams: crate::state::PreparedStreamPublication,
 }
 
 /// One restart-local resolve pass with every native gate already retained for revalidation.
@@ -4283,10 +4277,8 @@ enum MutationOperationState {
         publication: PreparedDriverPublication,
         /// Both epoch storage reservations allocated before the first write.
         slots: EpochPublicationSlots,
-        /// Native gate retained when this commit changes stream size.
-        size_changes: Option<crate::state::PreparedStreamSizeChanges>,
-        /// Native gate retained when this commit removes the cleaned-up regular file.
-        deletion: Option<crate::state::PreparedStreamDeletion>,
+        /// Revalidated Windows stream updates and their corresponding native gates.
+        streams: crate::state::PreparedStreamPublication,
     },
     /// Commit writes and durability flushes are in progress.
     CommitIo {
@@ -6333,7 +6325,7 @@ impl MutationRequestOperation {
                 );
             }
         };
-        let stream_metadata = match crate::state::PreparedStreamMetadataPublications::try_new(
+        let stream_metadata = match crate::state::StreamMetadataUpdates::try_new(
             reserved.node_metadata_updates(),
             access.volume_geometry().cluster_size(),
         ) {
@@ -6342,8 +6334,10 @@ impl MutationRequestOperation {
                 return MutationStep::Transition(self.complete_error(owned, error));
             }
         };
-        if let (Some(prepared), Some(cleanup)) = (deletion.as_ref(), self.cleanup_deletion.as_ref())
-            && prepared.node() != cleanup.node()
+        if let Some(prepared) = deletion.as_ref()
+            && !self.cleanup_deletion.as_ref().is_some_and(|cleanup| {
+                prepared.authorizes(cleanup.file_control_block(), cleanup.node())
+            })
         {
             return MutationStep::Transition(
                 self.complete_error(owned, DriverError::InternalInvariantViolation),
@@ -6374,7 +6368,6 @@ impl MutationRequestOperation {
                 });
             }
         }
-        let deletion_node = deletion.as_ref().map(|prepared| prepared.node());
         let reset_node = if self.paging.is_none() {
             self.pending_existing_create
                 .as_ref()
@@ -6382,49 +6375,19 @@ impl MutationRequestOperation {
         } else {
             None
         };
-        let size_changes = match size_changes {
-            Some(prepared) => {
-                let matches = match access.prepared_stream_size_changes_match(
-                    &stream_metadata,
-                    &prepared,
-                    deletion_node,
-                    reset_node,
-                ) {
-                    Ok(matches) => matches,
-                    Err(error) => {
-                        return MutationStep::Transition(self.complete_error(owned, error));
-                    }
-                };
-                if matches {
-                    Some(prepared)
-                } else {
-                    drop(prepared);
-                    None
-                }
-            }
-            None => None,
-        };
-        let mut size_changes = size_changes;
-        if size_changes.is_none() {
-            let requester_node = match requester_size_exclusion(&mut owned) {
-                Ok(node) => node,
-                Err(error) => {
-                    return MutationStep::Transition(self.complete_error(owned, error));
-                }
-            };
-            let mut plan = match access.prepare_stream_size_changes(
-                &stream_metadata,
-                deletion_node,
-                reset_node,
-                requester_node,
-            ) {
-                Ok(plan) => plan,
-                Err(error) => {
-                    return MutationStep::Transition(self.complete_error(owned, error));
-                }
-            };
-            if let Some(stream) = plan.next() {
-                drop(stream_metadata);
+        let streams = match access.prepare_stream_publication(
+            stream_metadata,
+            size_changes,
+            deletion,
+            reset_node,
+            || requester_size_exclusion(&mut owned),
+        ) {
+            Ok(crate::state::StreamPublicationPreparation::Ready(streams)) => streams,
+            Ok(crate::state::StreamPublicationPreparation::SizeChange {
+                stream,
+                plan,
+                deletion,
+            }) => {
                 drop(publication);
                 drop(reserved);
                 self.state = MutationOperationState::PreparingSizeChange {
@@ -6437,20 +6400,11 @@ impl MutationRequestOperation {
                     suspended: self,
                 });
             }
-            // Only gates covered by the requester's own exclusion can exist without native work;
-            // they were selected from this exact projection.
-            size_changes = match plan.into_prepared() {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    return MutationStep::Transition(self.complete_error(owned, error));
-                }
-            };
-        }
-        let publication = match publication.prepare(stream_metadata, access) {
+            Err(error) => return MutationStep::Transition(self.complete_error(owned, error)),
+        };
+        let publication = match publication.prepare(access) {
             Ok(publication) => publication,
-            Err(error) => {
-                return MutationStep::Transition(self.complete_error(owned, error));
-            }
+            Err(error) => return MutationStep::Transition(self.complete_error(owned, error)),
         };
         let slots = {
             let reservations = access.reserve_epoch_publication();
@@ -6466,8 +6420,7 @@ impl MutationRequestOperation {
             reserved,
             publication,
             slots,
-            size_changes,
-            deletion,
+            streams,
         };
         MutationStep::Transition(OperationTransition::RequestCommit {
             ticket: self.ticket,
@@ -6488,8 +6441,7 @@ impl MutationRequestOperation {
             reserved,
             publication,
             slots,
-            size_changes,
-            deletion,
+            streams,
         } = core::mem::replace(&mut self.state, MutationOperationState::Terminal)
         else {
             crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
@@ -6545,8 +6497,7 @@ impl MutationRequestOperation {
             publication,
             durable_slot,
             checkpoint_slot,
-            size_changes,
-            deletion,
+            streams,
         };
         MutationStep::Transition(self.drive_ordered(context, ready.start()))
     }
@@ -7206,42 +7157,33 @@ impl PreparedPublication for MutationRequestOperation {
             } => {
                 let CommitContext {
                     mut owned,
-                    publication,
+                    publication: driver_publication,
                     durable_slot,
                     checkpoint_slot,
-                    size_changes,
-                    deletion,
+                    streams,
                 } = context;
-                let PreparedDriverPublication {
-                    stream_metadata,
-                    effect,
-                    changes,
-                } = publication;
                 let publication = match access.publish_durable(
                     durable,
                     visibility,
                     durable_slot,
                     checkpoint_slot,
-                    stream_metadata,
-                    size_changes.as_ref(),
+                    &streams,
                 ) {
                     Ok(publication) => publication,
-                    Err((error, stream_metadata)) => {
+                    Err(error) => {
                         access.record_durability_unknown();
-                        let publication = PreparedDriverPublication {
-                            stream_metadata,
-                            effect,
-                            changes,
-                        };
                         return PublicationOutcome::Rejected(self.abort_create(
                             owned,
-                            Some(publication),
+                            Some(driver_publication),
                             CreateAbortContinuation::Complete(error),
                         ));
                     }
                 };
                 let (pending, stream_projection) = publication.into_parts();
-                let mut changes = changes;
+                let PreparedDriverPublication {
+                    effect,
+                    mut changes,
+                } = driver_publication;
                 while let Some(change) = changes.pop() {
                     access.report_directory_change(change);
                 }
@@ -7329,8 +7271,7 @@ impl PreparedPublication for MutationRequestOperation {
                 if self.paging_create.is_none() {
                     drop(self.write_open.take());
                 }
-                drop(size_changes);
-                drop(deletion);
+                drop(streams);
                 drop(self.oplock_mutation.take());
                 drop(self.create_oplock.take());
                 while self.cleanup_parent_oplock.pop().is_some() {}

@@ -743,6 +743,32 @@ impl PreparedStreamSizeChanges {
     }
 }
 
+/// Metadata and the exact gates admitted for it before durable commit.
+#[derive(Debug)]
+pub(crate) struct PreparedStreamPublication {
+    /// Visibility resolves live streams by inode under the ledger lock.
+    updates: StreamMetadataUpdates,
+    /// Each entry selects which owner projects changed dimensions to Cc.
+    size_changes: Option<PreparedStreamSizeChanges>,
+    /// Stronger exclusion for a cleanup deletion that superseded its size gates.
+    _deletion: Option<PreparedStreamDeletion>,
+}
+
+/// Native preparation can suspend before constructing a commit-ready publication.
+pub(crate) enum StreamPublicationPreparation {
+    /// The current metadata is covered by retained native authority.
+    Ready(PreparedStreamPublication),
+    /// A passive worker must acquire the next gate, then resolve against the new epoch.
+    SizeChange {
+        /// First ordered lease moved to native work.
+        stream: StreamSizeChangeLease,
+        /// Remaining work and acquired gates.
+        plan: StreamSizeChangePlan,
+        /// A cleanup deletion retains its stronger exclusion across re-resolution.
+        deletion: Option<PreparedStreamDeletion>,
+    },
+}
+
 /// Exclusion that keeps other main-resource owners out of one stream's size change.
 #[derive(Debug)]
 enum SizeChangeExclusion {
@@ -2307,9 +2333,9 @@ impl FileControlBlockLedger {
         unsafe_code,
         reason = "the ledger resource serializes FCB lookup and deferred-lease acquisition"
     )]
-    pub(super) fn prepare_stream_size_changes(
+    fn prepare_stream_size_changes(
         &self,
-        updates: &PreparedStreamMetadataPublications,
+        updates: &StreamMetadataUpdates,
         deletion: Option<NodeId>,
         reset: Option<NodeId>,
         requester: Option<NodeId>,
@@ -2444,6 +2470,50 @@ impl FileControlBlockLedger {
         })
     }
 
+    /// Binds the current metadata to exact gates or returns the first missing native operation.
+    /// # Errors
+    /// Returns an ownership, size observation, or native-preparation allocation failure.
+    pub(super) fn prepare_stream_publication(
+        &self,
+        updates: StreamMetadataUpdates,
+        mut sizes: Option<PreparedStreamSizeChanges>,
+        deletion: Option<PreparedStreamDeletion>,
+        reset: Option<NodeId>,
+        requester: impl FnOnce() -> DriverResult<Option<NodeId>>,
+    ) -> DriverResult<StreamPublicationPreparation> {
+        if deletion
+            .as_ref()
+            .is_some_and(|gate| gate.stream.retained.owner != NonNull::from(self))
+        {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        let deletion_node = deletion.as_ref().map(PreparedStreamDeletion::node);
+        if let Some(prepared) = sizes.as_ref()
+            && !self.prepared_stream_size_changes_match(&updates, prepared, deletion_node, reset)?
+        {
+            drop(sizes.take());
+        }
+        if sizes.is_none() {
+            let mut plan =
+                self.prepare_stream_size_changes(&updates, deletion_node, reset, requester()?)?;
+            if let Some(stream) = plan.next() {
+                return Ok(StreamPublicationPreparation::SizeChange {
+                    stream,
+                    plan,
+                    deletion,
+                });
+            }
+            sizes = plan.into_prepared()?;
+        }
+        Ok(StreamPublicationPreparation::Ready(
+            PreparedStreamPublication {
+                updates,
+                size_changes: sizes,
+                _deletion: deletion,
+            },
+        ))
+    }
+
     /// Verifies that retained native gates cover the exact current size-changing projection.
     ///
     /// A false result means the operation must release these gates and repeat preparation before
@@ -2456,9 +2526,9 @@ impl FileControlBlockLedger {
         unsafe_code,
         reason = "the ledger resource serializes FCB lookup while retained gates keep matched streams live"
     )]
-    pub(super) fn prepared_stream_size_changes_match(
+    fn prepared_stream_size_changes_match(
         &self,
-        updates: &PreparedStreamMetadataPublications,
+        updates: &StreamMetadataUpdates,
         prepared: &PreparedStreamSizeChanges,
         deletion: Option<NodeId>,
         reset: Option<NodeId>,
@@ -2764,10 +2834,10 @@ impl FileControlBlockLedger {
     )]
     pub(super) fn publish_stream_metadata(
         &self,
-        updates: PreparedStreamMetadataPublications,
+        prepared: &PreparedStreamPublication,
         epoch: ext4_core::EpochSequence,
-        size_changes: Option<&PreparedStreamSizeChanges>,
     ) -> StreamProjectionOutcome {
+        let updates = &prepared.updates;
         {
             let _guard = self.lock.acquire();
             let table = unsafe {
@@ -2796,7 +2866,9 @@ impl FileControlBlockLedger {
             let Some(lease) = lease else {
                 continue;
             };
-            let projection = size_changes
+            let projection = prepared
+                .size_changes
+                .as_ref()
                 .and_then(|changes| changes.size_projection(update.node()))
                 .unwrap_or(SizeProjection::Unchanged);
             match lease.publish(*update, epoch, projection) {

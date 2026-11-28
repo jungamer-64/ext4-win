@@ -479,7 +479,7 @@ impl StagedNodeStreamMetadata {
     }
 }
 
-/// Prevalidated metadata retained with the exact mutation's commit continuation.
+/// Metadata converted from the reserved mutation before admitting native size gates.
 ///
 /// Preparation does not snapshot FCB addresses: publication resolves inode identities under the
 /// ledger guard after epoch visibility. Future opens initialize from that current epoch.

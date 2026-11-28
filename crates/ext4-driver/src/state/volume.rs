@@ -1528,40 +1528,21 @@ impl MountedVolumeAccess<'_> {
             .acquire_file_object_cache_lease(file_object, NonNull::from(self.volume))
     }
 
-    /// Preallocates final size gates, combining image exclusion with any existing-file reset.
-    /// Resets require admission even when their cache dimensions are unchanged. `requester` names
-    /// the regular file whose main resource the synchronous paging end-of-file requester owns;
-    /// its growth is covered by that ownership and needs no passive preparation.
+    /// Prepares or revalidates native stream gates for this mount's single commit projection.
+    /// The synchronous paging requester can cover its own growth without passive work.
     /// # Errors
-    ///
-    /// Returns the exact allocation, stream-retention, or native size-snapshot failure before the
-    /// first Cache Manager or Memory Manager call is submitted.
-    pub(crate) fn prepare_stream_size_changes(
+    /// Returns allocation, stream-retention, or size observation failure before commit.
+    pub(crate) fn prepare_stream_publication(
         &self,
-        updates: &PreparedStreamMetadataPublications,
-        deletion: Option<NodeId>,
+        updates: StreamMetadataUpdates,
+        sizes: Option<PreparedStreamSizeChanges>,
+        deletion: Option<PreparedStreamDeletion>,
         reset: Option<NodeId>,
-        requester: Option<NodeId>,
-    ) -> DriverResult<StreamSizeChangePlan> {
+        requester: impl FnOnce() -> DriverResult<Option<NodeId>>,
+    ) -> DriverResult<StreamPublicationPreparation> {
         self.volume
             .file_control_blocks
-            .prepare_stream_size_changes(updates, deletion, reset, requester)
-    }
-
-    /// Verifies that retained native gates still match the latest resolved size projection.
-    /// # Errors
-    ///
-    /// Returns a native size snapshot failure or a cross-volume gate invariant error.
-    pub(crate) fn prepared_stream_size_changes_match(
-        &self,
-        updates: &PreparedStreamMetadataPublications,
-        prepared: &PreparedStreamSizeChanges,
-        deletion: Option<NodeId>,
-        reset: Option<NodeId>,
-    ) -> DriverResult<bool> {
-        self.volume
-            .file_control_blocks
-            .prepared_stream_size_changes_match(updates, prepared, deletion, reset)
+            .prepare_stream_publication(updates, sizes, deletion, reset, requester)
     }
 
     /// Retains one exact cleanup FCB for native stream-deletion preparation.
@@ -2233,13 +2214,9 @@ impl MountedVolumeAccess<'_> {
         self.runtime.publication_is_idle()
     }
 
-    /// Publishes the durable epoch and its prevalidated stream metadata in one reactor turn.
-    ///
-    /// The core durability/visibility capabilities are required here, so a caller cannot install
-    /// prepared stream metadata through the mounted-volume boundary before the commit is durable.
-    /// `size_changes` are the gates that covered every size change being published.
+    /// Publishes the durable epoch and the matching native stream projection in one actor turn.
     /// # Errors
-    /// Returns ownership loss and the unpublished native projection for mandatory cleanup.
+    /// Returns ownership loss before publication, with the native guards still held by the caller.
     #[inline(never)]
     pub(crate) fn publish_durable(
         &mut self,
@@ -2247,23 +2224,16 @@ impl MountedVolumeAccess<'_> {
         visibility: VisibilityLease,
         durable_slot: EpochPublicationSlot,
         checkpoint_slot: EpochPublicationSlot,
-        stream_metadata: PreparedStreamMetadataPublications,
-        size_changes: Option<&PreparedStreamSizeChanges>,
-    ) -> Result<DurablePublicationOutcome, (DriverError, PreparedStreamMetadataPublications)> {
+        streams: &PreparedStreamPublication,
+    ) -> DriverResult<DurablePublicationOutcome> {
         let checkpoint =
-            match self
-                .runtime
-                .publish_durable(mutation, visibility, durable_slot, checkpoint_slot)
-            {
-                Ok(checkpoint) => checkpoint,
-                Err(error) => return Err((error, stream_metadata)),
-            };
+            self.runtime
+                .publish_durable(mutation, visibility, durable_slot, checkpoint_slot)?;
         let epoch = checkpoint.epoch();
-        let stream_projection = self.volume.file_control_blocks.publish_stream_metadata(
-            stream_metadata,
-            epoch,
-            size_changes,
-        );
+        let stream_projection = self
+            .volume
+            .file_control_blocks
+            .publish_stream_metadata(streams, epoch);
         Ok(DurablePublicationOutcome {
             checkpoint,
             stream_projection,
