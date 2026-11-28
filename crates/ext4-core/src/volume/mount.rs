@@ -6,7 +6,7 @@ use core::mem::MaybeUninit;
 use super::block_group::AllocationIndexBuild;
 use super::orphan::{ORPHAN_METADATA_BUDGET, OrphanRecoveryQueue, ValidatedOrphanInventory};
 use super::scope::*;
-use super::session_marker::{prepare_primary_images, prepare_session_checkpoint};
+use super::session_marker::prepare_session_checkpoint;
 use super::transaction::{
     OrphanBatchCompletion, StorageRequestSequence, StorageRequestSequenceStep, prepare_orphan_batch,
 };
@@ -525,20 +525,6 @@ enum PendingMountOwnership {
 enum MountState {
     /// Journal and orphan recovery are complete; RO completion markers still need persistence.
     FinishingReadOnly(UnpublishedMount),
-    /// Prepared home update has no journal-loading or ordinary mutation authority.
-    ReadOnlyWrites {
-        /// Fully private mounted state, published only after durability.
-        recovered: UnpublishedMount,
-        /// Complete preallocated home-write sequence.
-        sequence: StorageRequestSequence<()>,
-    },
-    /// Only the exact lower completion can reveal the remaining RO completion writes.
-    ReadOnlyPending {
-        /// Retained private state.
-        recovered: UnpublishedMount,
-        /// Unique transfer continuation.
-        pending: crate::PendingStorageTransfer<StorageRequestSequence<()>>,
-    },
     /// Resolve the primary superblock and internal journal placement.
     Resolving,
     /// Await a core-minted token for the exact external-journal requirement.
@@ -580,13 +566,15 @@ enum MountState {
         /// Consuming continuation revealed by the exact transfer completion.
         pending: crate::PendingStorageTransfer<StorageRequestSequence<PreparedCleanJournal>>,
     },
+    /// Establish the recovered namespace root before validating orphan work or persisting markers.
+    ValidatingRoot(MountPublicationSeed),
     /// Validate both persistent orphan trackers before granting write authority.
     ScanningOrphans(MountPublicationSeed),
     /// Build allocation ownership with validated admission for zero-link orphans.
     Indexing(ValidatedMountSeed),
     /// Prepare the marker image and all publication allocations before its first write.
     PreparingMarker(Box<IndexedMount>),
-    /// The complete session image is journaled and checkpointed before publication.
+    /// The primary marker is journaled and checkpointed before publication.
     SessionWrites {
         /// Fully allocated mounted state, still private.
         recovered: UnpublishedMount,
@@ -747,7 +735,9 @@ impl ResolvedPrimary {
                     JournalRecoveryOperation::new(journal, superblock.recovery_state())
                 }
             }
-            Self::JournalRepairRequired(_) => JournalRecoveryOperation::repairing_primary(journal),
+            Self::JournalRepairRequired(_) => {
+                JournalRecoveryOperation::repairing_primary(journal, access)
+            }
         }?;
         memory::try_box(operation)
     }
@@ -947,12 +937,6 @@ impl MountOperation {
                 self.filesystem.complete(completion)?;
                 self.state = MountState::FinishingReadOnly(recovered);
             }
-            MountState::ReadOnlyPending { recovered, pending } => {
-                self.state = MountState::ReadOnlyWrites {
-                    recovered,
-                    sequence: pending.complete(completion)?,
-                };
-            }
             MountState::Resolving => {
                 self.filesystem.complete(completion)?;
                 self.state = MountState::Resolving;
@@ -963,6 +947,10 @@ impl MountOperation {
             } => {
                 operation.candidate.complete(completion)?;
                 self.state = MountState::LoadingExternal { primary, operation };
+            }
+            MountState::ValidatingRoot(publication) => {
+                self.filesystem.complete(completion)?;
+                self.state = MountState::ValidatingRoot(publication);
             }
             MountState::ScanningOrphans(publication) => {
                 self.filesystem.complete(completion)?;
@@ -1016,7 +1004,6 @@ impl MountOperation {
                 };
             }
             state @ (MountState::AwaitingExternal { .. }
-            | MountState::ReadOnlyWrites { .. }
             | MountState::SessionWrites { .. }
             | MountState::OrphanWrites { .. }
             | MountState::DeltaWrites { .. }
@@ -1133,30 +1120,9 @@ impl MountOperation {
                 MountState::FinishingReadOnly(recovered) => {
                     return self.finish_read_only(recovered);
                 }
-                MountState::ReadOnlyWrites {
-                    recovered,
-                    sequence,
-                } => match sequence.advance() {
-                    StorageRequestSequenceStep::Submit { request, suspended } => {
-                        self.state = MountState::ReadOnlyPending {
-                            recovered,
-                            pending: suspended,
-                        };
-                        return MountStep::Yield(MountTransition::SubmitLower {
-                            request,
-                            suspended: self,
-                        });
-                    }
-                    StorageRequestSequenceStep::Finished(()) => {
-                        self.state = MountState::ReadyToPublish(recovered);
-                    }
-                },
-                MountState::ReadOnlyPending { .. } => {
-                    return MountStep::Yield(self.fail(Error::DeviceIo));
-                }
                 MountState::Resolving => match self.resolve_journal() {
                     Ok(JournalResolution::Unloaded(superblock)) => {
-                        self.state = MountState::ScanningOrphans(MountPublicationSeed {
+                        self.state = MountState::ValidatingRoot(MountPublicationSeed {
                             superblock,
                             journal: None,
                         });
@@ -1284,6 +1250,9 @@ impl MountOperation {
                 MountState::DeltaWritePending { .. } => {
                     return MountStep::Yield(self.fail(Error::DeviceIo));
                 }
+                MountState::ValidatingRoot(publication) => {
+                    return self.validate_root(publication);
+                }
                 MountState::ScanningOrphans(publication) => {
                     return self.scan_orphans(publication);
                 }
@@ -1316,7 +1285,14 @@ impl MountOperation {
                             StorageTarget::Filesystem,
                             self.filesystem.len(),
                         );
-                        self.state = MountState::RecoveringOrphans(recovered);
+                        self.state = match self.access {
+                            super::MountAccess::ReadWrite => {
+                                MountState::RecoveringOrphans(recovered)
+                            }
+                            super::MountAccess::ReadOnly { .. } => {
+                                MountState::ReadyToPublish(recovered)
+                            }
+                        };
                     }
                 },
                 MountState::SessionPending { .. } => {
@@ -1451,21 +1427,29 @@ impl MountOperation {
                 return Err(Error::InvalidOrphanTracking);
             }
             let mut device = OperationDevice::new(&mut self.filesystem);
-            let Some(raw) =
-                Superblock::prepare_read_only_completion(&mut device, self.now.unix_seconds())?
-            else {
+            let Some(raw) = Superblock::prepare_read_only_completion(&mut device)? else {
                 return Ok(None);
             };
             let superblock = Superblock::parse_read_only(&raw)?;
-            let images = prepare_primary_images(&mut device, &raw, superblock.block_size())?;
-            let sequence =
-                StorageRequestSequence::home_updates(images, superblock.block_size(), ())?;
+            let journal = recovered
+                .image
+                .journal
+                .as_ref()
+                .ok_or(Error::JournalCorrupt)?;
+            let sequence = prepare_session_checkpoint(
+                &mut device,
+                &raw,
+                superblock.block_size(),
+                journal,
+                &[],
+            )?;
             Ok(Some((superblock, sequence)))
         })();
         match result {
             Ok(Some((superblock, sequence))) => {
                 recovered.image.superblock = superblock;
-                self.state = MountState::ReadOnlyWrites {
+                recovered.image.journal = None;
+                self.state = MountState::SessionWrites {
                     recovered,
                     sequence,
                 };
@@ -1501,7 +1485,7 @@ impl MountOperation {
                 }
                 self.state = match completion {
                     JournalRecoveryCompletion::Clean(journal) => {
-                        MountState::ScanningOrphans(MountPublicationSeed {
+                        MountState::ValidatingRoot(MountPublicationSeed {
                             superblock,
                             journal: Some(journal),
                         })
@@ -1553,6 +1537,34 @@ impl MountOperation {
                 Ok(sequence) => self.state = MountState::DeltaWrites { sequence },
                 Err(error) => return MountStep::Yield(self.fail(error)),
             },
+            Err(error) => return MountStep::Yield(self.fail(error)),
+        }
+        MountStep::Continue(self)
+    }
+
+    /// Reads only the mandatory root inode in the recovered namespace before mount publication.
+    #[inline(never)]
+    fn validate_root(mut self: Box<Self>, publication: MountPublicationSeed) -> MountStep {
+        let result = {
+            let device = OperationDevice::new(&mut self.filesystem);
+            let mut volume =
+                EpochReadView::recovery(device, publication.superblock, &self.fscrypt_keys, None);
+            volume
+                .load_directory(DirectoryNodeId::ROOT)
+                .and_then(|root| {
+                    let inode = root.inode();
+                    if inode.size().bytes() == 0 || inode.allocation_size().bytes() == 0 {
+                        return Err(Error::InvalidInode);
+                    }
+                    Ok(())
+                })
+        };
+        match result {
+            Ok(()) => self.state = MountState::ScanningOrphans(publication),
+            Err(Error::OperationSuspended) => {
+                self.state = MountState::ValidatingRoot(publication);
+                return self.submit_pending_read();
+            }
             Err(error) => return MountStep::Yield(self.fail(error)),
         }
         MountStep::Continue(self)
@@ -1802,13 +1814,16 @@ impl MountOperation {
             || (journal_target == StorageTarget::ExternalJournal
                 && self.external_access == super::DeviceWriteAccess::ReadOnly))
         {
+            if matches!(primary, ResolvedPrimary::JournalRepairRequired(_)) {
+                return MountStep::Yield(self.fail(Error::ChecksumMismatch));
+            }
             let superblock = primary.recovery_bootstrap();
             if superblock.recovery_state()
                 == crate::disk_format::superblock::RecoveryState::NeedsRecovery
             {
                 return MountStep::Yield(self.fail(Error::ReadOnlyFilesystem));
             }
-            self.state = MountState::ScanningOrphans(MountPublicationSeed {
+            self.state = MountState::ValidatingRoot(MountPublicationSeed {
                 superblock,
                 journal: None,
             });
@@ -1913,6 +1928,9 @@ impl MountOperation {
                     home_space: FilesystemHomeSpace::from_superblock(&superblock),
                 },
             }),
+            JournalMode::None if matches!(primary, ResolvedPrimary::JournalRepairRequired(_)) => {
+                Err(Error::ChecksumMismatch)
+            }
             JournalMode::None if self.access.media_access() == super::MediaAccess::ReadOnly => {
                 Ok(JournalResolution::Unloaded(superblock))
             }

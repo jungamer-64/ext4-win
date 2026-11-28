@@ -138,9 +138,11 @@ selection can proceed.
 
 `--access read-only` selects ordinary journal replay; `--recovery replay` selects it
 explicitly. Required recovery writes reach media before read-only publication, so
-write-protected media cannot admit required journal recovery. Standard RO requires a
-valid primary checksum and does not claim or inspect MMP ownership. `noload` skips
-journal loading, including external-journal discovery; it does not suppress
+write-protected media cannot admit required journal recovery. Replay admits a damaged
+primary checksum only through a valid committed replacement in the journal. The
+recovery markers are cleared through a journal checkpoint after orphan cleanup.
+Standard RO does not claim or inspect MMP ownership. `noload` requires a valid
+primary checksum and skips journal loading, including external-journal discovery. It permits
 independently admitted orphan cleanup, which requires writable media and no recorded
 filesystem error and then uses home writes without a journal.
 

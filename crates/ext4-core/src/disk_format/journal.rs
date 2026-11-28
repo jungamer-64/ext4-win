@@ -660,11 +660,15 @@ enum PrimaryRepairValidation {
     Required {
         /// Filesystem block containing the primary superblock.
         home: BlockAddress,
+        /// Feature policy that must accept the committed primary.
+        access: crate::MountAccess,
     },
     /// A committed JBD2 payload carries a checksum-valid replacement primary superblock.
     Validated {
         /// Filesystem block containing the primary superblock.
         home: BlockAddress,
+        /// Feature policy that every later primary postimage must satisfy.
+        access: crate::MountAccess,
         /// Transaction whose payload established repair authority.
         sequence: JournalSequence,
     },
@@ -897,12 +901,15 @@ impl JournalRecoveryOperation {
     /// # Errors
     ///
     /// Returns an error when the journal is already clean or recovery state cannot be allocated.
-    pub(crate) fn repairing_primary(journal: Journal<LoadedJournal>) -> Result<Self> {
+    pub(crate) fn repairing_primary(
+        journal: Journal<LoadedJournal>,
+        access: crate::MountAccess,
+    ) -> Result<Self> {
         let home = Superblock::primary_block(journal.data.geometry.block_size);
         Self::new_with_primary_repair(
             journal,
             RecoveryPolicy::Replay,
-            PrimaryRepairValidation::Required { home },
+            PrimaryRepairValidation::Required { home, access },
         )
     }
 
@@ -1591,7 +1598,7 @@ impl JournalRecoveryOperation {
         match self.primary_repair {
             PrimaryRepairValidation::NotRequired => {}
             PrimaryRepairValidation::Required { .. } => return Err(Error::ChecksumMismatch),
-            PrimaryRepairValidation::Validated { home, sequence } => {
+            PrimaryRepairValidation::Validated { home, sequence, .. } => {
                 if self.is_revoked(home, sequence) {
                     return Err(Error::JournalCorrupt);
                 }
@@ -1618,23 +1625,31 @@ impl JournalRecoveryOperation {
     /// # Errors
     ///
     /// Returns an error when a payload targeting the primary block does not itself contain a
-    /// checksum-valid read-write superblock.
+    /// checksum-valid superblock in the original journal ownership domain.
     fn validate_primary_repair_payload(&mut self, tag: RecoveryTag, payload: &[u8]) -> Result<()> {
         if !matches!(self.phase, RecoveryPhase::Validate) || tag.flags & JBD2_TAG_FLAG_DELETED != 0
         {
             return Ok(());
         }
-        let home = match self.primary_repair {
+        let (home, access) = match self.primary_repair {
             PrimaryRepairValidation::NotRequired => return Ok(()),
-            PrimaryRepairValidation::Required { home }
-            | PrimaryRepairValidation::Validated { home, .. } => home,
+            PrimaryRepairValidation::Required { home, access }
+            | PrimaryRepairValidation::Validated { home, access, .. } => (home, access),
         };
         if tag.home != home {
             return Ok(());
         }
-        Superblock::parse_primary_block(payload, self.journal.data.geometry.block_size)?;
+        let replacement = Superblock::parse_primary_block(
+            payload,
+            self.journal.data.geometry.block_size,
+            access,
+        )?;
+        if FilesystemHomeSpace::from_superblock(&replacement) != self.journal.data.home_space {
+            return Err(Error::InvalidSuperblock);
+        }
         self.primary_repair = PrimaryRepairValidation::Validated {
             home,
+            access,
             sequence: tag.sequence,
         };
         Ok(())
@@ -5063,7 +5078,7 @@ mod tests {
                 100,
             )?;
             assert!(matches!(
-                JournalRecoveryOperation::repairing_primary(clean),
+                JournalRecoveryOperation::repairing_primary(clean, crate::MountAccess::ReadWrite),
                 Err(Error::ChecksumMismatch)
             ));
 
@@ -5076,7 +5091,8 @@ mod tests {
                 3,
                 100,
             )?;
-            let mut recovery = JournalRecoveryOperation::repairing_primary(dirty)?;
+            let mut recovery =
+                JournalRecoveryOperation::repairing_primary(dirty, crate::MountAccess::ReadWrite)?;
             assert_eq!(
                 recovery.prepare_replay_and_clean(),
                 Err(Error::ChecksumMismatch)

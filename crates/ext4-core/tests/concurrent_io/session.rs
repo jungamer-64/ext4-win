@@ -371,6 +371,69 @@ fn journal_recovers_mount_clocks_after_torn_primary_checkpoint() -> Result<()> {
 }
 
 /// # Errors
+/// Returns fixture setup, replay or independent superblock decoding failure.
+/// # Panics
+/// Fails if a read-only completion can persist a partial primary with no durable replacement.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe filesystem and journal state across an interrupted checkpoint"
+)]
+fn read_only_replay_repairs_a_torn_completion_marker() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let initial_write_time = disk_time(&fixture.disk, 0x30, 0x274)?;
+    let access = MountAccess::ReadOnly {
+        recovery: ext4_core::ReadOnlyRecovery::Replay,
+    };
+    let mut interrupted = false;
+    let result = fixture.disk.mount_at(access, 900, |disk, boundary, _| {
+        if let MountBoundary::Lower(StorageRequest::Write {
+            target: StorageTarget::Filesystem,
+            offset,
+            buffer,
+        }) = boundary
+            && offset.get() == 0
+        {
+            for (byte, source) in disk
+                .filesystem
+                .get_mut(..1536)
+                .ok_or(Error::DeviceRange)?
+                .iter_mut()
+                .zip(buffer)
+            {
+                *byte = *source;
+            }
+            interrupted = true;
+            return Err(Error::DeviceIo);
+        }
+        Ok(())
+    });
+    assert!(matches!(result, Err(Error::DeviceIo)));
+    assert!(interrupted);
+    assert_eq!(fixture_u32(&fixture.disk.filesystem, 1120)? & 4, 0);
+    assert_ne!(
+        fixture_u32(&fixture.disk.filesystem, 2044)?,
+        primary_checksum(&fixture.disk)?,
+    );
+    let (profile, _, _, _) = fixture.disk.mount(access)?.into_parts();
+    assert_eq!(profile.access(), ext4_core::MediaAccess::ReadOnly);
+    assert_eq!(
+        fixture_u32(&fixture.disk.filesystem, 2044)?,
+        primary_checksum(&fixture.disk)?,
+    );
+    assert_eq!(disk_time(&fixture.disk, 0x30, 0x274)?, initial_write_time);
+    assert_eq!(fixture_u32(&fixture.disk.filesystem, 1120)? & 4, 0);
+    Ok(())
+}
+
+/// # Errors
+/// Returns a bounds failure when the disk image lacks a full primary checksum input.
+fn primary_checksum(disk: &Disk) -> Result<u32> {
+    let bytes = disk.filesystem.get(1024..2044).ok_or(Error::DeviceRange)?;
+    Ok(fixture_crc32c(u32::MAX, bytes))
+}
+
+/// # Errors
 /// Returns fixture setup, close checkpoint or journal recovery failure.
 /// # Panics
 /// Fails if clearing RECOVER before retiring the log hides a torn timestamp without metadata CRCs.

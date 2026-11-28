@@ -33,7 +33,7 @@ pub(super) fn prepare_session_checkpoint(
 /// Retains bytes outside the primary payload in its complete home-block image.
 /// # Errors
 /// Returns source suspension, range or allocation failure before submission.
-pub(super) fn prepare_primary_images(
+fn prepare_primary_images(
     device: &mut OperationDevice<'_>,
     raw: &[u8; 1024],
     block_size: BlockSize,

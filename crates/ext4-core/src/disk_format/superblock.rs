@@ -1900,45 +1900,60 @@ impl Superblock {
         Ok(FilesystemUuid::from_bytes(uuid))
     }
 
-    /// Selects strict read-only validation or journal-authenticated writable/private recovery.
+    /// Admits provisional geometry only when the selected mode can authenticate journal repair.
     /// # Errors
     /// Returns read suspension, checksum, feature or geometry failures.
     pub(crate) fn read_for_mount(
         device: &mut OperationDevice<'_>,
         access: crate::MountAccess,
     ) -> Result<PrimarySuperblockRead> {
-        match access {
-            crate::MountAccess::ReadOnly {
-                recovery: crate::ReadOnlyRecovery::Replay | crate::ReadOnlyRecovery::NoLoad,
-            } => {
-                let mut raw = [0_u8; SUPERBLOCK_SIZE];
-                device.read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)?;
-                Self::parse_read_only(&raw).map(PrimarySuperblockRead::Valid)
+        let mut raw = [0_u8; SUPERBLOCK_SIZE];
+        device.read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)?;
+        match Self::parse_mount_primary(&raw, access, SuperblockChecksumValidation::Required) {
+            Ok(superblock) => Ok(PrimarySuperblockRead::Valid(superblock)),
+            Err(Error::ChecksumMismatch)
+                if !matches!(
+                    access,
+                    crate::MountAccess::ReadOnly {
+                        recovery: crate::ReadOnlyRecovery::NoLoad
+                    }
+                ) =>
+            {
+                Self::parse_mount_primary(
+                    &raw,
+                    access,
+                    SuperblockChecksumValidation::DeferredToJournalReplay,
+                )
+                .map(ChecksumInvalidSuperblock)
+                .map(PrimarySuperblockRead::ChecksumInvalid)
             }
-            _ => Self::read_write_from(device),
+            Err(error) => Err(error),
         }
     }
 
-    /// Reads and validates the primary ext4 superblock for read-write mode.
-    ///
+    /// Uses the same feature policy for bootstrap and the authenticated replacement.
     /// # Errors
-    /// Returns an error when the superblock cannot support journaled writes.
-    pub(crate) fn read_write_from(
-        device: &mut OperationDevice<'_>,
-    ) -> Result<PrimarySuperblockRead> {
-        let mut raw = [0_u8; SUPERBLOCK_SIZE];
-        device.read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)?;
-        match Self::parse_read_write(&raw) {
-            Ok(superblock) => Ok(PrimarySuperblockRead::Valid(superblock)),
-            Err(Error::ChecksumMismatch) => Self::parse_with_policy(
-                &raw,
+    /// Rejects unsupported features, malformed geometry or an invalid required checksum.
+    fn parse_mount_primary(
+        raw: &[u8],
+        access: crate::MountAccess,
+        checksum_validation: SuperblockChecksumValidation,
+    ) -> Result<Self> {
+        match access {
+            crate::MountAccess::ReadOnly {
+                recovery: crate::ReadOnlyRecovery::Replay | crate::ReadOnlyRecovery::NoLoad,
+            } => Self::parse_with_policy(
+                raw,
+                FeatureSet::read_only,
+                crate::MediaAccess::ReadOnly,
+                checksum_validation,
+            ),
+            _ => Self::parse_with_policy(
+                raw,
                 FeatureSet::read_write,
                 crate::MediaAccess::ReadWrite,
-                SuperblockChecksumValidation::DeferredToJournalReplay,
-            )
-            .map(ChecksumInvalidSuperblock)
-            .map(PrimarySuperblockRead::ChecksumInvalid),
-            Err(error) => Err(error),
+                checksum_validation,
+            ),
         }
     }
 
@@ -1995,7 +2010,6 @@ impl Superblock {
     /// Returns source-read suspension, checksum or field-encoding failure before publication.
     pub(crate) fn prepare_read_only_completion(
         device: &mut OperationDevice<'_>,
-        unix_seconds: u64,
     ) -> Result<Option<[u8; SUPERBLOCK_SIZE]>> {
         let mut raw = [0; SUPERBLOCK_SIZE];
         device.read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)?;
@@ -2007,7 +2021,6 @@ impl Superblock {
         }
         put_le_u32(&mut raw, disk_offset(96), incompat & !INCOMPAT_RECOVER)?;
         put_le_u32(&mut raw, disk_offset(100), ro & !RO_COMPAT_ORPHAN_PRESENT)?;
-        Self::update_write_time(&mut raw, unix_seconds)?;
         Self::refresh_checksum(&mut raw)?;
         Ok(Some(raw))
     }
@@ -2296,8 +2309,12 @@ impl Superblock {
     /// # Errors
     ///
     /// Returns an error when the block does not contain a complete, checksum-valid primary
-    /// superblock accepted by the read-write feature policy.
-    pub(crate) fn parse_primary_block(block: &[u8], block_size: BlockSize) -> Result<Self> {
+    /// superblock accepted by the selected mount policy.
+    pub(crate) fn parse_primary_block(
+        block: &[u8],
+        block_size: BlockSize,
+        access: crate::MountAccess,
+    ) -> Result<Self> {
         let offset = if block_size.bytes() == 1024 {
             0
         } else {
@@ -2306,7 +2323,11 @@ impl Superblock {
         let end = offset
             .checked_add(SUPERBLOCK_SIZE)
             .ok_or(Error::ArithmeticOverflow)?;
-        Self::parse_read_write(block.get(offset..end).ok_or(Error::TruncatedStructure)?)
+        Self::parse_mount_primary(
+            block.get(offset..end).ok_or(Error::TruncatedStructure)?,
+            access,
+            SuperblockChecksumValidation::Required,
+        )
     }
 
     /// Validated block size.

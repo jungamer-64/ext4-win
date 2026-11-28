@@ -1814,6 +1814,38 @@ fn standard_read_only_requires_authenticated_primary() -> Result<()> {
 }
 
 /// # Errors
+/// Returns fixture setup or root inode location errors.
+/// # Panics
+/// Fails when a read-only mount publishes a root that fails authentication.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe the error and physical effects at mount admission"
+)]
+fn read_only_mount_requires_an_authenticated_root() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let root = fixture_inode_offset(&fixture.disk, NodeId::Directory(DirectoryNodeId::ROOT))?;
+    let checksum = root.checked_add(0x7c).ok_or(Error::DeviceRange)?;
+    *fixture
+        .disk
+        .filesystem
+        .get_mut(checksum)
+        .ok_or(Error::DeviceRange)? ^= 1;
+    fixture.disk.storage_effects = 0;
+    for recovery in [
+        ext4_core::ReadOnlyRecovery::Replay,
+        ext4_core::ReadOnlyRecovery::NoLoad,
+    ] {
+        assert!(matches!(
+            fixture.disk.mount(MountAccess::ReadOnly { recovery }),
+            Err(Error::ChecksumMismatch)
+        ));
+        assert_eq!(fixture.disk.storage_effects, 0);
+    }
+    Ok(())
+}
+
+/// # Errors
 /// Returns independent image editing or no-journal RO admission failure.
 /// # Panics
 /// Fails if read-only access requires a journal or mutation-only global inode validation.
