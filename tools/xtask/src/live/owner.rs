@@ -1612,62 +1612,6 @@ pub(crate) fn verify_live_vhdx(root: &Path, id: &OsStr, verifier: VerifierPlan) 
     Ok(())
 }
 
-/// Demand-starts the completed session's package under a pre-load Verifier selection.
-/// The disposable host owns the named selection for the rest of this boot.
-/// # Errors
-/// Returns incomplete live evidence, stale package identity, or load, Verifier or cleanup failure.
-pub(crate) fn verify_hosted_driver_startup(
-    root: &Path,
-    live_id: &OsStr,
-    startup_id: &OsStr,
-) -> TaskResult<()> {
-    driver_load::check_hosted_driver_host(root)?;
-    let live_id = SessionId::parse(live_id)?;
-    let startup = SessionId::parse(startup_id)?;
-    let live: Session<LiveState> = Session::load(root, "live-vhdx-sessions", &live_id)?;
-    if live.phase() != Phase::Complete {
-        return Err(
-            io::Error::other("startup verification requires a completed live session").into(),
-        );
-    }
-    let directory = root
-        .join("target/driver-load-sessions")
-        .join(startup.as_str());
-    if directory.exists() {
-        return Err(io::Error::other("startup requires a fresh driver-load session ID").into());
-    }
-    let operation = (|| {
-        require_idle_verifier()?;
-        driver_load::reinstall_completed_package(root, &live_id, startup.clone())?;
-        let rules = VerifierRules::Startup;
-        let _artifact = driver_load::start_session(root, &startup, None, || {
-            require_idle_verifier()?;
-            if windows_host::driver_image_loaded("ext4win.sys")? {
-                return Err(
-                    io::Error::other("Verifier startup requires an unloaded driver").into(),
-                );
-            }
-            let mut command = Command::new("verifier.exe");
-            command
-                .args(["/volatile", "/flags"])
-                .arg(format!("{:#010x}", rules.flags()))
-                .args(["/adddriver", "ext4win.sys"]);
-            run_checked(command, "select Driver Verifier before SCM start")
-        })?;
-        let report = query_verifier()?;
-        fs::write(directory.join("verifier-after-startup.txt"), &report)?;
-        verifier_activity(&report, rules)
-    })();
-    let cleanup = if directory.is_dir() {
-        driver_load::cleanup_driver_load_session(root, OsStr::new(startup.as_str()))
-    } else {
-        Ok(())
-    };
-    combine_verification_and_cleanup(operation, cleanup)?;
-    println!("hosted Driver Verifier startup assurance: PASS");
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
