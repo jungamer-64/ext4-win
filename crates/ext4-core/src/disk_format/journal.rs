@@ -1888,35 +1888,6 @@ impl Journal<CleanJournal> {
 }
 
 impl<State> Journal<State> {
-    /// Moves immutable journal facts across an owned protocol transition without allocating.
-    fn into_state<Next>(self) -> Journal<Next> {
-        Journal {
-            location: self.location,
-            superblock: self.superblock,
-            profile: self.profile,
-            geometry: self.geometry,
-            cursor: self.cursor,
-            home_space: self.home_space,
-            state: PhantomData,
-        }
-    }
-
-    /// Rebuilds the same journal data with a different typestate marker.
-    /// # Errors
-    ///
-    /// Returns an error when copying the typestate-independent journal data cannot allocate.
-    fn copy_without_state<Next>(&self) -> Result<Journal<Next>> {
-        Ok(Journal {
-            location: self.location.try_clone()?,
-            superblock: self.superblock.try_clone()?,
-            profile: self.profile,
-            geometry: self.geometry,
-            cursor: self.cursor,
-            home_space: self.home_space,
-            state: PhantomData,
-        })
-    }
-
     /// Loads an internal journal stored in the filesystem journal inode.
     /// # Errors
     ///
