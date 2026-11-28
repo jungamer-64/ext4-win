@@ -2,7 +2,11 @@
 use super::VerifierPlan;
 use crate::{
     TaskResult, driver_load, fixture,
-    process::{combine_verification_and_cleanup, run_checked, run_checked_output},
+    interop::{LIVE_RECOVERY_PATH, LIVE_RECOVERY_PAYLOAD, stage_live_journal_recovery},
+    process::{
+        combine_verification_and_cleanup, create_task_directory, remove_task_directory,
+        run_checked, run_checked_output,
+    },
     production::build_verified_production_bundle,
     session::{Operation, Phase, Session, SessionId},
     storage::{self, DisposablePartition, Partition},
@@ -648,12 +652,59 @@ fn attach_wsl_partition(session: &mut Session<LiveState>) -> TaskResult<String> 
 /// # Errors
 /// Returns device-difference, GPT identity, oracle, helper or WSL detachment failures.
 fn format_storage(
+    root: &Path,
     session: &mut Session<LiveState>,
     helper: &Path,
     workload: LiveWorkload,
 ) -> TaskResult<()> {
     let partition = attach_wsl_partition(session)?;
     session.publish(Phase::Intent(Operation::Format))?;
+    let helper = linux_path(helper)?;
+    match workload {
+        LiveWorkload::Assurance => {
+            let directory = create_task_directory(root, "live-recovery-image")?;
+            let operation = (|| {
+                let image = directory.join("filesystem.img");
+                let length = scope(session)?.partition.length;
+                fs::File::create_new(&image)?.set_len(length)?;
+                let path = linux_path(&image)?;
+                format_filesystem(&path, &helper, workload)?;
+                stage_live_journal_recovery(&image)?;
+                wsl_words(&[
+                    "--exec",
+                    "dd",
+                    &format!("if={path}"),
+                    &format!("of={partition}"),
+                    "bs=1M",
+                    "conv=fsync,notrunc",
+                    "status=none",
+                ])?;
+                let staged = wsl_words(&["--exec", "debugfs", "-R", "stats -h", &partition])?;
+                let features = superblock_features(&staged)?;
+                if !features.contains(&"has_journal") || !features.contains(&"needs_recovery") {
+                    return Err(io::Error::other(
+                        "the disposable partition lacks the staged journal recovery marker",
+                    )
+                    .into());
+                }
+                println!(
+                    "live recovery fixture: pending internal transaction transferred to the disposable partition"
+                );
+                Ok(())
+            })();
+            let cleanup = remove_task_directory(root, &directory, "live-recovery-image");
+            combine_verification_and_cleanup(operation, cleanup)?;
+        }
+        LiveWorkload::RandomIo => format_filesystem(&partition, &helper, workload)?,
+    }
+    session.publish(Phase::Observed(Operation::Format))?;
+    finish_wsl(session, wsl)
+}
+
+/// Prepares the clean home filesystem before any test-specific journal staging.
+/// # Errors
+/// Returns formatting, fixture construction or independent filesystem check failures.
+fn format_filesystem(target: &str, helper: &str, workload: LiveWorkload) -> TaskResult<()> {
     wsl_words(&[
         "--exec",
         "mke2fs",
@@ -664,31 +715,24 @@ fn format_storage(
         "4096",
         "-O",
         "metadata_csum,64bit",
-        &partition,
+        target,
     ])?;
-    wsl_words(&[
-        "--exec",
-        "debugfs",
-        "-w",
-        "-R",
-        "mkdir /live-ci",
-        &partition,
-    ])?;
+    wsl_words(&["--exec", "debugfs", "-w", "-R", "mkdir /live-ci", target])?;
     wsl_words(&[
         "--exec",
         "debugfs",
         "-w",
         "-R",
         "set_inode_field /live-ci mode 040755",
-        &partition,
+        target,
     ])?;
     for field in [
         "set_inode_field /live-ci uid 1000",
         "set_inode_field /live-ci gid 100",
     ] {
-        wsl_words(&["--exec", "debugfs", "-w", "-R", field, &partition])?;
+        wsl_words(&["--exec", "debugfs", "-w", "-R", field, target])?;
     }
-    let stat = wsl_words(&["--exec", "debugfs", "-R", "stat /live-ci", &partition])?;
+    let stat = wsl_words(&["--exec", "debugfs", "-R", "stat /live-ci", target])?;
     if !stat
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -699,14 +743,11 @@ fn format_storage(
             io::Error::other("test directory lacks explicit POSIX write permission").into(),
         );
     }
-    let helper = linux_path(helper)?;
-    wsl_words(&["--exec", &helper, "live-directory", &partition])?;
+    wsl_words(&["--exec", helper, "live-directory", target])?;
     if matches!(workload, LiveWorkload::RandomIo) {
-        wsl_words(&["--exec", &helper, "live-random-files", &partition])?;
+        wsl_words(&["--exec", helper, "live-random-files", target])?;
     }
-    wsl_words(&["--exec", "e2fsck", "-fn", &partition])?;
-    session.publish(Phase::Observed(Operation::Format))?;
-    finish_wsl(session, wsl)?;
+    wsl_words(&["--exec", "e2fsck", "-fn", target])?;
     Ok(())
 }
 
@@ -718,22 +759,26 @@ fn require_clean_superblock(report: &str) -> TaskResult<()> {
         .lines()
         .filter_map(|line| line.strip_prefix("Filesystem state:"))
         .map(str::trim);
-    let mut features = report
-        .lines()
-        .filter_map(|line| line.strip_prefix("Filesystem features:"));
-    let features = match (features.next(), features.next()) {
-        (Some(features), None) => features,
-        _ => return Err(io::Error::other("ambiguous debugfs filesystem features").into()),
-    };
     if states.next() != Some("clean")
         || states.next().is_some()
-        || features
-            .split_whitespace()
-            .any(|feature| feature == "needs_recovery")
+        || superblock_features(report)?.contains(&"needs_recovery")
     {
         return Err(io::Error::other("Linux observed an unclean ext4 superblock").into());
     }
     Ok(())
+}
+
+/// Extracts the one feature list reported for the observed superblock.
+/// # Errors
+/// Returns a missing or ambiguous feature observation.
+fn superblock_features(report: &str) -> TaskResult<Vec<&str>> {
+    let mut features = report
+        .lines()
+        .filter_map(|line| line.strip_prefix("Filesystem features:"));
+    match (features.next(), features.next()) {
+        (Some(features), None) => Ok(features.split_whitespace().collect()),
+        _ => Err(io::Error::other("ambiguous debugfs filesystem features").into()),
+    }
 }
 
 /// Checks the values independently reported by debugfs for the Windows-created inode.
@@ -791,6 +836,21 @@ fn verify_persisted_storage(session: &mut Session<LiveState>, payload: &[u8]) ->
         return Err(
             io::Error::other("Linux readback differs from the Windows-written payload").into(),
         );
+    }
+    if matches!(session.state().workload, LiveWorkload::Assurance) {
+        let arguments = [
+            "--exec",
+            "debugfs",
+            "-R",
+            &format!("cat /{LIVE_RECOVERY_PATH}"),
+            &partition,
+        ];
+        if wsl_output(&arguments.map(OsString::from))?.stdout != LIVE_RECOVERY_PAYLOAD {
+            return Err(io::Error::other(
+                "Linux readback differs from the replayed journal payload",
+            )
+            .into());
+        }
     }
     session.publish(Phase::Observed(Operation::InspectFilesystem))?;
     finish_wsl(session, wsl)?;
@@ -1371,6 +1431,15 @@ fn exercise_driver(
         rules,
     )?;
     let mount = mount_namespace(session)?;
+    if matches!(session.state().workload, LiveWorkload::Assurance) {
+        if fs::read(mount.join(LIVE_RECOVERY_PATH))? != LIVE_RECOVERY_PAYLOAD {
+            return Err(io::Error::other(
+                "first Windows read differs from the committed journal payload",
+            )
+            .into());
+        }
+        println!("live internal journal recovery: PASS");
+    }
     configure_identity(session)?;
     let payload = exercise_io(session, &mount)?;
     if matches!(session.state().workload, LiveWorkload::RandomIo) {
@@ -1582,7 +1651,7 @@ fn prepare_session(
     let mut session = Session::create(root, "live-vhdx-sessions", id, state)?;
     let operation = (|| {
         create_storage(&mut session, workload)?;
-        format_storage(&mut session, &helper, workload)?;
+        format_storage(root, &mut session, &helper, workload)?;
         attachment(&mut session, true)?;
         let scope = scope(&session)?;
         storage::validate(&scope)?;
@@ -1604,6 +1673,8 @@ fn prepare_session(
 }
 
 /// Builds the package once before acquiring disposable resources.
+/// # Errors
+/// Returns preflight, build, preparation, or cleanup failures.
 fn prepare_fresh_session(root: &Path, workload: LiveWorkload, id: SessionId) -> TaskResult<()> {
     check_live_driver_host(root)?;
     let bundle = build_verified_production_bundle(root)?;

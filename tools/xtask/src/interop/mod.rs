@@ -13,6 +13,10 @@ use std::{
 /// Owns independent JBD2, HTree, crash-cut, and fixture-provenance scenarios.
 mod scenarios;
 
+#[cfg(windows)]
+pub(crate) use scenarios::{
+    LIVE_RECOVERY_PATH, LIVE_RECOVERY_PAYLOAD, stage_live_journal_recovery,
+};
 pub(crate) use scenarios::{
     verify_htree_interop, verify_journal_fixture_provenance, verify_journal_interop,
     verify_ro_interop,

@@ -279,6 +279,7 @@ pub(crate) fn verify_journal_interop(repository_root: &Path) -> TaskResult<()> {
         inode::verify_inode_contracts(linux, &temporary_root)?;
         orphan::verify_orphan_recovery(linux, &temporary_root)?;
         verify_internal_mutation_profiles(linux, &temporary_root)?;
+        verify_live_recovery_fixture(linux, &temporary_root)?;
         for case in cases {
             verify_linux_generated_journal_case(linux, &temporary_root, case)?;
         }
@@ -290,6 +291,127 @@ pub(crate) fn verify_journal_interop(repository_root: &Path) -> TaskResult<()> {
     let cleanup = remove_task_directory(repository_root, &temporary_root, "journal-interop");
     combine_verification_and_cleanup(verification, cleanup)?;
     println!("JBD2 Linux -> core recovery and clean-close interoperability: PASS");
+    Ok(())
+}
+
+/// Relative path of the independently journaled probe in the live filesystem.
+pub(crate) const LIVE_RECOVERY_PATH: &str = "live-ci/journal-replay.bin";
+
+/// One full replacement block written to the journal and expected after recovery.
+pub(crate) const LIVE_RECOVERY_PAYLOAD: [u8; 4096] = [0xB2; 4096];
+
+/// Adds a pending recovery transaction to a prepared regular image from the live session.
+/// # Errors
+/// Returns fixture I/O, journal construction, or admission failures.
+#[cfg(windows)]
+pub(crate) fn stage_live_journal_recovery(image: &Path) -> TaskResult<()> {
+    stage_live_recovery_fixture(LinuxEnvironment::Wsl, image)
+}
+
+/// Confirms the live fixture generator's intended replay with the independent e2fsck oracle.
+/// # Errors
+/// Returns generation, e2fsck, or recovered-data mismatch failures.
+fn verify_live_recovery_fixture(linux: LinuxEnvironment, root: &Path) -> TaskResult<()> {
+    let directory = root.join("live-recovery-fixture");
+    fs::create_dir(&directory)?;
+    let image = directory.join("filesystem.img");
+    format_mutation_image(linux, &image, None, true)?;
+    let image_path = linux.tool_path(&image)?;
+    let mut debugfs = linux.command("debugfs");
+    debugfs.args(["-w", "-R", "mkdir /live-ci", &image_path]);
+    run_checked(debugfs, "create fixture directory")?;
+    stage_live_recovery_fixture(linux, &image)?;
+    let mut e2fsck = linux.command("e2fsck");
+    e2fsck.args(["-E", "journal_only", "-y", &image_path]);
+    run_checked(e2fsck, "independent live fixture replay")?;
+    verify_primary_recovery_marker(&image, false)?;
+    require_live_recovery_payload(linux, &image_path, &LIVE_RECOVERY_PAYLOAD)
+}
+
+/// Leaves a committed journal replacement whose home block still contains the predecessor.
+/// # Errors
+/// Returns malformed layout, pending input, journal construction, or pre-recovery mismatches.
+fn stage_live_recovery_fixture(linux: LinuxEnvironment, image: &Path) -> TaskResult<()> {
+    const BEFORE: [u8; 4096] = [0xA1; 4096];
+    let payload = image.with_extension("probe");
+    let commands = image.with_extension("debugfs");
+    let image_path = linux.tool_path(image)?;
+    let payload_path = linux.tool_path(&payload)?;
+    let commands_path = linux.tool_path(&commands)?;
+
+    verify_primary_recovery_marker(image, false)?;
+    fs::write(&payload, BEFORE)?;
+    let mut debugfs = linux.command("debugfs");
+    debugfs.args([
+        "-w",
+        "-R",
+        &format!("write \"{payload_path}\" /{LIVE_RECOVERY_PATH}"),
+        &image_path,
+    ]);
+    run_checked(debugfs, "write the live fixture's home block")?;
+    let mut debugfs = linux.command("debugfs");
+    debugfs.args([
+        "-w",
+        "-R",
+        &format!("set_inode_field /{LIVE_RECOVERY_PATH} mode 0100644"),
+        &image_path,
+    ]);
+    run_checked(
+        debugfs,
+        "make the recovery probe readable before identity setup",
+    )?;
+    let blocks =
+        debugfs_block_sequence(linux, &image_path, &format!("blocks /{LIVE_RECOVERY_PATH}"))?;
+    let [block] = blocks.as_slice() else {
+        return Err(io::Error::other("the live recovery probe must occupy one home block").into());
+    };
+    let journal = debugfs_block_sequence(linux, &image_path, "blocks <8>")?;
+
+    fs::write(&payload, LIVE_RECOVERY_PAYLOAD)?;
+    fs::write(
+        &commands,
+        format!(
+            "journal_open -c -v 3\njournal_write -b {block} \"{payload_path}\"\njournal_close\n"
+        ),
+    )?;
+    let mut debugfs = linux.command("debugfs");
+    debugfs.args(["-w", "-f", &commands_path, &image_path]);
+    run_checked(debugfs, "commit the live fixture's journal transaction")?;
+    let evidence = normalize_debugfs_descriptors(
+        image,
+        JournalImageLayout::Internal(&journal),
+        JournalInteropCase {
+            block_size: 4096,
+            checksum_version: 3,
+            block_numbers_64bit: true,
+            revokes: false,
+        },
+        DebugfsCommitTimestamp::Preserve,
+    )?;
+    if evidence.first_committed_descriptors != Some(1) || evidence.pending_descriptors != 0 {
+        return Err(io::Error::other(
+            "the live recovery fixture requires one committed descriptor",
+        )
+        .into());
+    }
+    verify_primary_recovery_marker(image, true)?;
+    require_live_recovery_payload(linux, &image_path, &BEFORE)
+}
+
+/// Reads the durable home payload through debugfs, which does not replay this image.
+/// # Errors
+/// Returns tool or payload mismatch failures.
+fn require_live_recovery_payload(
+    linux: LinuxEnvironment,
+    image: &str,
+    expected: &[u8],
+) -> TaskResult<()> {
+    let mut debugfs = linux.command("debugfs");
+    debugfs.args(["-R", &format!("cat /{LIVE_RECOVERY_PATH}"), image]);
+    let observed = run_checked_output(debugfs, "inspect the live recovery probe")?;
+    if observed.stdout != expected {
+        return Err(io::Error::other("the live recovery probe has unexpected home bytes").into());
+    }
     Ok(())
 }
 

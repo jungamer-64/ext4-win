@@ -286,11 +286,13 @@ start, so an interrupted start requires reconciliation rather than repeating act
 Artifact bytes, signer trust, service configuration, storage scope and source identity
 are revalidated before start. Cleanup remains possible after source changes.
 
-`verify-live-vhdx` requires persisted Windows readback after flush, dismount, and
-reattachment. After the session driver unloads, WSL exposes the same GPT partition
-for read-only `e2fsck` and `debugfs` inspection. The image must have clean ext4
-metadata with no pending journal recovery. The Windows-created probe must match
-its expected inode metadata and bytes before the session can pass.
+`verify-live-vhdx` starts from a pending committed internal-journal transaction.
+The first Windows read must observe the replayed data. The workload also requires
+persisted Windows readback after flush, dismount, and reattachment. After the
+session driver unloads, WSL exposes the same GPT partition for read-only
+`e2fsck` and `debugfs` inspection. The image must have clean ext4 metadata with
+no pending recovery. The replayed data and the Windows-created probe must match
+their expected contents, including the created probe's inode metadata.
 
 The runtime workflow enables DIF rule classes on each loaded image. It requires
 a successful native command status and independently observes the active classes
