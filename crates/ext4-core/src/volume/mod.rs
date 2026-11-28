@@ -73,7 +73,8 @@ pub use transaction::{
     CheckpointOperation, CheckpointPublication, CleanJournalDurability, CleanJournalRecordPhase,
     CommitDurability, CommitReadyMutation, CommitRecordPhase, DurableMutation, HomeBlockDurability,
     JournalPayloadDurability, MutationCompletionDurability, MutationResolvePass,
-    NamespaceDestination, OrderedDataDurability, PublishedMutation, ReservedMutation,
-    ResolvedMutation, StorageRequestSequence, StorageRequestSequenceStep, TransactionDirectory,
-    TransactionFile, TransactionHardLinkSource, TransactionNode, TransactionSymlink,
+    NamespaceDestination, OrderedDataDurability, PendingCleanJournalDurability,
+    PendingCommitDurability, PublishedMutation, ReservedMutation, ResolvedMutation,
+    StorageRequestSequence, StorageRequestSequenceStep, TransactionDirectory, TransactionFile,
+    TransactionHardLinkSource, TransactionNode, TransactionSymlink,
 };

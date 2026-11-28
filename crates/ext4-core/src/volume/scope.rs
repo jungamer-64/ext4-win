@@ -31,7 +31,9 @@ pub(super) use crate::disk_format::inode::{
     InodeStorage, LinkCountAfterDecrement, NewDirectoryMetadata, NewFileMetadata,
     NewSymlinkMetadata, ReadBytes, SymlinkTarget,
 };
-pub(super) use crate::disk_format::journal::{CleanJournal, DirtyJournal, Journal, JournalBlock};
+pub(super) use crate::disk_format::journal::{
+    CleanJournal, Journal, JournalBlock, PreparedCleanJournal,
+};
 pub(super) use crate::disk_format::name::Ext4Name;
 pub(super) use crate::disk_format::superblock::{
     BlockGroupId, ClusterAddress, DirectoryIndexing, Ext4VolumeLabel, FreeClusterDelta,

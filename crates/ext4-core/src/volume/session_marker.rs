@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use super::transaction::StorageRequestSequence;
 use crate::disk::block::BlockSize;
 use crate::disk::storage::{OperationDevice, StorageTarget};
-use crate::disk_format::journal::{CleanJournal, Journal, JournalBlock};
+use crate::disk_format::journal::{CleanJournal, Journal, JournalBlock, PreparedCleanJournal};
 use crate::disk_format::superblock::Superblock;
 use crate::memory::{self, FallibleVec};
 use crate::{Error, Result};
@@ -24,7 +24,7 @@ pub(super) fn prepare_session_checkpoint(
     block_size: BlockSize,
     journal: &Journal<CleanJournal>,
     flush_before: &[StorageTarget],
-) -> Result<StorageRequestSequence<Journal<CleanJournal>>> {
+) -> Result<StorageRequestSequence<PreparedCleanJournal>> {
     let blocks = prepare_primary_images(device, raw, block_size)?;
     let prepared = journal.prepare_commit(
         block_size,

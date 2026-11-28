@@ -8,7 +8,7 @@ use super::transaction::{StorageRequestSequence, StorageRequestSequenceStep};
 use crate::disk::block::BlockSize;
 use crate::disk::storage::{OperationDevice, StorageTarget, StorageTranscript};
 use crate::disk_format::inode::Ext4Timestamp;
-use crate::disk_format::journal::{CleanJournal, Journal};
+use crate::disk_format::journal::{CleanJournal, Journal, PreparedCleanJournal};
 use crate::disk_format::superblock::{Superblock, WriteSessionState};
 use crate::{Error, Result};
 
@@ -70,9 +70,9 @@ enum CleanClosePhase {
     /// Source read must complete before preparation resumes.
     ReadPending(CleanClosePreparation),
     /// Fully prepared flush, log, checkpoint and clean-journal requests.
-    Writing(StorageRequestSequence<Journal<CleanJournal>>),
+    Writing(StorageRequestSequence<PreparedCleanJournal>),
     /// Matching completion alone can reveal the remaining sequence.
-    Pending(crate::PendingStorageTransfer<StorageRequestSequence<Journal<CleanJournal>>>),
+    Pending(crate::PendingStorageTransfer<StorageRequestSequence<PreparedCleanJournal>>),
     /// Completion consumed this operation's close authority.
     Complete,
 }

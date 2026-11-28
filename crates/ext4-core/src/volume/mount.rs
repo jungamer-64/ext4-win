@@ -13,7 +13,7 @@ use super::transaction::{
 use crate::disk::storage::{OperationDevice, StorageReadOverlay, StorageTarget, StorageTranscript};
 use crate::disk_format::journal::{
     CleanJournal, ExternalJournalLoad, FilesystemHomeSpace, Journal, JournalRecoveryCompletion,
-    JournalRecoveryOperation, LoadedJournal,
+    JournalRecoveryOperation, LoadedJournal, PreparedCleanJournal,
 };
 use crate::disk_format::superblock::{
     ChecksumInvalidSuperblock, FilesystemUuid, JournalMode, JournalUuid, PrimarySuperblockRead,
@@ -581,14 +581,14 @@ enum MountState {
     /// Fully allocated full-commit conversion and home checkpoint requests.
     DeltaWrites {
         /// Only matching lower completions can advance this sequence.
-        sequence: StorageRequestSequence<Journal<CleanJournal>>,
+        sequence: StorageRequestSequence<PreparedCleanJournal>,
         /// Physical journal target retained for mount publication.
         journal_target: StorageTarget,
     },
     /// A submitted delta-conversion transfer remains owned even after cancellation.
     DeltaWritePending {
         /// Consuming continuation revealed by the exact transfer completion.
-        pending: crate::PendingStorageTransfer<StorageRequestSequence<Journal<CleanJournal>>>,
+        pending: crate::PendingStorageTransfer<StorageRequestSequence<PreparedCleanJournal>>,
         /// Physical journal target retained for mount publication.
         journal_target: StorageTarget,
     },
@@ -603,14 +603,14 @@ enum MountState {
         /// Fully allocated mounted state, still private.
         recovered: UnpublishedMount,
         /// Log, commit, checkpoint and clean-journal durability.
-        sequence: StorageRequestSequence<Journal<CleanJournal>>,
+        sequence: StorageRequestSequence<PreparedCleanJournal>,
     },
     /// Only the matching lower completion can advance session publication.
     SessionPending {
         /// Fully allocated mounted state, still private.
         recovered: UnpublishedMount,
         /// Sole consuming continuation for this transfer.
-        pending: crate::PendingStorageTransfer<StorageRequestSequence<Journal<CleanJournal>>>,
+        pending: crate::PendingStorageTransfer<StorageRequestSequence<PreparedCleanJournal>>,
     },
     /// Resolve one bounded batch, with no published namespace or scheduler authority.
     RecoveringOrphans(UnpublishedMount),
@@ -1321,7 +1321,7 @@ impl MountOperation {
                             self.filesystem.len(),
                         );
                         self.state = MountState::VerifyingReplayedPrimary {
-                            completion: JournalRecoveryCompletion::Clean(journal),
+                            completion: JournalRecoveryCompletion::Clean(journal.into_clean()),
                             journal_target,
                         };
                     }
@@ -1356,7 +1356,7 @@ impl MountOperation {
                         });
                     }
                     StorageRequestSequenceStep::Finished(journal) => {
-                        recovered.image.journal = Some(journal);
+                        recovered.image.journal = Some(journal.into_clean());
                         self.filesystem = StorageTranscript::new(
                             StorageTarget::Filesystem,
                             self.filesystem.len(),
@@ -1387,7 +1387,8 @@ impl MountOperation {
                     StorageRequestSequenceStep::Finished(completion) => {
                         mount.image.superblock = completion.superblock;
                         mount.image.clusters = Some(completion.clusters);
-                        mount.image.journal = completion.journal;
+                        mount.image.journal =
+                            completion.journal.map(PreparedCleanJournal::into_clean);
                         self.filesystem = StorageTranscript::new(
                             StorageTarget::Filesystem,
                             self.filesystem.len(),

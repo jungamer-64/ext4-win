@@ -500,7 +500,7 @@ impl EffectBoundaryController {
         storage: &mut CrashStorageAdapter,
         (request, pending): (
             ext4_core::StorageRequest,
-            ext4_core::PendingStorageTransfer<ext4_core::DurableMutation>,
+            ext4_core::PendingCommitDurability,
         ),
     ) -> TaskResult<Option<ext4_core::DurableMutation>> {
         let journal_target = if storage.external_journal.is_some() {
@@ -1274,11 +1274,12 @@ fn run_prepared_mutation_until_boundary(
     else {
         return Ok(controller.stopped());
     };
-    let Some(publication) =
-        complete_boundary_transfer(storage, &mut controller, clean_durability.submit())?
-    else {
+    let (request, pending) = clean_durability.submit();
+    let Some(completion) = controller.complete(storage, request)? else {
         return Ok(controller.stopped());
     };
+
+    let publication = pending.complete(completion).map_err(core_task_error)?;
     let _checkpointed_epoch = publication
         .publish(coordinator)
         .map_err(|(error, _publication)| core_task_error(error))?;
@@ -1548,7 +1549,10 @@ fn complete_prepared_mutation<S: HostStorage>(
     let payloads = complete_storage_sequence(storage, payload_sequence)?;
     let commit_record = complete_file_transfer(storage, payloads.submit())?;
     let commit_durability = complete_file_transfer(storage, commit_record.submit())?;
-    let durable = complete_file_transfer(storage, commit_durability.submit())?;
+    let (request, pending) = commit_durability.submit();
+    let durable = pending
+        .complete(complete_file_request(storage, request)?)
+        .map_err(core_task_error)?;
     let published = durable
         .publish(
             coordinator
@@ -1571,7 +1575,10 @@ fn complete_prepared_mutation<S: HostStorage>(
     let home = complete_storage_sequence(storage, sequence)?;
     let clean_record = complete_file_transfer(storage, home.submit())?;
     let clean_durability = complete_file_transfer(storage, clean_record.submit())?;
-    let publication = complete_file_transfer(storage, clean_durability.submit())?;
+    let (request, pending) = clean_durability.submit();
+    let publication = pending
+        .complete(complete_file_request(storage, request)?)
+        .map_err(core_task_error)?;
     Ok(publication
         .publish(coordinator)
         .map_err(|(error, _publication)| core_task_error(error))?)
@@ -1737,7 +1744,10 @@ fn drive_core_commit_without_checkpoint(image: &Path, label: &[u8]) -> TaskResul
     let payloads = complete_storage_sequence(&mut storage, payload_sequence)?;
     let commit_record = complete_file_transfer(&mut storage, payloads.submit())?;
     let commit_durability = complete_file_transfer(&mut storage, commit_record.submit())?;
-    let _durable_uncheckpointed = complete_file_transfer(&mut storage, commit_durability.submit())?;
+    let (request, pending) = commit_durability.submit();
+    let _durable_uncheckpointed = pending
+        .complete(complete_file_request(&mut storage, request)?)
+        .map_err(core_task_error)?;
     Ok(())
 }
 

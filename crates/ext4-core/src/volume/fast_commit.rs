@@ -67,7 +67,7 @@ enum DeltaReplayPhase {
         index: alloc::boxed::Box<AllocationIndexBuild>,
     },
     /// A replacement full commit and checkpoint are completely allocated but have not been sent.
-    Ready(StorageRequestSequence<Journal<CleanJournal>>),
+    Ready(StorageRequestSequence<PreparedCleanJournal>),
     /// Errors consume the preparation; only an unfinished lower read can resume a live phase.
     Failed,
 }
@@ -282,7 +282,7 @@ impl DeltaReplayOperation {
     /// The complete replacement is revealed only after candidate validation and preallocation.
     /// # Errors
     /// Rejects unfinished or failed preparation instead of discarding its recovery obligation.
-    pub(super) fn into_sequence(self) -> Result<StorageRequestSequence<Journal<CleanJournal>>> {
+    pub(super) fn into_sequence(self) -> Result<StorageRequestSequence<PreparedCleanJournal>> {
         match self.phase {
             DeltaReplayPhase::Ready(sequence) => Ok(sequence),
             _ => Err(Error::DeviceIo),

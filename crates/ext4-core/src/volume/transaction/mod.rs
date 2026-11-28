@@ -480,8 +480,6 @@ pub struct CommitReadyMutation {
     commit_write: crate::StorageRequest,
     /// Journal device whose flush establishes commit durability.
     journal_target: crate::StorageTarget,
-    /// Dirty journal coordinator value moved at visibility publication.
-    durable_journal: Journal<DirtyJournal>,
     /// Immutable overlay epoch moved at visibility publication.
     durable_epoch: CommittedEpoch,
     /// Preallocated checkpoint and overlay-free epoch detached from visibility.
@@ -492,11 +490,13 @@ pub struct CommitReadyMutation {
 
 /// Commit whose record and required flush are durable but not yet visible to readers.
 #[derive(Debug)]
-pub struct DurableMutation {
+pub struct DurableMutation(PreparedMutationPublication);
+
+/// Preallocated successor whose publication authority still depends on commit durability.
+#[derive(Debug)]
+struct PreparedMutationPublication {
     /// Scheduler ticket whose commit and visibility grants protect this publication.
     claim: CommitClaim,
-    /// Dirty journal coordinator value.
-    durable_journal: Journal<DirtyJournal>,
     /// Overlay epoch ready for an allocation-free swap.
     durable_epoch: CommittedEpoch,
     /// Independent checkpoint work and overlay-free epoch.
@@ -530,7 +530,7 @@ pub struct CheckpointOperation {
     /// Preallocated clean journal-superblock write.
     clean_write: crate::StorageRequest,
     /// Clean journal state installed after the final flush.
-    clean_journal: Journal<CleanJournal>,
+    clean_journal: PreparedCleanJournal,
     /// Overlay-free epoch installed after the final flush.
     checkpointed_epoch: CommittedEpoch,
 }
@@ -604,9 +604,9 @@ impl<Next> StorageRequestSequence<Next> {
     pub(in crate::volume) fn checkpoint(
         prepared: crate::disk_format::journal::PreparedJournalCommit,
         flush_before: &[crate::StorageTarget],
-        next: impl FnOnce(Journal<CleanJournal>) -> Next,
+        next: impl FnOnce(PreparedCleanJournal) -> Next,
     ) -> Result<Self> {
-        let (writes, commit, target, _durable, _overlay, checkpoint) = prepared.into_parts();
+        let (writes, commit, target, _overlay, checkpoint) = prepared.into_parts();
         let (homes, clean, journal) = checkpoint.into_parts();
         let capacity = writes
             .len()
@@ -686,7 +686,7 @@ pub struct JournalPayloadDurability {
     /// Preallocated commit record.
     commit_write: crate::StorageRequest,
     /// Sealed state revealed after commit durability.
-    durable: DurableMutation,
+    durable: PreparedMutationPublication,
 }
 
 impl JournalPayloadDurability {
@@ -718,7 +718,7 @@ pub struct CommitRecordPhase {
     /// Journal device flushed after the commit record.
     journal_target: crate::StorageTarget,
     /// Sealed durable mutation state.
-    durable: DurableMutation,
+    durable: PreparedMutationPublication,
 }
 
 impl CommitRecordPhase {
@@ -744,22 +744,31 @@ pub struct CommitDurability {
     /// Journal device selected for the final commit flush.
     journal_target: crate::StorageTarget,
     /// Mutation revealed only after the flush succeeds.
-    durable: DurableMutation,
+    durable: PreparedMutationPublication,
 }
 
 impl CommitDurability {
     /// Issues the barrier whose successful completion establishes commit durability.
     #[must_use]
-    pub fn submit(
-        self,
-    ) -> (
-        crate::StorageRequest,
-        crate::PendingStorageTransfer<DurableMutation>,
-    ) {
+    pub fn submit(self) -> (crate::StorageRequest, PendingCommitDurability) {
         let request = crate::StorageRequest::Flush {
             target: self.journal_target,
         };
-        crate::PendingStorageTransfer::submit(request, self.durable)
+        let (request, pending) = crate::PendingStorageTransfer::submit(request, self.durable);
+        (request, PendingCommitDurability(pending))
+    }
+}
+
+/// Outstanding commit flush and the only continuation that can make the commit visible.
+#[derive(Debug)]
+pub struct PendingCommitDurability(crate::PendingStorageTransfer<PreparedMutationPublication>);
+
+impl PendingCommitDurability {
+    /// Constructs durable publication authority from the completed commit flush.
+    /// # Errors
+    /// A failed or mismatched completion consumes the continuation.
+    pub fn complete(self, completion: crate::StorageCompletion) -> Result<DurableMutation> {
+        self.0.complete(completion).map(DurableMutation)
     }
 }
 
@@ -771,7 +780,7 @@ pub struct HomeBlockDurability {
     /// Journal target flushed after the clean write.
     journal_target: crate::StorageTarget,
     /// Clean publication state.
-    clean_journal: Journal<CleanJournal>,
+    clean_journal: PreparedCleanJournal,
     /// Overlay-free epoch publication state.
     checkpointed_epoch: CommittedEpoch,
 }
@@ -806,7 +815,7 @@ pub struct CleanJournalRecordPhase {
     /// Journal device flushed after this request.
     journal_target: crate::StorageTarget,
     /// Clean journal coordinator state.
-    clean_journal: Journal<CleanJournal>,
+    clean_journal: PreparedCleanJournal,
     /// Overlay-free committed epoch.
     checkpointed_epoch: CommittedEpoch,
 }
@@ -835,7 +844,7 @@ pub struct CleanJournalDurability {
     /// Journal device selected for the clean-state flush.
     journal_target: crate::StorageTarget,
     /// Clean journal coordinator state.
-    clean_journal: Journal<CleanJournal>,
+    clean_journal: PreparedCleanJournal,
     /// Overlay-free epoch publication state.
     checkpointed_epoch: CommittedEpoch,
 }
@@ -843,20 +852,29 @@ pub struct CleanJournalDurability {
 impl CleanJournalDurability {
     /// Issues the final journal barrier; publication becomes available only after completion.
     #[must_use]
-    pub fn submit(
-        self,
-    ) -> (
-        crate::StorageRequest,
-        crate::PendingStorageTransfer<CheckpointPublication>,
-    ) {
+    pub fn submit(self) -> (crate::StorageRequest, PendingCleanJournalDurability) {
         let request = crate::StorageRequest::Flush {
             target: self.journal_target,
         };
-        let next = CheckpointPublication {
-            clean_journal: self.clean_journal,
-            checkpointed_epoch: self.checkpointed_epoch,
-        };
-        crate::PendingStorageTransfer::submit(request, next)
+        let (request, pending) = crate::PendingStorageTransfer::submit(request, self);
+        (request, PendingCleanJournalDurability(pending))
+    }
+}
+
+/// Outstanding clean-journal flush and its overlay-free successor.
+#[derive(Debug)]
+pub struct PendingCleanJournalDurability(crate::PendingStorageTransfer<CleanJournalDurability>);
+
+impl PendingCleanJournalDurability {
+    /// Constructs the clean publication only after the matching journal flush.
+    /// # Errors
+    /// A failed or mismatched completion consumes the continuation.
+    pub fn complete(self, completion: crate::StorageCompletion) -> Result<CheckpointPublication> {
+        let prepared = self.0.complete(completion)?;
+        Ok(CheckpointPublication {
+            clean_journal: prepared.clean_journal.into_clean(),
+            checkpointed_epoch: prepared.checkpointed_epoch,
+        })
     }
 }
 

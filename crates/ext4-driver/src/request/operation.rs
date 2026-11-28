@@ -3989,7 +3989,7 @@ enum CommitIoPhase {
     /// Matching lower completion reveals the next CommitFlush protocol state.
     CommitFlush {
         /// Owned continuation bound to its exact transfer.
-        pending: PendingStorageTransfer<DurableMutation>,
+        pending: ext4_core::PendingCommitDurability,
     },
 }
 
@@ -4014,7 +4014,7 @@ enum CheckpointIoPhase {
     /// Matching lower completion reveals the next CleanFlush protocol state.
     CleanFlush {
         /// Owned continuation bound to its exact transfer.
-        pending: PendingStorageTransfer<CheckpointPublication>,
+        pending: ext4_core::PendingCleanJournalDurability,
     },
 }
 

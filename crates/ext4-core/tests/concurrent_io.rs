@@ -1674,7 +1674,8 @@ fn read_only_recovery_preserves_media_and_mount_local_keys() -> Result<()> {
     let payload = fixture.disk.sequence(payloads)?;
     let commit = fixture.disk.transfer(payload.submit())?;
     let durability = fixture.disk.transfer(commit.submit())?;
-    drop(fixture.disk.transfer(durability.submit())?);
+    let (request, pending) = durability.submit();
+    drop(pending.complete(fixture.disk.complete(request)?)?);
     let filesystem = fixture.disk.filesystem.clone();
     let journal = fixture.disk.journal.clone();
     fixture.disk.storage_effects = 0;
@@ -2104,7 +2105,8 @@ fn read_only_recovery_failure_and_cancellation_preserve_effects() -> Result<()> 
         let payload = fixture.disk.sequence(payloads)?;
         let commit = fixture.disk.transfer(payload.submit())?;
         let durability = fixture.disk.transfer(commit.submit())?;
-        drop(fixture.disk.transfer(durability.submit())?);
+        let (request, pending) = durability.submit();
+        drop(pending.complete(fixture.disk.complete(request)?)?);
         let mut disk = fixture.disk;
         disk.storage_effects = 0;
         let length = DeviceLength::from_bytes(
@@ -2333,7 +2335,7 @@ fn mount_sessions_isolate_plans_grants_and_read_provenance() -> Result<()> {
 
 /// # Errors
 /// Returns actual fixture, preparation, storage or commit failures.
-fn durable_label_change(fixture: &mut Fixture) -> Result<(u64, ext4_core::DurableMutation)> {
+fn label_commit_barrier(fixture: &mut Fixture) -> Result<(u64, ext4_core::CommitDurability)> {
     let ticket = fixture.coordinator.admit_mutation()?;
     let (resolved, ()) = fixture.disk.resolve(
         &fixture.profile,
@@ -2361,8 +2363,54 @@ fn durable_label_change(fixture: &mut Fixture) -> Result<(u64, ext4_core::Durabl
     let payloads = fixture.disk.transfer(ordered.submit())?;
     let payloads = fixture.disk.sequence(payloads)?;
     let commit = fixture.disk.transfer(payloads.submit())?;
-    let barrier = fixture.disk.transfer(commit.submit())?;
-    Ok((ticket, fixture.disk.transfer(barrier.submit())?))
+    Ok((ticket, fixture.disk.transfer(commit.submit())?))
+}
+
+/// # Errors
+/// Returns preparation, storage or commit completion failures.
+fn durable_label_change(fixture: &mut Fixture) -> Result<(u64, ext4_core::DurableMutation)> {
+    let (ticket, barrier) = label_commit_barrier(fixture)?;
+    let (request, pending) = barrier.submit();
+    Ok((ticket, pending.complete(fixture.disk.complete(request)?)?))
+}
+
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe the commit publication boundary"
+)]
+fn failed_or_foreign_commit_flush_cannot_publish() -> Result<()> {
+    for wrong_target in [false, true] {
+        let mut fixture = Fixture::new()?;
+        let (_ticket, barrier) = label_commit_barrier(&mut fixture)?;
+        let (request, pending) = barrier.submit();
+        let completion = if wrong_target {
+            let foreign = match request {
+                StorageRequest::Flush {
+                    target: StorageTarget::Filesystem,
+                } => StorageTarget::ExternalJournal,
+                StorageRequest::Flush {
+                    target: StorageTarget::ExternalJournal,
+                } => StorageTarget::Filesystem,
+                _ => return Err(Error::DeviceIo),
+            };
+            StorageCompletion::success(CompletedStorageTransfer::Flush { target: foreign }, 0)
+        } else {
+            StorageCompletion::failure(
+                CompletedStorageTransfer::from_request(request),
+                Error::DeviceIo,
+            )
+        };
+        assert!(matches!(pending.complete(completion), Err(Error::DeviceIo)));
+        assert!(!fixture.coordinator.publication_is_idle());
+        assert!(
+            fixture
+                .coordinator
+                .acquire_checkpoint(fixture.epoch.sequence())
+                .is_none()
+        );
+    }
+    Ok(())
 }
 
 /// # Errors
@@ -2528,7 +2576,8 @@ fn revoked_session_rejects_completed_checkpoint_publication() -> Result<()> {
     let home = fixture.disk.sequence(sequence)?;
     let record = fixture.disk.transfer(home.submit())?;
     let barrier = fixture.disk.transfer(record.submit())?;
-    let publication = fixture.disk.transfer(barrier.submit())?;
+    let (request, pending) = barrier.submit();
+    let publication = pending.complete(fixture.disk.complete(request)?)?;
     let effects = fixture.disk.storage_effects;
     fixture.coordinator.revoke_media_ownership();
     let (error, publication) = publication
@@ -2583,7 +2632,8 @@ fn durable_publications_retain_state_after_mismatched_authority() -> Result<()> 
     let payload = origin.disk.sequence(sequence)?;
     let record = origin.disk.transfer(payload.submit())?;
     let barrier = origin.disk.transfer(record.submit())?;
-    let durable = origin.disk.transfer(barrier.submit())?;
+    let (request, pending) = barrier.submit();
+    let durable = pending.complete(origin.disk.complete(request)?)?;
     let other_ticket = other.coordinator.admit_mutation()?;
     let (other_resolved, ()) = other.disk.resolve(
         &other.profile,
@@ -2660,7 +2710,8 @@ fn durable_publications_retain_state_after_mismatched_authority() -> Result<()> 
     let home = origin.disk.sequence(sequence)?;
     let record = origin.disk.transfer(home.submit())?;
     let barrier = origin.disk.transfer(record.submit())?;
-    let publication = origin.disk.transfer(barrier.submit())?;
+    let (request, pending) = barrier.submit();
+    let publication = pending.complete(origin.disk.complete(request)?)?;
     let effects = origin.disk.storage_effects;
     let (error, publication) = publication
         .publish(&mut other.coordinator)
@@ -3257,7 +3308,8 @@ fn journaled_file_data_publishes_before_home_checkpoint() -> Result<()> {
     let payload = fixture.disk.sequence(payload_sequence)?;
     let commit_record = fixture.disk.transfer(payload.submit())?;
     let durability = fixture.disk.transfer(commit_record.submit())?;
-    let durable = fixture.disk.transfer(durability.submit())?;
+    let (request, pending) = durability.submit();
+    let durable = pending.complete(fixture.disk.complete(request)?)?;
     assert_eq!(fixture.disk.filesystem.get(home), Some(&b'a'));
     let (epoch, checkpoint) = durable
         .publish(
@@ -3287,7 +3339,8 @@ fn journaled_file_data_publishes_before_home_checkpoint() -> Result<()> {
     )?;
     let clean_record = fixture.disk.transfer(home_writes.submit())?;
     let clean_durability = fixture.disk.transfer(clean_record.submit())?;
-    let clean = fixture.disk.transfer(clean_durability.submit())?;
+    let (request, pending) = clean_durability.submit();
+    let clean = pending.complete(fixture.disk.complete(request)?)?;
     fixture.epoch = clean
         .publish(&mut fixture.coordinator)
         .map_err(|(error, _publication)| error)?;
@@ -3771,7 +3824,8 @@ impl Disk {
         let payload = self.sequence(payload_sequence)?;
         let commit_record = self.transfer(payload.submit())?;
         let durability = self.transfer(commit_record.submit())?;
-        let durable = self.transfer(durability.submit())?;
+        let (request, pending) = durability.submit();
+        let durable = pending.complete(self.complete(request)?)?;
         let (epoch, checkpoint) = durable
             .publish(
                 coordinator
@@ -3794,7 +3848,8 @@ impl Disk {
         )?;
         let clean_record = self.transfer(home.submit())?;
         let clean_durability = self.transfer(clean_record.submit())?;
-        let clean = self.transfer(clean_durability.submit())?;
+        let (request, pending) = clean_durability.submit();
+        let clean = pending.complete(self.complete(request)?)?;
         let epoch = clean
             .publish(coordinator)
             .map_err(|(error, _publication)| error)?;

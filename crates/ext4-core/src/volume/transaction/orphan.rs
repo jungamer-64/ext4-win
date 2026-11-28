@@ -14,7 +14,7 @@ const RELEASE_BLOCK_BUDGET: u64 = 1024;
 #[derive(Debug)]
 pub(in crate::volume) struct OrphanBatchCompletion {
     /// Journal cursor for a journaled batch; direct home updates have no journal cursor.
-    pub(in crate::volume) journal: Option<Journal<CleanJournal>>,
+    pub(in crate::volume) journal: Option<PreparedCleanJournal>,
     /// Allocation counts corresponding to checkpointed home metadata.
     pub(in crate::volume) clusters: ClusterReferenceIndex,
     /// Primary metadata including a possibly advanced fallback head.

@@ -427,14 +427,8 @@ impl ReservedMutation {
 
         let prepared =
             journal.prepare_commit(current_epoch.superblock.block_size(), self.resolved.image)?;
-        let (
-            planned_journal_writes,
-            planned_commit_write,
-            journal_target,
-            durable_journal,
-            overlay,
-            checkpoint,
-        ) = prepared.into_parts();
+        let (planned_journal_writes, planned_commit_write, journal_target, overlay, checkpoint) =
+            prepared.into_parts();
         let mut journal_writes = Vec::new();
         journal_writes
             .try_reserve_exact(planned_journal_writes.len())
@@ -489,7 +483,7 @@ impl ReservedMutation {
             journal_writes,
             commit_write,
             journal_target,
-            durable_journal,
+
             durable_epoch,
             checkpoint,
             version_publication,
@@ -523,9 +517,9 @@ impl CommitReadyMutation {
     /// retire mutation admission and recover the journal before admitting another commit.
     #[must_use]
     pub fn start(self) -> StorageRequestSequence<OrderedDataDurability> {
-        let durable = DurableMutation {
+        let durable = PreparedMutationPublication {
             claim: self.claim,
-            durable_journal: self.durable_journal,
+
             durable_epoch: self.durable_epoch,
             checkpoint: self.checkpoint,
             version_publication: self.version_publication,
@@ -562,24 +556,24 @@ impl DurableMutation {
         visibility: super::super::VisibilityLease,
         coordinator: &mut MutationCoordinatorState,
     ) -> core::result::Result<PublishedMutation, (Error, Self)> {
+        let prepared = self.0;
         if let Err((error, version_publication)) = coordinator.publish_durable(
             visibility,
-            self.claim,
-            &self.durable_epoch,
-            self.version_publication,
+            prepared.claim,
+            &prepared.durable_epoch,
+            prepared.version_publication,
         ) {
             return Err((
                 error,
-                Self {
+                Self(PreparedMutationPublication {
                     version_publication,
-                    ..self
-                },
+                    ..prepared
+                }),
             ));
         }
-        let _durable_journal = self.durable_journal;
         Ok(PublishedMutation {
-            epoch: self.durable_epoch,
-            checkpoint: self.checkpoint,
+            epoch: prepared.durable_epoch,
+            checkpoint: prepared.checkpoint,
         })
     }
 }
