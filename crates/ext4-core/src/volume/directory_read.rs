@@ -168,14 +168,14 @@ enum DirectoryReadBinding {
     /// A committed reader can continue through unrelated publications on the same filesystem.
     Observed {
         /// Filesystem whose directory mapping was decoded.
-        filesystem: super::mount::MountIdentity,
+        filesystem: super::session::MountIdentity,
         /// Directory version established by coordinator read admission.
         version: ResourceVersion,
     },
     /// Resolution has no committed version recorder; decoded progress belongs to its exact epoch.
     Resolution {
         /// Filesystem whose directory mapping was decoded.
-        filesystem: super::mount::MountIdentity,
+        filesystem: super::session::MountIdentity,
         /// Snapshot supplying all metadata interpreted by this resolution.
         epoch: super::EpochSequence,
     },

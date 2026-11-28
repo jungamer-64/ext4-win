@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 use core::mem::size_of;
 
-use super::mount::{CommittedEpoch, EpochSequence, MountIdentity};
+use super::session::{CommittedEpoch, EpochSequence, MountIdentity};
 use crate::disk::block::{BlockAddress, BlockSize, ByteOffset};
 use crate::memory;
 use crate::{Error, Result, StorageRequest, StorageTarget};

@@ -13,7 +13,7 @@ pub(super) fn initialized_contiguous_storage(
     size: BlockSize,
     context: ExtentTreeContext,
     source: &mut impl crate::disk_format::extent::ExtentNodeReader,
-    mount: super::mount::MountIdentity,
+    mount: super::session::MountIdentity,
     retained: Option<super::node::ContiguousFileStorage>,
 ) -> Result<Option<super::node::ContiguousFileStorage>> {
     inode.file_payload_mutation()?;

@@ -639,7 +639,7 @@ pub enum ChildLookup {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ContiguousFileStorage {
     /// Session replacement invalidates the observation even if inode and physical addresses recur.
-    pub(super) mount: super::mount::MountIdentity,
+    pub(super) mount: super::session::MountIdentity,
     /// Inode identity and generation whose excluded physical mapping establishes this byte fact.
     pub(super) inode: InodeId,
     /// Allocation retirement and inode reuse invalidate this observation.

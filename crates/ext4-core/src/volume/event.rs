@@ -6,20 +6,20 @@ use crate::StorageCompletion;
 #[derive(Debug)]
 pub struct MutationLease {
     /// Mount whose coordinator issued this authority.
-    mount: super::mount::MountIdentity,
+    mount: super::session::MountIdentity,
     /// FIFO mutation ticket retained across stale-plan re-resolution.
     ticket: u64,
 }
 
 impl MutationLease {
     /// Constructed only by the owning coordinator after external gate arbitration.
-    pub(super) fn new(mount: super::mount::MountIdentity, ticket: u64) -> Self {
+    pub(super) fn new(mount: super::session::MountIdentity, ticket: u64) -> Self {
         Self { mount, ticket }
     }
     /// Checks the issuing session; either outcome consumes this lease.
     /// # Errors
     /// Returns a conflict if the grant belongs to another mount.
-    pub(super) fn consume(self, mount: &super::mount::MountIdentity) -> crate::Result<u64> {
+    pub(super) fn consume(self, mount: &super::session::MountIdentity) -> crate::Result<u64> {
         if &self.mount != mount {
             return Err(crate::Error::ClusterReferenceConflict);
         }
@@ -46,20 +46,20 @@ pub(super) struct CommitClaim {
 #[derive(Debug)]
 pub struct CommitLease {
     /// Mount whose coordinator issued this authority.
-    mount: super::mount::MountIdentity,
+    mount: super::session::MountIdentity,
     /// FIFO mutation ticket selected by commit arbitration.
     claim: CommitClaim,
 }
 
 impl CommitLease {
     /// Constructed only by the coordinator after reserving the matching state transition.
-    pub(super) fn new(mount: super::mount::MountIdentity, claim: CommitClaim) -> Self {
+    pub(super) fn new(mount: super::session::MountIdentity, claim: CommitClaim) -> Self {
         Self { mount, claim }
     }
     /// Checks the issuing session; either outcome consumes this lease.
     /// # Errors
     /// Returns a conflict if the grant belongs to another mount.
-    pub(super) fn consume(self, mount: &super::mount::MountIdentity) -> crate::Result<CommitClaim> {
+    pub(super) fn consume(self, mount: &super::session::MountIdentity) -> crate::Result<CommitClaim> {
         if &self.mount != mount {
             return Err(crate::Error::ClusterReferenceConflict);
         }
@@ -77,20 +77,20 @@ impl CommitLease {
 #[derive(Debug)]
 pub struct VisibilityLease {
     /// Mount whose coordinator issued this authority.
-    mount: super::mount::MountIdentity,
+    mount: super::session::MountIdentity,
     /// FIFO mutation ticket whose durable values may be published.
     claim: CommitClaim,
 }
 
 impl VisibilityLease {
     /// Constructed only by the coordinator after reserving the matching state transition.
-    pub(super) fn new(mount: super::mount::MountIdentity, claim: CommitClaim) -> Self {
+    pub(super) fn new(mount: super::session::MountIdentity, claim: CommitClaim) -> Self {
         Self { mount, claim }
     }
     /// Checks the issuing session; either outcome consumes this lease.
     /// # Errors
     /// Returns a conflict if the grant belongs to another mount.
-    pub(super) fn consume(self, mount: &super::mount::MountIdentity) -> crate::Result<CommitClaim> {
+    pub(super) fn consume(self, mount: &super::session::MountIdentity) -> crate::Result<CommitClaim> {
         if &self.mount != mount {
             return Err(crate::Error::ClusterReferenceConflict);
         }
@@ -108,14 +108,14 @@ impl VisibilityLease {
 #[derive(Debug)]
 pub struct CheckpointLease {
     /// Mount whose coordinator issued this authority.
-    mount: super::mount::MountIdentity,
+    mount: super::session::MountIdentity,
     /// Sequence of the visible epoch whose overlay is being checkpointed.
     epoch: super::EpochSequence,
 }
 
 impl CheckpointLease {
     /// Constructed only after the coordinator acquires its pending checkpoint.
-    pub(super) fn new(mount: super::mount::MountIdentity, epoch: super::EpochSequence) -> Self {
+    pub(super) fn new(mount: super::session::MountIdentity, epoch: super::EpochSequence) -> Self {
         Self { mount, epoch }
     }
     /// Checks the issuing session; either outcome consumes this lease.
@@ -123,7 +123,7 @@ impl CheckpointLease {
     /// Returns a conflict if the grant belongs to another mount.
     pub(super) fn consume(
         self,
-        mount: &super::mount::MountIdentity,
+        mount: &super::session::MountIdentity,
     ) -> crate::Result<super::EpochSequence> {
         if &self.mount != mount {
             return Err(crate::Error::ClusterReferenceConflict);

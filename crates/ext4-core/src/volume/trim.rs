@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use core::num::{NonZeroU32, NonZeroU64};
 use ext4_shared::Shared;
 
-use super::mount::{
+use super::session::{
     CommittedEpoch, CommittedReadContext, EpochSequence, MountIdentity, MountedProfile,
     MutationCoordinatorState,
 };

@@ -34,7 +34,7 @@ pub(super) use crate::disk_format::inode::{
 pub(super) use crate::disk_format::journal::{CleanJournal, DirtyJournal, Journal, JournalBlock};
 pub(super) use crate::disk_format::name::Ext4Name;
 pub(super) use crate::disk_format::superblock::{
-    BlockGroupId, ClusterAddress, DirectoryIndexing, Ext4VolumeLabel, FreeClusterCount,
+    BlockGroupId, ClusterAddress, DirectoryIndexing, Ext4VolumeLabel,
     FreeClusterDelta, InodeTimestampEncoding, MetadataChecksum, SparseSuperblockLayout, Superblock,
     XattrMutationSupport,
 };
@@ -46,7 +46,7 @@ pub(super) use crate::memory::{self, FallibleVec};
 pub(super) use crate::protection::crypto::CryptographicOperation;
 pub(super) use crate::protection::fscrypt::{
     FscryptContentsKey, FscryptContextV2, FscryptFileNonce, FscryptInodeKey, FscryptKeyIdentifier,
-    FscryptKeyPresence, FscryptKeySet, FscryptMasterKey, FscryptNoKeyName,
+    FscryptKeySet, FscryptMasterKey, FscryptNoKeyName,
 };
 pub(super) use crate::protection::verity::{
     Ext4VerityMetadataLayout, FsverityDescriptor, FsverityEnable, FsverityMerkleTree,
@@ -69,11 +69,11 @@ pub(super) use super::inode_record::{
     AllocatedInodeRecord, AttributeInodeRecord, DeletedInodeRecord, InlinePayloadUpdate,
     LiveInodeRecord, RawInodeRecord, RecoverableOrphanInode, StagedInodeIndex, StagedInodeRecord,
 };
-pub(super) use super::mount::{
-    CheckpointAdmission, CommitAdmission, CommittedEpoch, EpochReadView, MountIdentity,
-    MountedProfile, MutationCoordinatorState, MutationResource, ObservedResourceVersionSet,
-    PublicationState, ReadObservations, ResourceVersion, ResourceVersionPublication,
+pub(super) use super::session::{
+    CommittedEpoch, MountIdentity, MountedProfile, MutationCoordinatorState, MutationResource,
+    ObservedResourceVersionSet, ReadObservations, ResourceVersion, ResourceVersionPublication,
 };
+pub(super) use super::view::EpochReadView;
 pub(super) use super::node::{
     ChildLookup, DirectoryEntry, DirectoryNode, DirectoryNodeId, FileNode, FileNodeId,
     HardLinkEntry, HardLinkNodeId, HardLinks, LoadedNode, NodeId, NodeMetadataSnapshot,

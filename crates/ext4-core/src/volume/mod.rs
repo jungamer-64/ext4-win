@@ -5,6 +5,7 @@ pub use access::{
     DeviceWriteAccess, MediaAccess, MountAccess, ReadOnlyRecovery, RecoveryMemoryLimit,
 };
 mod block_group;
+mod close;
 mod directory;
 mod directory_read;
 pub use directory_read::{DirectoryReadOperation, DirectoryReadTransition, DirectoryReader};
@@ -33,8 +34,11 @@ mod orphan;
 mod read;
 mod recovery;
 mod scope;
+mod session;
+mod session_marker;
 mod transaction;
 mod trim;
+mod view;
 pub use trim::{
     PendingTrim, PreparedTrim, TRIM_BATCH_BYTES, TRIM_BATCH_RANGES, TrimAdmission, TrimAlignment,
     TrimBatchResult, TrimCompletion, TrimCompletionMismatch, TrimCursor, TrimFailure,
@@ -43,14 +47,17 @@ pub use trim::{
 
 pub use directory::{DirectoryScanCursor, ScannedDirectoryEntry};
 pub use event::{CheckpointLease, CommitLease, MutationLease, OperationEvent, VisibilityLease};
+pub use close::{CleanCloseDurability, CleanCloseOperation, CleanCloseTransition};
 pub use mount::{
-    CleanCloseDurability, CleanCloseOperation, CleanCloseTransition, CommittedEpoch,
-    CommittedReadContext, CompletedMount, EpochSequence, ExternalJournalProbeOperation,
-    ExternalJournalProbeOutcome, ExternalJournalProbeTransition, ExternalJournalRequirement,
-    MountFailure, MountMediaOutcome, MountOperation, MountProbeOperation, MountProbeTransition,
-    MountTransition, MountedProfile, MutationCoordinatorState, MutationResolveContext,
-    MutationResource, ObservedResourceVersionSet, ProbedMount, ResourceVersion,
-    ValidatedExternalJournal, VolumeGeometry, VolumeIdentity,
+    CompletedMount, ExternalJournalProbeOperation, ExternalJournalProbeOutcome,
+    ExternalJournalProbeTransition, ExternalJournalRequirement, MountFailure, MountMediaOutcome,
+    MountOperation, MountProbeOperation, MountProbeTransition, MountTransition, ProbedMount,
+    ValidatedExternalJournal,
+};
+pub use session::{
+    CommittedEpoch, CommittedReadContext, EpochSequence, MountedProfile, MutationCoordinatorState,
+    MutationResolveContext, MutationResource, ObservedResourceVersionSet, ResourceVersion,
+    VolumeGeometry, VolumeIdentity,
 };
 pub use node::{
     ChildLookup, ContiguousFileStorage, DataAllocationRun, DirectoryChild, DirectoryEntry,

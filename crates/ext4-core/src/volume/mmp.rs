@@ -58,7 +58,7 @@ mod tests;
 #[derive(Debug)]
 pub struct MmpOwner {
     /// Non-reusable core session identity, independent of probabilistic device-visible identifiers.
-    mount: super::mount::MountIdentity,
+    mount: super::session::MountIdentity,
     /// Independent mount instance identity, encoded within the fixed nodename field.
     node: [u8; 64],
     /// Initial non-reserved sequence selected independently of other mounts.
@@ -69,7 +69,7 @@ impl MmpOwner {
     /// # Errors
     /// Returns session identity exhaustion before any ownership or filesystem write.
     pub fn new(entropy: [u8; 16]) -> Result<Self> {
-        let mount = super::mount::MountIdentity::new()?;
+        let mount = super::session::MountIdentity::new()?;
         let mut node = [0; 64];
         for (target, source) in node.iter_mut().zip(b"ext4-win:") {
             *target = *source;
@@ -93,7 +93,7 @@ impl MmpOwner {
         })
     }
     /// Observes the reserved origin without granting ownership or publication authority.
-    pub(super) const fn mount(&self) -> super::mount::MountIdentity {
+    pub(super) const fn mount(&self) -> super::session::MountIdentity {
         self.mount
     }
 }
@@ -213,7 +213,7 @@ impl MmpLease {
 #[derive(Debug)]
 pub struct MmpRenewingLease {
     /// Exact core session expected by the successor proof, including equal-entropy acquisitions.
-    mount: super::mount::MountIdentity,
+    mount: super::session::MountIdentity,
     /// Immutable physical and authentication scope of the transferred record update.
     parameters: MmpParameters,
     /// Expected mount-instance identity; observation does not grant another record-update operation.
