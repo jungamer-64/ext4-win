@@ -812,16 +812,8 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Path target -Force | Out-Null
-          Start-Transcript -Path target/driver-load-ci.log
-          try {
-            cargo xtask verify-hosted-driver-load
-            if ($LASTEXITCODE -ne 0) {
-              throw "Kernel initialization verification failed with exit code $LASTEXITCODE"
-            }
-          }
-          finally {
-            Stop-Transcript
-          }
+          ./.github/scripts/invoke-cargo-with-log.ps1 -LogPath target/driver-load-ci.log -CargoArguments @('xtask', 'verify-hosted-driver-load')
+          exit $LASTEXITCODE
 
       - name: Prepare stopped driver and disposable ext4 storage
         if: env.EXT4WIN_DRIVER_SCENARIO != 'load'
@@ -832,16 +824,8 @@ jobs:
           $sessionId = [Guid]::NewGuid().ToString("N")
           "LIVE_VHDX_SESSION=$sessionId" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           New-Item -ItemType Directory -Path target -Force | Out-Null
-          Start-Transcript -Path target/live-preparation-ci.log
-          try {
-            cargo xtask prepare-live-vhdx $sessionId
-            if ($LASTEXITCODE -ne 0) {
-              throw "Live ext4 preparation failed with exit code $LASTEXITCODE"
-            }
-          }
-          finally {
-            Stop-Transcript
-          }
+          ./.github/scripts/invoke-cargo-with-log.ps1 -LogPath target/live-preparation-ci.log -CargoArguments @('xtask', 'prepare-live-vhdx', $sessionId)
+          exit $LASTEXITCODE
 
       - name: Upload evidence before kernel activation
         if: always() && env.EXT4WIN_DRIVER_SCENARIO != 'load'
@@ -864,16 +848,8 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           New-Item -ItemType Directory -Path target -Force | Out-Null
-          Start-Transcript -Path target/live-vhdx-ci.log
-          try {
-            cargo xtask verify-live-vhdx $env:LIVE_VHDX_SESSION
-            if ($LASTEXITCODE -ne 0) {
-              throw "Live ext4 read-write verification failed with exit code $LASTEXITCODE"
-            }
-          }
-          finally {
-            Stop-Transcript
-          }
+          ./.github/scripts/invoke-cargo-with-log.ps1 -LogPath target/live-vhdx-ci.log -CargoArguments @('xtask', 'verify-live-vhdx', $env:LIVE_VHDX_SESSION)
+          exit $LASTEXITCODE
 
       - name: Reconcile interrupted live sessions
         if: always()
