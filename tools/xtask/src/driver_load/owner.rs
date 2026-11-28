@@ -519,9 +519,20 @@ pub(crate) fn install_session(
     id: SessionId,
     scope: Option<&crate::storage::DisposablePartition>,
 ) -> TaskResult<()> {
+    install_bundle(root, BundleIdentity::from_verified(bundle), id, scope)
+}
+
+/// Installs a sealed identity after checking current source, package bytes, signer and host scope.
+/// # Errors
+/// Returns package admission, installation, identity binding or observation failures.
+fn install_bundle(
+    root: &Path,
+    identity: BundleIdentity,
+    id: SessionId,
+    scope: Option<&crate::storage::DisposablePartition>,
+) -> TaskResult<()> {
     host_contract(root)?;
     crate::storage::assert_scope(scope)?;
-    let identity = BundleIdentity::from_verified(bundle);
     identity.source.require_unchanged(root)?;
     identity.revalidate(root)?;
     let signer = signer(&identity, true)?;
@@ -550,6 +561,25 @@ pub(crate) fn install_session(
     }
     println!("prepared service state: Stopped");
     session.publish(Phase::Observed(Operation::InstallPackage))
+}
+
+/// Reinstalls the exact completed session's package for a new load without disposable storage.
+/// # Errors
+/// Returns incomplete prior cleanup, stale package identity, or install failures.
+pub(crate) fn reinstall_completed_package(
+    root: &Path,
+    completed: &SessionId,
+    id: SessionId,
+) -> TaskResult<()> {
+    let session = recovered(root, completed)?;
+    if session.phase() != Phase::Complete
+        || !matches!(session.state().package, PackageState::Removed(_))
+    {
+        return Err(
+            io::Error::other("startup verification requires a completed package session").into(),
+        );
+    }
+    install_bundle(root, session.state().bundle.clone(), id, None)
 }
 
 /// Admits activation only from a completed, independently bound installation.

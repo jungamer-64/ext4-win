@@ -6,7 +6,8 @@ mod owner;
 #[cfg(windows)]
 pub(crate) use owner::{
     check_hosted_driver_host, cleanup_driver_load_session, install_session, quiesce_session,
-    resolve_driver_store_image, start_session, unload_requester, verify_hosted_driver_load,
+    reinstall_completed_package, resolve_driver_store_image, start_session, unload_requester,
+    verify_hosted_driver_load,
 };
 
 #[cfg(not(windows))]

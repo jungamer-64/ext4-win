@@ -13,7 +13,7 @@ use crate::{
     },
     live::{
         VerifierPlan, benchmark_multi_file, check_live_driver_host, cleanup_live_vhdx_session,
-        prepare_live_vhdx, verify_live_vhdx,
+        prepare_live_vhdx, verify_hosted_driver_startup, verify_live_vhdx,
     },
     process::repository_root,
     production::verify_production_driver,
@@ -49,6 +49,8 @@ enum Task {
     CheckHostedDriverHost,
     /// Builds one production bundle and proves its demand-start kernel initialization.
     VerifyHostedDriverLoad,
+    /// Loads the completed live session's package with Verifier selected before SCM start.
+    VerifyHostedDriverStartup,
     /// Reconciles one interrupted DriverStore/service lifecycle session.
     CleanupDriverLoadSession,
     /// Sends a secured lifecycle request from a separately supervised requester.
@@ -101,6 +103,8 @@ impl Task {
             Some(Self::CheckHostedDriverHost)
         } else if argument == "verify-hosted-driver-load" {
             Some(Self::VerifyHostedDriverLoad)
+        } else if argument == "verify-hosted-driver-startup" {
+            Some(Self::VerifyHostedDriverStartup)
         } else if argument == "cleanup-driver-load-session" {
             Some(Self::CleanupDriverLoadSession)
         } else if argument == UnloadRequest::QuiesceMounts.command() {
@@ -150,12 +154,20 @@ fn execute() -> TaskResult<()> {
         .and_then(Task::parse)
         .ok_or_else(usage_error)?;
     let task_argument = arguments.next();
-    if arguments.next().is_some() {
+    let startup_argument = arguments.next();
+    if arguments.next().is_some()
+        || (startup_argument.is_some() && task != Task::VerifyHostedDriverStartup)
+    {
         return Err(usage_error().into());
     }
 
     let repository_root = repository_root()?;
     match task {
+        Task::VerifyHostedDriverStartup => {
+            let live_id = task_argument.as_deref().ok_or_else(usage_error)?;
+            let startup_id = startup_argument.as_deref().ok_or_else(usage_error)?;
+            verify_hosted_driver_startup(&repository_root, live_id, startup_id)
+        }
         Task::CleanupDriverLoadSession => {
             let session_id = task_argument.as_deref().ok_or_else(usage_error)?;
             cleanup_driver_load_session(&repository_root, session_id)
@@ -220,7 +232,8 @@ fn execute() -> TaskResult<()> {
                 Task::CheckHostedDriverHost => check_hosted_driver_host(&repository_root),
                 Task::VerifyHostedDriverLoad => verify_hosted_driver_load(&repository_root),
                 Task::CheckLiveDriverHost => check_live_driver_host(&repository_root),
-                Task::CleanupDriverLoadSession
+                Task::VerifyHostedDriverStartup
+                | Task::CleanupDriverLoadSession
                 | Task::CleanupLiveVhdxSession
                 | Task::PrepareLiveVhdx
                 | Task::VerifyLiveVhdx(_)
@@ -241,7 +254,7 @@ fn execute() -> TaskResult<()> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: cargo xtask <verify-portable|verify-windows-host|verify-driver|verify-fuzz-replay|fuzz|verify-journal-interop|verify-ro-interop|verify-htree-interop|verify-journal-fixture-provenance|verify-production-driver|check-hosted-driver-host|verify-hosted-driver-load|cleanup-driver-load-session SESSION_ID|quiesce-driver-mounts SESSION_ID|prepare-driver-unload SESSION_ID|resolve-driver-store-image OEM_INF|check-live-driver-host|prepare-live-vhdx SESSION_ID|verify-live-vhdx SESSION_ID|verify-live-vhdx-boot-verifier SESSION_ID|benchmark-multi-file|cleanup-live-vhdx-session SESSION_ID>",
+        "usage: cargo xtask <verify-portable|verify-windows-host|verify-driver|verify-fuzz-replay|fuzz|verify-journal-interop|verify-ro-interop|verify-htree-interop|verify-journal-fixture-provenance|verify-production-driver|check-hosted-driver-host|verify-hosted-driver-load|verify-hosted-driver-startup LIVE_SESSION_ID STARTUP_SESSION_ID|cleanup-driver-load-session SESSION_ID|quiesce-driver-mounts SESSION_ID|prepare-driver-unload SESSION_ID|resolve-driver-store-image OEM_INF|check-live-driver-host|prepare-live-vhdx SESSION_ID|verify-live-vhdx SESSION_ID|verify-live-vhdx-boot-verifier SESSION_ID|benchmark-multi-file|cleanup-live-vhdx-session SESSION_ID>",
     )
 }
 
@@ -317,6 +330,10 @@ mod tests {
         assert_eq!(
             Task::parse(OsStr::new("check-live-driver-host")),
             Some(Task::CheckLiveDriverHost)
+        );
+        assert_eq!(
+            Task::parse(OsStr::new("verify-hosted-driver-startup")),
+            Some(Task::VerifyHostedDriverStartup)
         );
         assert_eq!(
             Task::parse(OsStr::new("verify-live-vhdx")),

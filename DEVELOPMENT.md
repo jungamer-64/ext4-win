@@ -21,6 +21,7 @@ Cargo commands for a canonical gate.
 | `cargo xtask verify-production-driver` | Windows with MSVC, WDK, `cargo-wdk`, WSL/e2fsprogs, and WSL root loop-mount authority | Runs the development and interoperability gates, builds and signs one identity-bound package, and verifies release reachability. |
 | `cargo xtask check-hosted-driver-host` | Elevated Windows host with `TESTSIGNING`, PnPUtil, SCM, and no existing ext4win package/service | Performs the read-only preflight for a kernel-load smoke session. |
 | `cargo xtask verify-hosted-driver-load` | A host that passes the hosted preflight and trusts the production signer in LocalMachine Root and Trusted Publishers | Builds one verified production bundle, installs that exact package, completes demand-start driver initialization, and requires service/package cleanup. |
+| `cargo xtask verify-hosted-driver-startup <live-session-id> <startup-session-id>` | Disposable hosted Windows boot, idle Driver Verifier, a finalized live VHDX session and a fresh startup session ID | Reinstalls the sealed package and verifies demand-start initialization under the pre-load Verifier selection. |
 | `cargo xtask cleanup-driver-load-session <session-id>` | Elevated Windows host | Reconciles an interrupted service/package session only after its durable bundle, signer, and package identities match. |
 | `cargo xtask check-live-driver-host` | Dedicated host that passes the hosted preflight and also provides Hyper-V PowerShell, WSL/e2fsprogs, and Driver Verifier | Performs the read-only preflight for disposable live VHDX validation. |
 | `cargo xtask prepare-live-vhdx <session-id>` | A host that passes the live preflight; a fresh 32-digit lowercase hexadecimal session ID | Builds one verified bundle, creates disposable ext4 storage and binds its installed service in the stopped state. |
@@ -299,7 +300,12 @@ departure and checks that the Verifier is idle. A boot-scoped selection that
 requires a reboot can be reconciled by running the session cleanup command after
 a new boot. Unknown report formats fail validation.
 
-To cover driver startup, configure the dedicated guest before reboot:
+The hosted live job then reinstalls the same package and selects deadlock
+detection for the unloaded image before SCM start. The gate requires an active
+Verifier report for the loaded image and confirms its departure and package
+removal. The runner's disposal releases the named selection for that boot.
+
+To apply the full DIF rule set from startup, configure the dedicated guest before reboot:
 
 ```powershell
 verifier.exe /dif 1 2 4 5 9 12 18 /driver ext4win.sys

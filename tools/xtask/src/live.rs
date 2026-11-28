@@ -8,7 +8,7 @@ pub(crate) use owner::benchmark_multi_file;
 #[cfg(windows)]
 pub(crate) use owner::{
     READ_REMOUNT_PAYLOAD, check_live_driver_host, cleanup_live_vhdx_session, prepare_live_vhdx,
-    read_remount_payload, verify_live_vhdx,
+    read_remount_payload, verify_hosted_driver_startup, verify_live_vhdx,
 };
 #[cfg(not(windows))]
 use std::{ffi::OsStr, io, path::Path};
@@ -40,6 +40,17 @@ pub(crate) fn verify_live_vhdx(
     root: &Path,
     _id: &OsStr,
     _verifier: VerifierPlan,
+) -> TaskResult<()> {
+    check_live_driver_host(root)
+}
+/// Rejects startup verification outside Windows.
+/// # Errors
+/// Always returns Unsupported on non-Windows hosts.
+#[cfg(not(windows))]
+pub(crate) fn verify_hosted_driver_startup(
+    root: &Path,
+    _live_id: &OsStr,
+    _startup_id: &OsStr,
 ) -> TaskResult<()> {
     check_live_driver_host(root)
 }

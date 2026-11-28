@@ -300,10 +300,29 @@ impl VerifierObservation {
     }
 }
 
+/// Checks required for the two independently configured Verifier workloads.
+#[derive(Clone, Copy)]
+enum VerifierRules {
+    /// Full DIF coverage during live filesystem I/O.
+    FilesystemIo,
+    /// Deadlock detection can be selected while the driver is still unloaded.
+    Startup,
+}
+
+impl VerifierRules {
+    /// Required bits in the current-boot Verifier report.
+    const fn flags(self) -> u32 {
+        match self {
+            Self::FilesystemIo => 0x0002_091b,
+            Self::Startup => 0x0000_0020,
+        }
+    }
+}
+
 /// Parses current-boot Driver Verifier activity and requires the requested observation.
 /// # Errors
 /// Returns unknown/localized, ambiguous, insufficient or unloaded reports.
-fn verifier_activity(report: &str) -> TaskResult<()> {
+fn verifier_activity(report: &str, rules: VerifierRules) -> TaskResult<()> {
     let mut flags = Vec::new();
     let mut modules = Vec::new();
     for line in report.lines().map(str::trim) {
@@ -342,9 +361,10 @@ fn verifier_activity(report: &str) -> TaskResult<()> {
     if loads <= unloads {
         return Err(io::Error::other("Verifier does not observe ext4win.sys loaded").into());
     }
-    if flags & 0x0002_091b != 0x0002_091b {
+    let required = rules.flags();
+    if flags & required != required {
         return Err(io::Error::other(format!(
-            "required runtime Verifier checks are missing from flags {flags:#010x}"
+            "Verifier flags {flags:#010x} do not include {required:#010x}"
         ))
         .into());
     }
@@ -381,7 +401,7 @@ fn observe_verifier(
 ) -> TaskResult<()> {
     let report = query_verifier()?;
     fs::write(session.directory().join(observation.file_name()), &report)?;
-    verifier_activity(&report)?;
+    verifier_activity(&report, VerifierRules::FilesystemIo)?;
     session.publish(Phase::Observed(Operation::ObserveVerifier))
 }
 
@@ -1592,6 +1612,62 @@ pub(crate) fn verify_live_vhdx(root: &Path, id: &OsStr, verifier: VerifierPlan) 
     Ok(())
 }
 
+/// Demand-starts the completed session's package under a pre-load Verifier selection.
+/// The disposable host owns the named selection for the rest of this boot.
+/// # Errors
+/// Returns incomplete live evidence, stale package identity, or load, Verifier or cleanup failure.
+pub(crate) fn verify_hosted_driver_startup(
+    root: &Path,
+    live_id: &OsStr,
+    startup_id: &OsStr,
+) -> TaskResult<()> {
+    driver_load::check_hosted_driver_host(root)?;
+    let live_id = SessionId::parse(live_id)?;
+    let startup = SessionId::parse(startup_id)?;
+    let live: Session<LiveState> = Session::load(root, "live-vhdx-sessions", &live_id)?;
+    if live.phase() != Phase::Complete {
+        return Err(
+            io::Error::other("startup verification requires a completed live session").into(),
+        );
+    }
+    let directory = root
+        .join("target/driver-load-sessions")
+        .join(startup.as_str());
+    if directory.exists() {
+        return Err(io::Error::other("startup requires a fresh driver-load session ID").into());
+    }
+    let operation = (|| {
+        require_idle_verifier()?;
+        driver_load::reinstall_completed_package(root, &live_id, startup.clone())?;
+        let rules = VerifierRules::Startup;
+        let _artifact = driver_load::start_session(root, &startup, None, || {
+            require_idle_verifier()?;
+            if windows_host::driver_image_loaded("ext4win.sys")? {
+                return Err(
+                    io::Error::other("Verifier startup requires an unloaded driver").into(),
+                );
+            }
+            let mut command = Command::new("verifier.exe");
+            command
+                .args(["/volatile", "/flags"])
+                .arg(format!("{:#010x}", rules.flags()))
+                .args(["/adddriver", "ext4win.sys"]);
+            run_checked(command, "select Driver Verifier before SCM start")
+        })?;
+        let report = query_verifier()?;
+        fs::write(directory.join("verifier-after-startup.txt"), &report)?;
+        verifier_activity(&report, rules)
+    })();
+    let cleanup = if directory.is_dir() {
+        driver_load::cleanup_driver_load_session(root, OsStr::new(startup.as_str()))
+    } else {
+        Ok(())
+    };
+    combine_verification_and_cleanup(operation, cleanup)?;
+    println!("hosted Driver Verifier startup assurance: PASS");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1752,11 +1828,12 @@ mod tests {
         reason = "contract assertions intentionally fail the test; external observation parsing preserves error context"
     )]
     fn runtime_and_partition_admission() -> TaskResult<()> {
-        let report = "Verifier Flags: 0x001209bb\nMODULE: ext4win.sys (load: 1 / unload: 0)";
-        verifier_activity(report)?;
-        assert!(verifier_activity(&report.replace("0x001209bb", "0x00000000")).is_err());
-        assert!(verifier_activity(&report.replace("load: 1", "load: 0")).is_err());
-        assert!(verifier_activity(&format!("{report}\n{report}")).is_err());
+        let report = "Verifier Flags: 0x0012091b\nMODULE: ext4win.sys (load: 1 / unload: 0)";
+        let rules = VerifierRules::FilesystemIo;
+        verifier_activity(report, rules)?;
+        assert!(verifier_activity(&report.replace("0x0012091b", "0x00000000"), rules).is_err());
+        assert!(verifier_activity(&report.replace("load: 1", "load: 0"), rules).is_err());
+        assert!(verifier_activity(&format!("{report}\n{report}"), rules).is_err());
 
         let partition = Partition {
             number: 2,
@@ -1794,5 +1871,16 @@ mod tests {
         assert_eq!(linux_partition(layout, &partition)?, "sde2");
         assert!(linux_partition(&format!("{layout}{layout}"), &partition).is_err());
         Ok(())
+    }
+
+    /// # Panics
+    /// Fails if an unloaded image or rules covering only runtime I/O satisfy the startup gate.
+    #[test]
+    fn startup_verifier_requires_deadlock_detection_on_the_loaded_driver() {
+        let rules = VerifierRules::Startup;
+        let report = "Verifier Flags: 0x00000020\nMODULE: ext4win.sys (load: 1 / unload: 0)";
+        assert!(verifier_activity(report, rules).is_ok());
+        assert!(verifier_activity(&report.replace("0x00000020", "0x0012091b"), rules).is_err());
+        assert!(verifier_activity(&report.replace("unload: 0", "unload: 1"), rules).is_err());
     }
 }
