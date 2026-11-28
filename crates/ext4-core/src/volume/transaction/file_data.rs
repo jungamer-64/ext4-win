@@ -186,8 +186,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 .superblock
                 .inode_data_encoding()
                 .encode_file_size(new_size)?;
-            let inode_index = pass.mutation.ensure_inode_update(file.inode())?;
-            let mut raw_inode = pass.mutation.staged_live_inode(inode_index)?;
+            let (edit, mut raw_inode) = pass.mutation.edit_live_inode(file.inode())?;
             let mut inode = raw_inode.parse()?;
             if inode.kind() != InodeKind::File {
                 return Err(Error::WrongInodeKind);
@@ -229,7 +228,9 @@ impl MutationResolvePass<'_, '_, '_> {
                     if pass.mutation.store_inline_file(&mut raw_inode, &payload)? {
                         pass.mutation.retire_file_privileges(&mut raw_inode)?;
                         raw_inode.touch_contents(pass.now)?;
-                        pass.mutation.replace_live_inode(inode_index, raw_inode)?;
+                        pass.mutation
+                            .inode_updates
+                            .finish_edit(edit, raw_inode.into())?;
                         return Ok(());
                     }
                 }
@@ -268,7 +269,9 @@ impl MutationResolvePass<'_, '_, '_> {
             }
             pass.mutation.retire_file_privileges(&mut raw_inode)?;
             raw_inode.touch_contents(pass.now)?;
-            pass.mutation.replace_live_inode(inode_index, raw_inode)?;
+            pass.mutation
+                .inode_updates
+                .finish_edit(edit, raw_inode.into())?;
             Ok(())
         })
     }
@@ -293,8 +296,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 .superblock
                 .inode_data_encoding()
                 .encode_file_size(FileSize::from_bytes(bound.bytes()))?;
-            let inode_index = pass.mutation.ensure_inode_update(file.inode())?;
-            let mut raw_inode = pass.mutation.staged_live_inode(inode_index)?;
+            let (edit, mut raw_inode) = pass.mutation.edit_live_inode(file.inode())?;
             pass.mutation.require_extent_storage(&mut raw_inode)?;
             let inode = raw_inode.parse()?;
             pass.require_file_data_mutation(&inode)?;
@@ -314,7 +316,9 @@ impl MutationResolvePass<'_, '_, '_> {
             pass.mutation.stage_extent_tree(&mut raw_inode, tree)?;
             pass.mutation.retire_file_privileges(&mut raw_inode)?;
             raw_inode.touch_metadata(pass.now)?;
-            pass.mutation.replace_live_inode(inode_index, raw_inode)?;
+            pass.mutation
+                .inode_updates
+                .finish_edit(edit, raw_inode.into())?;
             Ok(())
         })
     }
@@ -330,8 +334,7 @@ impl MutationResolvePass<'_, '_, '_> {
         bound: FileAllocationSize,
     ) -> Result<()> {
         self.edit(|pass| {
-            let inode_index = pass.mutation.ensure_inode_update(file.inode())?;
-            let mut raw_inode = pass.mutation.staged_live_inode(inode_index)?;
+            let (edit, mut raw_inode) = pass.mutation.edit_live_inode(file.inode())?;
             pass.mutation.require_extent_storage(&mut raw_inode)?;
             let inode = raw_inode.parse()?;
             pass.require_file_data_mutation(&inode)?;
@@ -348,7 +351,9 @@ impl MutationResolvePass<'_, '_, '_> {
             pass.mutation.stage_extent_tree(&mut raw_inode, tree)?;
             pass.mutation.retire_file_privileges(&mut raw_inode)?;
             raw_inode.touch_metadata(pass.now)?;
-            pass.mutation.replace_live_inode(inode_index, raw_inode)?;
+            pass.mutation
+                .inode_updates
+                .finish_edit(edit, raw_inode.into())?;
             pass.reserve_file_allocation(file, bound)
         })
     }
@@ -361,7 +366,7 @@ impl MutationResolvePass<'_, '_, '_> {
     /// Returns protected mutation, allocation-accounting, or extent staging failures.
     pub fn trim_file_allocation(&mut self, file: TransactionFile) -> Result<bool> {
         self.edit(|pass| {
-            let mut raw_inode = pass.mutation.raw_inode_for_policy(file.inode())?;
+            let raw_inode = pass.mutation.raw_inode_for_policy(file.inode())?;
             let inode = raw_inode.parse()?;
             if inode.protection().is_verity()
                 || matches!(inode.storage(), InodeStorage::InlineData(_))
@@ -387,10 +392,12 @@ impl MutationResolvePass<'_, '_, '_> {
                 return Ok(false);
             }
             pass.require_file_data_mutation(&inode)?;
-            let index = pass.mutation.ensure_inode_update(file.inode())?;
+            let (edit, mut raw_inode) = pass.mutation.edit_live_inode(file.inode())?;
             pass.retain_file_allocation(&mut tree, FileAllocationSize::from_bytes(bound))?;
             pass.mutation.stage_extent_tree(&mut raw_inode, tree)?;
-            pass.mutation.replace_live_inode(index, raw_inode)?;
+            pass.mutation
+                .inode_updates
+                .finish_edit(edit, raw_inode.into())?;
             Ok(true)
         })
     }
@@ -852,8 +859,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 .superblock
                 .inode_data_encoding()
                 .encode_file_size(new_size)?;
-            let inode_index = pass.mutation.ensure_inode_update(file.inode())?;
-            let mut raw_inode = pass.mutation.staged_live_inode(inode_index)?;
+            let (edit, mut raw_inode) = pass.mutation.edit_live_inode(file.inode())?;
             let mut inode = raw_inode.parse()?;
             pass.require_file_size_mutation(&inode)?;
             if new_size < inode.size() {
@@ -878,7 +884,9 @@ impl MutationResolvePass<'_, '_, '_> {
                     if pass.mutation.store_inline_file(&mut raw_inode, &payload)? {
                         pass.mutation.retire_file_privileges(&mut raw_inode)?;
                         raw_inode.touch_contents(pass.now)?;
-                        pass.mutation.replace_live_inode(inode_index, raw_inode)?;
+                        pass.mutation
+                            .inode_updates
+                            .finish_edit(edit, raw_inode.into())?;
                         return Ok(());
                     }
                 }
@@ -897,7 +905,9 @@ impl MutationResolvePass<'_, '_, '_> {
             raw_inode.set_encoded_size(encoded_size)?;
             pass.mutation.retire_file_privileges(&mut raw_inode)?;
             raw_inode.touch_contents(pass.now)?;
-            pass.mutation.replace_live_inode(inode_index, raw_inode)?;
+            pass.mutation
+                .inode_updates
+                .finish_edit(edit, raw_inode.into())?;
             Ok(())
         })
     }
@@ -915,8 +925,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 .superblock
                 .inode_data_encoding()
                 .encode_file_size(new_size)?;
-            let inode_index = pass.mutation.ensure_inode_update(file.inode())?;
-            let mut raw_inode = pass.mutation.staged_live_inode(inode_index)?;
+            let (edit, mut raw_inode) = pass.mutation.edit_live_inode(file.inode())?;
             let mut inode = raw_inode.parse()?;
             pass.require_file_size_mutation(&inode)?;
             if new_size > inode.size() {
@@ -941,7 +950,9 @@ impl MutationResolvePass<'_, '_, '_> {
                     if pass.mutation.store_inline_file(&mut raw_inode, &payload)? {
                         pass.mutation.retire_file_privileges(&mut raw_inode)?;
                         raw_inode.touch_contents(pass.now)?;
-                        pass.mutation.replace_live_inode(inode_index, raw_inode)?;
+                        pass.mutation
+                            .inode_updates
+                            .finish_edit(edit, raw_inode.into())?;
                         return Ok(());
                     }
                 }
@@ -980,7 +991,9 @@ impl MutationResolvePass<'_, '_, '_> {
             pass.mutation.stage_extent_tree(&mut raw_inode, tree)?;
             pass.mutation.retire_file_privileges(&mut raw_inode)?;
             raw_inode.touch_contents(pass.now)?;
-            pass.mutation.replace_live_inode(inode_index, raw_inode)?;
+            pass.mutation
+                .inode_updates
+                .finish_edit(edit, raw_inode.into())?;
             Ok(())
         })
     }
@@ -996,8 +1009,7 @@ impl MutationResolvePass<'_, '_, '_> {
     pub fn enable_verity(&mut self, file: TransactionFile, enable: &FsverityEnable) -> Result<()> {
         self.edit(|pass| {
             pass.mutation.volume.superblock.require_verity()?;
-            let inode_index = pass.mutation.ensure_inode_update(file.inode())?;
-            let mut raw_inode = pass.mutation.staged_live_inode(inode_index)?;
+            let (edit, mut raw_inode) = pass.mutation.edit_live_inode(file.inode())?;
             pass.mutation.require_extent_storage(&mut raw_inode)?;
             let inode = raw_inode.parse()?;
             if inode.kind() != InodeKind::File {
@@ -1062,7 +1074,9 @@ impl MutationResolvePass<'_, '_, '_> {
             }
             raw_inode.touch_metadata(pass.now)?;
             pass.mutation.stage_extent_tree(&mut raw_inode, tree)?;
-            pass.mutation.replace_live_inode(inode_index, raw_inode)?;
+            pass.mutation
+                .inode_updates
+                .finish_edit(edit, raw_inode.into())?;
             Ok(())
         })
     }

@@ -52,8 +52,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 ))
                 .map_err(|_| Error::ArithmeticOverflow)?;
             if count != 0 {
-                let index = pass.mutation.ensure_inode_update(file.inode())?;
-                let mut raw = pass.mutation.staged_live_inode(index)?;
+                let (edit, mut raw) = pass.mutation.edit_live_inode(file.inode())?;
                 pass.mutation.require_extent_storage(&mut raw)?;
                 let mut tree = pass.mutation.mutable_extent_tree(&raw.parse()?)?;
                 let origin = if let Some(previous) = previous {
@@ -116,7 +115,7 @@ impl MutationResolvePass<'_, '_, '_> {
                         .inode_data_encoding()
                         .encode_file_size(current)?,
                 )?;
-                pass.mutation.replace_live_inode(index, raw)?;
+                pass.mutation.inode_updates.finish_edit(edit, raw.into())?;
                 pass.write_file_range(
                     file,
                     FileOffset::from_bytes(current.bytes()),
@@ -124,7 +123,7 @@ impl MutationResolvePass<'_, '_, '_> {
                         .get(..count)
                         .ok_or(Error::InvalidWriteRange)?,
                 )?;
-                let mut raw = pass.mutation.staged_live_inode(index)?;
+                let (edit, mut raw) = pass.mutation.edit_live_inode(file.inode())?;
                 let mut tree = pass.mutation.mutable_extent_tree(&raw.parse()?)?;
                 tree.set_initialized_prefix(round_up_div(logical_size.bytes(), width)?)?;
                 pass.mutation.stage_extent_tree(&mut raw, tree)?;
@@ -135,7 +134,7 @@ impl MutationResolvePass<'_, '_, '_> {
                         .inode_data_encoding()
                         .encode_file_size(logical_size)?,
                 )?;
-                pass.mutation.replace_live_inode(index, raw)?;
+                pass.mutation.inode_updates.finish_edit(edit, raw.into())?;
                 initialized = Some(super::super::node::ContiguousFileStorage {
                     mount: pass
                         .mutation
@@ -152,10 +151,9 @@ impl MutationResolvePass<'_, '_, '_> {
                     logical_size,
                 });
             } else {
-                let index = pass.mutation.ensure_inode_update(file.inode())?;
-                let mut raw = pass.mutation.staged_live_inode(index)?;
+                let (edit, mut raw) = pass.mutation.edit_live_inode(file.inode())?;
                 raw.touch_metadata(pass.now)?;
-                pass.mutation.replace_live_inode(index, raw)?;
+                pass.mutation.inode_updates.finish_edit(edit, raw.into())?;
             }
             let initialized = pass.retained_contiguous_file_storage(
                 file.id(),
@@ -192,8 +190,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 .superblock
                 .inode_data_encoding()
                 .encode_file_size(size)?;
-            let index = pass.mutation.ensure_inode_update(file.inode())?;
-            let mut raw = pass.mutation.staged_live_inode(index)?;
+            let (edit, mut raw) = pass.mutation.edit_live_inode(file.inode())?;
             let mut tree = pass.mutation.mutable_extent_tree(&raw.parse()?)?;
             tree.set_initialized_prefix(round_up_div(
                 size.bytes(),
@@ -202,7 +199,7 @@ impl MutationResolvePass<'_, '_, '_> {
             pass.mutation.stage_extent_tree(&mut raw, tree)?;
             raw.set_encoded_size(encoded)?;
             raw.touch_contents(pass.now)?;
-            pass.mutation.replace_live_inode(index, raw)?;
+            pass.mutation.inode_updates.finish_edit(edit, raw.into())?;
             pass.retained_contiguous_file_storage(file.id(), initialized)
         })
     }

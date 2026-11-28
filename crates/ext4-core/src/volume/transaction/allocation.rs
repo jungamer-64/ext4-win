@@ -589,10 +589,7 @@ impl MetadataMutation<'_, '_> {
                     .ok_or(Error::InvalidSuperblock)?;
                 if inode_bitmap_bit_state(bitmap.bytes.as_slice(), position)?
                     == BitmapBitState::Free
-                    && !self
-                        .inode_updates
-                        .iter()
-                        .any(|record| record.id() == inode_id)
+                    && self.inode_updates.find(inode_id).is_none()
                 {
                     set_inode_bitmap_bit(
                         bitmap.bytes.as_mut_slice(),

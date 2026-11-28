@@ -135,7 +135,7 @@ pub(in crate::volume) fn prepare_orphan_batch(
         if let RecoverableOrphanInode::Unlinked(_) = inode {
             mutation.reclaim_inode(inode.raw())?;
         }
-        mutation.inode_updates.try_push(inode.finish()?)?;
+        mutation.inode_updates.insert(inode.finish()?)?;
         OrphanProgress::Complete
     } else {
         let allocation = target.allocation.releasing(superblock, &released)?;
@@ -145,7 +145,7 @@ pub(in crate::volume) fn prepare_orphan_batch(
         inode.raw_mut().set_encoded_allocation_size(encoded)?;
         mutation
             .inode_updates
-            .try_push(StagedInodeRecord::Recovering(inode))?;
+            .insert(StagedInodeRecord::Recovering(inode))?;
         OrphanProgress::Remaining(allocation)
     };
     let (clusters, mut next_superblock) = mutation.committed_cluster_state()?;

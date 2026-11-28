@@ -21,7 +21,7 @@ impl MetadataMutation<'_, '_> {
         {
             return Ok(JournalCommitImage::full(blocks));
         }
-        let [StagedInodeRecord::Live(inode)] = self.inode_updates.as_slice() else {
+        let Some(inode) = self.inode_updates.only_live() else {
             return Ok(JournalCommitImage::full(blocks));
         };
         let block = blocks.first().ok_or(Error::InvalidWriteRange)?;
@@ -166,7 +166,7 @@ impl MetadataMutation<'_, '_> {
                 bytes: self.updated_superblock_bytes(write_time)?,
             })?;
         }
-        for inode in &self.inode_updates {
+        for inode in self.inode_updates.resolved()? {
             let mut inode = inode.try_clone()?;
             inode.refresh_checksum(&self.volume.superblock)?;
             writes.try_push(RangeWrite {
@@ -291,7 +291,10 @@ impl MetadataMutation<'_, '_> {
             .try_reserve_exact(self.inode_updates.len())
             .map_err(|_| Error::OutOfMemory)?;
         for index in 0..self.inode_updates.len() {
-            let inode = self.inode_updates.get(index).ok_or(Error::InvalidInode)?;
+            let inode = self
+                .inode_updates
+                .record_at(index)
+                .ok_or(Error::InvalidInode)?;
             let inode_id = inode.id();
             match inode {
                 StagedInodeRecord::Live(_) => {

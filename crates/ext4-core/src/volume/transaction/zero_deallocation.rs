@@ -32,13 +32,12 @@ impl MutationResolvePass<'_, '_, '_> {
     pub fn set_zero_on_deallocation(&mut self, file: TransactionFile) -> Result<()> {
         self.edit(|pass| {
             require_zero_retirement_profile(pass.mutation.volume.superblock)?;
-            let index = pass.mutation.ensure_inode_update(file.inode())?;
-            let mut raw = pass.mutation.staged_live_inode(index)?;
+            let (edit, mut raw) = pass.mutation.edit_live_inode(file.inode())?;
             let _metadata = raw.parse()?.metadata_mutation()?;
             pass.mutation.require_extent_storage(&mut raw)?;
             raw.mark_zero_on_deallocation()?;
             pass.mutation.register_zero_on_deallocation(&raw.parse()?)?;
-            pass.mutation.replace_live_inode(index, raw)
+            pass.mutation.inode_updates.finish_edit(edit, raw.into())
         })
     }
 }

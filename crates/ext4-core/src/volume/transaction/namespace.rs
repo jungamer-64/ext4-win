@@ -120,8 +120,7 @@ impl MutationResolvePass<'_, '_, '_> {
     ) -> Result<()> {
         self.edit(|pass| {
             pass.mutation.volume.superblock.require_casefold()?;
-            let index = pass.mutation.ensure_inode_update(directory.inode())?;
-            let mut raw = pass.mutation.staged_live_inode(index)?;
+            let (edit, mut raw) = pass.mutation.edit_live_inode(directory.inode())?;
             let inode = raw.parse()?;
             if inode.kind() != InodeKind::Directory {
                 return Err(Error::WrongInodeKind);
@@ -184,7 +183,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 pass.mutation.stage_directory_block(physical, bytes)?;
             }
             raw.touch_metadata(pass.now)?;
-            pass.mutation.replace_live_inode(index, raw)
+            pass.mutation.inode_updates.finish_edit(edit, raw.into())
         })
     }
 
@@ -220,7 +219,7 @@ impl MutationResolvePass<'_, '_, '_> {
             pass.mutation.initialize_inline_file(&mut raw_inode)?;
             let inode_id = raw_inode.id();
             pass.add_directory_entry(parent.inode(), name, inode_id, DirectoryEntryKind::File)?;
-            pass.mutation.inode_updates.try_push(raw_inode.into())?;
+            pass.mutation.inode_updates.insert(raw_inode.into())?;
             Ok(TransactionFile {
                 id: FileNodeId::new(inode_id),
             })
@@ -236,8 +235,7 @@ impl MutationResolvePass<'_, '_, '_> {
     pub fn unlink_file(&mut self, parent: TransactionDirectory, name: &Ext4Name) -> Result<()> {
         self.edit(|pass| {
             let removed = pass.remove_directory_entry(parent.inode(), name)?;
-            let inode_index = pass.mutation.ensure_inode_update(removed.inode())?;
-            let mut raw_inode = pass.mutation.staged_live_inode(inode_index)?;
+            let (edit, mut raw_inode) = pass.mutation.edit_live_inode(removed.inode())?;
             let inode = raw_inode.parse()?;
             if inode.kind() != InodeKind::File {
                 return Err(Error::WrongInodeKind);
@@ -246,14 +244,18 @@ impl MutationResolvePass<'_, '_, '_> {
             match raw_inode.decrement_links_count()? {
                 LinkCountAfterDecrement::StillLinked(_) => {
                     raw_inode.touch_metadata(pass.now)?;
-                    pass.mutation.replace_live_inode(inode_index, raw_inode)?;
+                    pass.mutation
+                        .inode_updates
+                        .finish_edit(edit, raw_inode.into())?;
                 }
                 LinkCountAfterDecrement::Unlinked => {
                     pass.mutation.release_inode_data(&inode)?;
                     pass.mutation.reclaim_inode(raw_inode.raw())?;
                     let deleted =
                         raw_inode.delete(pass.now, pass.mutation.volume.superblock.block_size())?;
-                    pass.mutation.replace_deleted_inode(inode_index, deleted)?;
+                    pass.mutation
+                        .inode_updates
+                        .finish_edit(edit, deleted.into())?;
                 }
             }
             Ok(())
@@ -276,8 +278,7 @@ impl MutationResolvePass<'_, '_, '_> {
         self.edit(|pass| {
             reject_reserved_directory_name(target_name)?;
             let source_inode_id = source.inode();
-            let source_index = pass.mutation.ensure_inode_update(source_inode_id)?;
-            let mut raw_source = pass.mutation.staged_live_inode(source_index)?;
+            let (source_edit, mut raw_source) = pass.mutation.edit_live_inode(source_inode_id)?;
             let source_inode = raw_source.parse()?;
             let _namespace = source_inode.namespace_mutation()?;
             let target_parent_inode = pass
@@ -335,7 +336,9 @@ impl MutationResolvePass<'_, '_, '_> {
                 raw_source.increment_links_count()?;
             }
             raw_source.touch_metadata(pass.now)?;
-            pass.mutation.replace_live_inode(source_index, raw_source)?;
+            pass.mutation
+                .inode_updates
+                .finish_edit(source_edit, raw_source.into())?;
             Ok(())
         })
     }
@@ -452,7 +455,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 InodeBitmapPosition::from_inode(&pass.mutation.volume.superblock, inode_id)?
                     .group();
             pass.mutation.record_group_used_dirs_delta(group, 1)?;
-            pass.mutation.inode_updates.try_push(raw_inode.into())?;
+            pass.mutation.inode_updates.insert(raw_inode.into())?;
             Ok(TransactionDirectory {
                 id: DirectoryNodeId::new(inode_id),
             })
@@ -545,7 +548,7 @@ impl MutationResolvePass<'_, '_, '_> {
             };
             let inode_id = raw_inode.id();
             pass.add_directory_entry(parent.inode(), name, inode_id, DirectoryEntryKind::Symlink)?;
-            pass.mutation.inode_updates.try_push(raw_inode.into())?;
+            pass.mutation.inode_updates.insert(raw_inode.into())?;
             Ok(TransactionSymlink {
                 id: SymlinkNodeId::new(inode_id),
             })
@@ -567,8 +570,7 @@ impl MutationResolvePass<'_, '_, '_> {
             if removed.inode() == InodeId::ROOT {
                 return Err(Error::CannotRemoveRoot);
             }
-            let inode_index = pass.mutation.ensure_inode_update(removed.inode())?;
-            let raw_inode = pass.mutation.staged_live_inode(inode_index)?;
+            let (edit, raw_inode) = pass.mutation.edit_live_inode(removed.inode())?;
             let inode = raw_inode.parse()?;
             if inode.kind() != InodeKind::Directory {
                 return Err(Error::WrongInodeKind);
@@ -582,7 +584,9 @@ impl MutationResolvePass<'_, '_, '_> {
             pass.mutation.reclaim_inode(raw_inode.raw())?;
             let deleted =
                 raw_inode.delete(pass.now, pass.mutation.volume.superblock.block_size())?;
-            pass.mutation.replace_deleted_inode(inode_index, deleted)?;
+            pass.mutation
+                .inode_updates
+                .finish_edit(edit, deleted.into())?;
             pass.mutation
                 .decrement_directory_links(parent.inode(), pass.now)?;
             Ok(())
@@ -613,8 +617,11 @@ impl MutationResolvePass<'_, '_, '_> {
             if source_parent == target_parent && source_name == target_name {
                 return Ok(());
             }
-            let child_index = pass.mutation.ensure_inode_update(source.inode())?;
-            let child_inode = pass.mutation.staged_live_inode(child_index)?.parse()?;
+            pass.mutation.stage_live_inode(source.inode())?;
+            let child_inode = pass
+                .mutation
+                .raw_inode_for_policy(source.inode())?
+                .parse()?;
             let _namespace = child_inode.namespace_mutation()?;
             if child_inode.kind() == InodeKind::Directory && source.inode() == InodeId::ROOT {
                 return Err(Error::CannotRemoveRoot);
@@ -686,9 +693,11 @@ impl MutationResolvePass<'_, '_, '_> {
                 }
             }
 
-            let mut child_raw = pass.mutation.staged_live_inode(child_index)?;
+            let (child_edit, mut child_raw) = pass.mutation.edit_live_inode(source.inode())?;
             child_raw.touch_metadata(pass.now)?;
-            pass.mutation.replace_live_inode(child_index, child_raw)?;
+            pass.mutation
+                .inode_updates
+                .finish_edit(child_edit, child_raw.into())?;
             Ok(())
         })
     }
@@ -778,8 +787,7 @@ impl MutationResolvePass<'_, '_, '_> {
     pub fn remove_symlink(&mut self, parent: TransactionDirectory, name: &Ext4Name) -> Result<()> {
         self.edit(|pass| {
             let removed = pass.remove_directory_entry(parent.inode(), name)?;
-            let inode_index = pass.mutation.ensure_inode_update(removed.inode())?;
-            let mut raw_inode = pass.mutation.staged_live_inode(inode_index)?;
+            let (edit, mut raw_inode) = pass.mutation.edit_live_inode(removed.inode())?;
             let inode = raw_inode.parse()?;
             if inode.kind() != InodeKind::Symlink {
                 return Err(Error::WrongInodeKind);
@@ -790,7 +798,9 @@ impl MutationResolvePass<'_, '_, '_> {
                 LinkCountAfterDecrement::StillLinked(_)
             ) {
                 raw_inode.touch_metadata(pass.now)?;
-                pass.mutation.replace_live_inode(inode_index, raw_inode)?;
+                pass.mutation
+                    .inode_updates
+                    .finish_edit(edit, raw_inode.into())?;
                 return Ok(());
             }
             match inode.storage() {
@@ -803,7 +813,9 @@ impl MutationResolvePass<'_, '_, '_> {
             pass.mutation.reclaim_inode(raw_inode.raw())?;
             let deleted =
                 raw_inode.delete(pass.now, pass.mutation.volume.superblock.block_size())?;
-            pass.mutation.replace_deleted_inode(inode_index, deleted)?;
+            pass.mutation
+                .inode_updates
+                .finish_edit(edit, deleted.into())?;
             Ok(())
         })
     }
@@ -891,8 +903,7 @@ impl MutationResolvePass<'_, '_, '_> {
         child: InodeId,
         kind: DirectoryEntryKind,
     ) -> Result<()> {
-        let inode_index = self.mutation.ensure_inode_update(parent)?;
-        let mut raw_parent = self.mutation.staged_live_inode(inode_index)?;
+        let (edit, mut raw_parent) = self.mutation.edit_live_inode(parent)?;
         let mut parent_inode = raw_parent.parse()?;
         if parent_inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
@@ -927,7 +938,9 @@ impl MutationResolvePass<'_, '_, '_> {
                 },
             )? {
                 raw_parent.touch_contents(self.now)?;
-                self.mutation.replace_live_inode(inode_index, raw_parent)?;
+                self.mutation
+                    .inode_updates
+                    .finish_edit(edit, raw_parent.into())?;
                 return Ok(());
             }
             self.mutation.require_extent_storage(&mut raw_parent)?;
@@ -945,7 +958,9 @@ impl MutationResolvePass<'_, '_, '_> {
         self.mutation
             .insert_encoded_directory_entry(&mut raw_parent, entry)?;
         raw_parent.touch_contents(self.now)?;
-        self.mutation.replace_live_inode(inode_index, raw_parent)
+        self.mutation
+            .inode_updates
+            .finish_edit(edit, raw_parent.into())
     }
 
     /// Removes a child entry from a mutable directory.
@@ -958,8 +973,7 @@ impl MutationResolvePass<'_, '_, '_> {
         parent: InodeId,
         name: &Ext4Name,
     ) -> Result<RawDirectoryEntry> {
-        let inode_index = self.mutation.ensure_inode_update(parent)?;
-        let mut raw_parent = self.mutation.staged_live_inode(inode_index)?;
+        let (edit, mut raw_parent) = self.mutation.edit_live_inode(parent)?;
         let mut parent_inode = raw_parent.parse()?;
         if parent_inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
@@ -994,7 +1008,9 @@ impl MutationResolvePass<'_, '_, '_> {
                 },
             )? {
                 raw_parent.touch_contents(self.now)?;
-                self.mutation.replace_live_inode(inode_index, raw_parent)?;
+                self.mutation
+                    .inode_updates
+                    .finish_edit(edit, raw_parent.into())?;
                 return Ok(result);
             }
             self.mutation.require_extent_storage(&mut raw_parent)?;
@@ -1011,7 +1027,9 @@ impl MutationResolvePass<'_, '_, '_> {
         self.mutation
             .stage_directory_block(location.physical, location.block.into_bytes())?;
         raw_parent.touch_contents(self.now)?;
-        self.mutation.replace_live_inode(inode_index, raw_parent)?;
+        self.mutation
+            .inode_updates
+            .finish_edit(edit, raw_parent.into())?;
         Ok(removed)
     }
 
@@ -1025,8 +1043,7 @@ impl MutationResolvePass<'_, '_, '_> {
         new_name: &Ext4Name,
         kind: DirectoryEntryKind,
     ) -> Result<RawDirectoryEntry> {
-        let inode_index = self.mutation.ensure_inode_update(parent)?;
-        let mut raw_parent = self.mutation.staged_live_inode(inode_index)?;
+        let (edit, mut raw_parent) = self.mutation.edit_live_inode(parent)?;
         let mut parent_inode = raw_parent.parse()?;
         if parent_inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
@@ -1072,7 +1089,9 @@ impl MutationResolvePass<'_, '_, '_> {
                     })?
             {
                 raw_parent.touch_contents(self.now)?;
-                self.mutation.replace_live_inode(inode_index, raw_parent)?;
+                self.mutation
+                    .inode_updates
+                    .finish_edit(edit, raw_parent.into())?;
                 return Ok(result);
             }
             self.mutation.require_extent_storage(&mut raw_parent)?;
@@ -1099,7 +1118,9 @@ impl MutationResolvePass<'_, '_, '_> {
                 replacement,
             )?;
             raw_parent.touch_contents(self.now)?;
-            self.mutation.replace_live_inode(inode_index, raw_parent)?;
+            self.mutation
+                .inode_updates
+                .finish_edit(edit, raw_parent.into())?;
             return Ok(removed);
         }
         match location.block.rename(source.name(), &replacement) {
@@ -1107,7 +1128,9 @@ impl MutationResolvePass<'_, '_, '_> {
                 self.mutation
                     .stage_directory_block(location.physical, location.block.into_bytes())?;
                 raw_parent.touch_contents(self.now)?;
-                self.mutation.replace_live_inode(inode_index, raw_parent)?;
+                self.mutation
+                    .inode_updates
+                    .finish_edit(edit, raw_parent.into())?;
                 Ok(removed)
             }
             Ok(None) => Err(Error::DirectoryEntryNotFound),
@@ -1129,8 +1152,7 @@ impl MutationResolvePass<'_, '_, '_> {
     /// # Errors
     /// Returns policy, malformed special records, allocation or journal staging failure.
     fn reparent_directory(&mut self, directory: InodeId, parent: InodeId) -> Result<InodeId> {
-        let index = self.mutation.ensure_inode_update(directory)?;
-        let mut raw = self.mutation.staged_live_inode(index)?;
+        let (edit, mut raw) = self.mutation.edit_live_inode(directory)?;
         let mut inode = raw.parse()?;
         if inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
@@ -1146,7 +1168,7 @@ impl MutationResolvePass<'_, '_, '_> {
                     })?
             {
                 raw.touch_contents(self.now)?;
-                self.mutation.replace_live_inode(index, raw)?;
+                self.mutation.inode_updates.finish_edit(edit, raw.into())?;
                 return Ok(previous);
             }
             self.mutation.require_extent_storage(&mut raw)?;
@@ -1176,7 +1198,7 @@ impl MutationResolvePass<'_, '_, '_> {
         };
         self.mutation.stage_directory_block(physical, bytes)?;
         raw.touch_contents(self.now)?;
-        self.mutation.replace_live_inode(index, raw)?;
+        self.mutation.inode_updates.finish_edit(edit, raw.into())?;
         Ok(previous)
     }
 
@@ -1938,8 +1960,7 @@ impl MetadataMutation<'_, '_> {
             },
         };
         if parent.flags().has_inline_data() {
-            let index = self.ensure_inode_update(parent.id())?;
-            let mut raw = self.staged_live_inode(index)?;
+            let (edit, mut raw) = self.edit_live_inode(parent.id())?;
             let names = self.volume.superblock.name_semantics(&parent)?;
             if self
                 .edit_inline_directory(&mut raw, |_, first, second| {
@@ -1947,13 +1968,13 @@ impl MetadataMutation<'_, '_> {
                 })?
                 .is_some()
             {
-                return self.replace_live_inode(index, raw);
+                return self.inode_updates.finish_edit(edit, raw.into());
             }
             let mut attributes = self.xattr_set_for_raw_inode(&raw)?;
             self.convert_inline_data(&mut raw, &mut attributes)?;
             self.store_xattr_set(&mut raw, attributes, None)?;
             parent = raw.parse()?;
-            self.replace_live_inode(index, raw)?;
+            self.inode_updates.finish_edit(edit, raw.into())?;
         }
         let names = self.volume.superblock.name_semantics(&parent)?;
         let tree = self.mutable_extent_tree(&parent)?;
@@ -2165,16 +2186,17 @@ impl MetadataMutation<'_, '_> {
         program: &crate::disk_format::journal::fast_commit::DeltaProgram,
     ) -> Result<()> {
         for offset in 0..self.inode_updates.len() {
-            let is_directory = match self.inode_updates.get(offset).ok_or(Error::InvalidInode)? {
-                StagedInodeRecord::Live(raw) => raw.parse()?.kind() == InodeKind::Directory,
-                _ => false,
+            let StagedInodeRecord::Live(predecessor) = self
+                .inode_updates
+                .record_at(offset)
+                .ok_or(Error::InvalidInode)?
+            else {
+                continue;
             };
-            if !is_directory {
+            let inode = predecessor.parse()?;
+            if inode.kind() != InodeKind::Directory {
                 continue;
             }
-            let index = StagedInodeIndex::new(offset);
-            let mut raw = self.staged_live_inode(index)?;
-            let inode = raw.parse()?;
             let normalize_uncounted = inode.links_count().known_count().is_none()
                 && !inode.flags().has_indexed_directory();
             let mut structural_change = normalize_uncounted;
@@ -2201,8 +2223,9 @@ impl MetadataMutation<'_, '_> {
                 mutation.count_directory_children(entries, &inode, &mut links)?;
                 Ok(core::ops::ControlFlow::Continue(()))
             })?;
+            let (edit, mut raw) = self.edit_live_inode(inode.id())?;
             raw.replace_directory_links(links)?;
-            self.replace_live_inode(index, raw)?;
+            self.inode_updates.finish_edit(edit, raw.into())?;
         }
         Ok(())
     }
@@ -2244,10 +2267,9 @@ impl MetadataMutation<'_, '_> {
         match binding {
             LoggedBinding::AbsentIf { .. } => Ok(()),
             LoggedBinding::Present(entry) => {
-                let index = self.ensure_inode_update(parent)?;
-                let mut raw = self.staged_live_inode(index)?;
+                let (edit, mut raw) = self.edit_live_inode(parent)?;
                 self.insert_encoded_directory_entry(&mut raw, entry)?;
-                self.replace_live_inode(index, raw)
+                self.inode_updates.finish_edit(edit, raw.into())
             }
         }
     }

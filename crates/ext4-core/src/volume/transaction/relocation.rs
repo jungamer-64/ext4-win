@@ -46,8 +46,7 @@ impl MutationResolvePass<'_, '_, '_> {
             if destination_end > superblock.cluster_count().as_u64() {
                 return Err(Error::DeviceRange);
             }
-            let inode_index = pass.mutation.ensure_inode_update(file.inode())?;
-            let mut raw_inode = pass.mutation.staged_live_inode(inode_index)?;
+            let (edit, mut raw_inode) = pass.mutation.edit_live_inode(file.inode())?;
             let inode = raw_inode.parse()?;
             let _metadata = inode.metadata_mutation()?;
             let mut tree = pass.mutation.mutable_extent_tree(&inode)?;
@@ -137,7 +136,9 @@ impl MutationResolvePass<'_, '_, '_> {
             // Physical allocation queries can be followed by raw LCN reads. Journaled payload
             // images must therefore reach their new home addresses before MOVE acknowledges.
             pass.mutation.completion_durability = MutationCompletionDurability::HomeCheckpoint;
-            pass.mutation.replace_live_inode(inode_index, raw_inode)
+            pass.mutation
+                .inode_updates
+                .finish_edit(edit, raw_inode.into())
         })
     }
 }

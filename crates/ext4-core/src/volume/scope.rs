@@ -68,7 +68,7 @@ pub(super) use super::directory::{
 pub(super) use super::directory_read::DirectoryReader;
 pub(super) use super::inode_record::{
     AllocatedInodeRecord, AttributeInodeRecord, DeletedInodeRecord, InlinePayloadUpdate,
-    LiveInodeRecord, RawInodeRecord, RecoverableOrphanInode, StagedInodeIndex, StagedInodeRecord,
+    LiveInodeRecord, RawInodeRecord, RecoverableOrphanInode, StagedInodeRecord,
 };
 pub(super) use super::node::{
     ChildLookup, DirectoryEntry, DirectoryNode, DirectoryNodeId, FileNode, FileNodeId,

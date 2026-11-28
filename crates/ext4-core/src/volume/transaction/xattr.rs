@@ -263,26 +263,8 @@ impl MetadataMutation<'_, '_> {
             size: value.len(),
             checksum,
         };
-        self.stage_attribute_record(raw.into())?;
+        self.inode_updates.update_attribute(raw)?;
         Ok(location)
-    }
-    /// Publishes a private attribute-record successor within this transaction's sole inode index.
-    /// # Errors
-    /// Rejects namespace/deleted-role aliasing and physical allocation failure.
-    fn stage_attribute_record(&mut self, record: StagedInodeRecord) -> Result<()> {
-        if let Some(old) = self
-            .inode_updates
-            .iter_mut()
-            .find(|old| old.id() == record.id())
-        {
-            if !matches!(old, StagedInodeRecord::Attribute(_)) {
-                return Err(Error::InvalidXattr);
-            }
-            *old = record;
-            Ok(())
-        } else {
-            self.inode_updates.try_push(record)
-        }
     }
     /// Releases one physical entry reference, reclaiming storage only on the final reference.
     /// # Errors
@@ -304,7 +286,7 @@ impl MetadataMutation<'_, '_> {
                 .ok_or(Error::InvalidXattr)?,
         ) {
             raw.set_references(remaining)?;
-            return self.stage_attribute_record(raw.into());
+            return self.inode_updates.update_attribute(raw);
         }
         let data = header.data();
         let InodeStorage::Extents(root) = data.storage() else {
@@ -328,10 +310,8 @@ impl MetadataMutation<'_, '_> {
             return Err(Error::InvalidXattr);
         }
         self.free_inode(raw.id())?;
-        self.stage_attribute_record(
-            raw.retire(block_size, self.volume.superblock.inode_count())?
-                .into(),
-        )
+        self.inode_updates
+            .retire_attribute(raw.retire(block_size, self.volume.superblock.inode_count())?)
     }
     /// Releases inode-body value entries; shared external-block entries have separate ownership.
     /// # Errors
@@ -355,7 +335,7 @@ impl MetadataMutation<'_, '_> {
     /// # Errors
     /// Rejects another staged role or malformed/unallocated backing data.
     fn attribute_record(&mut self, id: InodeId) -> Result<AttributeInodeRecord> {
-        match self.inode_updates.iter().find(|record| record.id() == id) {
+        match self.inode_updates.find(id) {
             Some(StagedInodeRecord::Attribute(record)) => record.try_clone(),
             Some(_) => Err(Error::InvalidXattr),
             None => self.volume.read_raw_inode_record(id)?.into_attribute(),
@@ -450,8 +430,7 @@ impl MetadataMutation<'_, '_> {
         update: impl FnOnce(&mut XattrSet) -> Result<()>,
     ) -> Result<()> {
         self.require_xattr_mutation()?;
-        let inode_index = self.ensure_inode_update(node.inode())?;
-        let mut raw_inode = self.staged_live_inode(inode_index)?;
+        let (edit, mut raw_inode) = self.edit_live_inode(node.inode())?;
         let inode = raw_inode.parse()?;
         let _metadata = inode.metadata_mutation()?;
 
@@ -468,7 +447,7 @@ impl MetadataMutation<'_, '_> {
         }
         self.store_xattr_set(&mut raw_inode, set, None)?;
         raw_inode.touch_metadata(now)?;
-        self.replace_live_inode(inode_index, raw_inode)?;
+        self.inode_updates.finish_edit(edit, raw_inode.into())?;
         Ok(())
     }
 

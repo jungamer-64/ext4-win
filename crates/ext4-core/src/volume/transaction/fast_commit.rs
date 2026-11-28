@@ -164,7 +164,7 @@ pub(in crate::volume) fn resolve_delta_postconditions(
         }
         mutation
             .inode_updates
-            .try_push(StagedInodeRecord::Live(raw))?;
+            .insert(StagedInodeRecord::Live(raw))?;
     }
     for record in program.records() {
         if let ParsedDelta::Namespace {
@@ -493,7 +493,7 @@ impl MetadataMutation<'_, '_> {
                 {
                     continue;
                 }
-                let inode = if self.inode_updates.iter().any(|raw| raw.id() == id) {
+                let inode = if self.inode_updates.find(id).is_some() {
                     self.raw_inode_for_policy(id)?.parse()?
                 } else {
                     let raw = self.volume.read_raw_inode_record(id)?;
@@ -528,8 +528,7 @@ impl MetadataMutation<'_, '_> {
                 }
                 continue;
             }
-            let mut raw = self.raw_inode_for_policy(*id)?;
-            let index = self.ensure_inode_update(*id)?;
+            let (edit, mut raw) = self.edit_live_inode(*id)?;
             let inode = raw.parse()?;
             if references != 0 {
                 if inode.kind() == InodeKind::Directory {
@@ -540,8 +539,8 @@ impl MetadataMutation<'_, '_> {
                     raw.replace_file_links(Ext4LinkCount::new(
                         u16::try_from(references).map_err(|_| Error::InvalidInode)?,
                     )?)?;
-                    self.replace_live_inode(index, raw)?;
                 }
+                self.inode_updates.finish_edit(edit, raw.into())?;
             } else {
                 if inode.kind() == InodeKind::Directory && !self.directory_is_empty(&inode)? {
                     return Err(Error::DirectoryNotEmpty);
@@ -549,10 +548,7 @@ impl MetadataMutation<'_, '_> {
                 self.release_inode_data(&inode)?;
                 self.reclaim_inode(raw.raw())?;
                 let deleted = raw.retire_replayed(superblock.block_size())?;
-                *self
-                    .inode_updates
-                    .get_mut(index.get())
-                    .ok_or(Error::InvalidInode)? = StagedInodeRecord::Deleted(deleted);
+                self.inode_updates.finish_edit(edit, deleted.into())?;
             }
         }
         Ok(())

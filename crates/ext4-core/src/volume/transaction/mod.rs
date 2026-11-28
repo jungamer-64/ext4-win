@@ -12,6 +12,7 @@ mod contiguous;
 mod file_data;
 mod fscrypt;
 mod inline_data;
+mod inodes;
 mod namespace;
 mod orphan;
 mod relocation;
@@ -337,7 +338,7 @@ struct MetadataMutation<'storage, 'epoch> {
     volume: EpochReadView<'storage, 'epoch>,
     /// Unique inode identities staged for rewrite; deleted records reserve their identity
     /// until this transaction is published or discarded.
-    inode_updates: Vec<StagedInodeRecord>,
+    inode_updates: inodes::StagedInodes,
     /// Block bitmap images staged for allocation changes.
     block_bitmap_updates: Vec<BlockImage>,
     /// Inode bitmap images staged for allocation changes.
@@ -1119,8 +1120,7 @@ impl MutationResolvePass<'_, '_, '_> {
         security: Ext4Security,
     ) -> Result<()> {
         self.edit(|pass| {
-            let inode_index = pass.mutation.ensure_inode_update(node.inode())?;
-            let mut raw_inode = pass.mutation.staged_live_inode(inode_index)?;
+            let (edit, mut raw_inode) = pass.mutation.edit_live_inode(node.inode())?;
             let inode = raw_inode.parse()?;
             let _metadata = inode.metadata_mutation()?;
             let mut xattrs = pass.mutation.xattr_set_for_raw_inode(&raw_inode)?;
@@ -1139,7 +1139,9 @@ impl MutationResolvePass<'_, '_, '_> {
                 pass.mutation.retire_file_privileges(&mut raw_inode)?;
             }
             raw_inode.touch_metadata(pass.now)?;
-            pass.mutation.replace_live_inode(inode_index, raw_inode)?;
+            pass.mutation
+                .inode_updates
+                .finish_edit(edit, raw_inode.into())?;
             Ok(())
         })
     }
@@ -1151,12 +1153,13 @@ impl MutationResolvePass<'_, '_, '_> {
     /// inode record cannot be rewritten.
     pub fn set_times(&mut self, node: TransactionNode, times: Ext4Times) -> Result<()> {
         self.edit(|pass| {
-            let inode_index = pass.mutation.ensure_inode_update(node.inode())?;
-            let mut raw_inode = pass.mutation.staged_live_inode(inode_index)?;
+            let (edit, mut raw_inode) = pass.mutation.edit_live_inode(node.inode())?;
             let inode = raw_inode.parse()?;
             let _metadata = inode.metadata_mutation()?;
             raw_inode.set_ext4_times(times)?;
-            pass.mutation.replace_live_inode(inode_index, raw_inode)?;
+            pass.mutation
+                .inode_updates
+                .finish_edit(edit, raw_inode.into())?;
             Ok(())
         })
     }
@@ -1420,7 +1423,7 @@ impl<'storage, 'epoch> MetadataMutation<'storage, 'epoch> {
         Self {
             allocation,
             volume,
-            inode_updates: Vec::new(),
+            inode_updates: inodes::StagedInodes::default(),
             block_bitmap_updates: Vec::new(),
             inode_bitmap_updates: Vec::new(),
             directory_updates: Vec::new(),
@@ -1476,11 +1479,7 @@ impl MetadataMutation<'_, '_> {
     /// Returns an error when an existing staged record is deleted or the live inode cannot be read
     /// from the mounted device.
     fn raw_inode_for_policy(&mut self, inode_id: InodeId) -> Result<LiveInodeRecord> {
-        if let Some(raw_inode) = self
-            .inode_updates
-            .iter()
-            .find(|raw_inode| raw_inode.id() == inode_id)
-        {
+        if let Some(raw_inode) = self.inode_updates.find(inode_id) {
             return raw_inode.clone_live();
         }
         self.volume.read_live_inode_record(inode_id)
@@ -1643,11 +1642,10 @@ impl MetadataMutation<'_, '_> {
     /// Returns an error when the directory inode cannot be staged, its link count is saturated, or
     /// timestamps cannot be written.
     fn increment_directory_links(&mut self, inode_id: InodeId, now: Ext4Timestamp) -> Result<()> {
-        let inode_index = self.ensure_inode_update(inode_id)?;
-        let mut raw_inode = self.staged_live_inode(inode_index)?;
+        let (edit, mut raw_inode) = self.edit_live_inode(inode_id)?;
         raw_inode.increment_directory_links()?;
         raw_inode.touch_metadata(now)?;
-        self.replace_live_inode(inode_index, raw_inode)?;
+        self.inode_updates.finish_edit(edit, raw_inode.into())?;
         Ok(())
     }
 
@@ -1657,78 +1655,30 @@ impl MetadataMutation<'_, '_> {
     /// Returns an error when the directory inode cannot be staged or the decremented link count and
     /// timestamps cannot be written.
     fn decrement_directory_links(&mut self, inode_id: InodeId, now: Ext4Timestamp) -> Result<()> {
-        let inode_index = self.ensure_inode_update(inode_id)?;
-        let mut raw_inode = self.staged_live_inode(inode_index)?;
+        let (edit, mut raw_inode) = self.edit_live_inode(inode_id)?;
         raw_inode.decrement_directory_links()?;
         raw_inode.touch_metadata(now)?;
-        self.replace_live_inode(inode_index, raw_inode)?;
+        self.inode_updates.finish_edit(edit, raw_inode.into())?;
         Ok(())
     }
 
-    /// Returns the staged inode record index, loading it once when needed.
+    /// Stages a live predecessor once, preserving the pass's zero-on-deallocation observation.
     /// # Errors
-    ///
-    /// Returns an error when `inode_id` cannot be read as a live inode or the staged index cannot be
-    /// represented.
-    fn ensure_inode_update(&mut self, inode_id: InodeId) -> Result<StagedInodeIndex> {
-        if let Some(index) = self
-            .inode_updates
-            .iter()
-            .position(|inode| inode.id() == inode_id)
-        {
-            return Ok(StagedInodeIndex::new(index));
+    /// Returns inode validation, lower read, or staging allocation failure.
+    fn stage_live_inode(&mut self, id: InodeId) -> Result<()> {
+        if self.inode_updates.find(id).is_none() {
+            let record = self.volume.read_live_inode_record(id)?;
+            self.register_zero_on_deallocation(&record.parse()?)?;
+            self.inode_updates.insert(record.into())?;
         }
-        let raw_inode = self.volume.read_live_inode_record(inode_id)?;
-        self.register_zero_on_deallocation(&raw_inode.parse()?)?;
-        self.inode_updates.try_push(raw_inode.into())?;
-        Ok(StagedInodeIndex::new(
-            self.inode_updates
-                .len()
-                .checked_sub(1)
-                .ok_or(Error::ArithmeticOverflow)?,
-        ))
-    }
-
-    /// Returns a staged live inode record by index.
-    /// # Errors
-    ///
-    /// Returns an error when `index` is outside the staging vector or refers to a deleted inode.
-    fn staged_live_inode(&self, index: StagedInodeIndex) -> Result<LiveInodeRecord> {
-        self.inode_updates
-            .get(index.get())
-            .ok_or(Error::InvalidInode)?
-            .clone_live()
-    }
-
-    /// Replaces a staged inode with its updated live state.
-    /// # Errors
-    ///
-    /// Returns an error when `index` is outside the staged inode vector.
-    fn replace_live_inode(
-        &mut self,
-        index: StagedInodeIndex,
-        record: LiveInodeRecord,
-    ) -> Result<()> {
-        *self
-            .inode_updates
-            .get_mut(index.get())
-            .ok_or(Error::InvalidInode)? = record.into();
         Ok(())
     }
 
-    /// Replaces a staged inode with its deleted state.
+    /// Acquires exclusive edit authority and a private working copy of one live inode.
     /// # Errors
-    ///
-    /// Returns an error when `index` is outside the staged inode vector.
-    fn replace_deleted_inode(
-        &mut self,
-        index: StagedInodeIndex,
-        record: DeletedInodeRecord,
-    ) -> Result<()> {
-        *self
-            .inode_updates
-            .get_mut(index.get())
-            .ok_or(Error::InvalidInode)? = record.into();
-        Ok(())
+    /// Returns a staging failure or rejects an incompatible or already edited record.
+    fn edit_live_inode(&mut self, id: InodeId) -> Result<(inodes::InodeEdit, LiveInodeRecord)> {
+        self.stage_live_inode(id)?;
+        self.inode_updates.edit_live(id)
     }
 }

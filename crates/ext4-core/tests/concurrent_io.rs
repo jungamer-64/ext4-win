@@ -2374,6 +2374,10 @@ fn durable_label_change(fixture: &mut Fixture) -> Result<(u64, ext4_core::Durabl
     Ok((ticket, pending.complete(fixture.disk.complete(request)?)?))
 }
 
+/// # Errors
+/// Returns fixture, commit preparation or storage setup failures.
+/// # Panics
+/// Fails if an unsuccessful or foreign flush yields publication authority.
 #[test]
 #[expect(
     clippy::panic_in_result_fn,
