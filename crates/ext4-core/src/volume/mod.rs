@@ -14,6 +14,7 @@ mod inode_record;
 mod keys;
 pub use keys::{PreparedKeyChange, ReservedKeyChange, ResolvedKeyChange};
 mod fast_commit;
+mod htree;
 mod media_verification;
 mod metadata_cache;
 mod metadata_image;

@@ -1,6 +1,6 @@
 //! Bounded directory walks with owned continuation across lower-I/O completions.
 
-use super::read::{HtreePath, HtreePathLevel};
+use super::htree::HtreePath;
 use super::scope::*;
 use crate::disk::storage::{StorageTarget, StorageTranscript};
 use crate::disk_format::dir::DirectoryRecord;
@@ -97,12 +97,8 @@ enum HashPhase {
 struct HashWalk {
     /// Root-selected name hashing contract.
     hash: DirectoryIndexHash,
-    /// Number of interior levels below the root.
-    depth: u8,
     /// Current root-to-leaf path, possibly awaiting descendants.
     path: HtreePath,
-    /// Hash selecting descendants during an initial or resumed descent.
-    descend_major: u32,
     /// Root-owned special entries not yet consumed.
     dots: alloc::vec::IntoIter<RawDirectoryEntry>,
     /// Validated candidates of one leaf, descending by semantic key.
@@ -427,19 +423,12 @@ impl DirectoryReader {
                     for raw in root.dot_entries().iter().skip(dot_start) {
                         dots.try_push(raw.try_clone()?)?;
                     }
-                    let index = root.index().try_clone()?;
-                    let selected = index.select(major);
-                    let mut levels = Vec::new();
-                    levels.try_push(HtreePathLevel {
-                        logical: 0,
-                        index,
-                        selected,
-                    })?;
+                    let hash = root.hash_profile();
+                    let depth = root.indirect_levels();
+                    let path = HtreePath::new(root.into_index(), depth, major, ())?;
                     *layout = DirectoryLayout::Hash(memory::try_box(HashWalk {
-                        hash: root.hash_profile(),
-                        depth: root.indirect_levels(),
-                        path: HtreePath { levels },
-                        descend_major: major,
+                        hash,
+                        path,
                         dots: dots.into_iter(),
                         leaf: None,
                         after,
@@ -529,44 +518,6 @@ impl LinearWalk {
     }
 }
 
-impl HtreePath {
-    /// Next leaf boundary, derivable from resident ancestors without reading the next leaf.
-    fn next_boundary(&self) -> Option<u32> {
-        self.levels.iter().rev().find_map(|level| {
-            level
-                .selected
-                .checked_add(1)
-                .and_then(|index| level.index.entry(index))
-                .map(|entry| entry.hash())
-        })
-    }
-
-    /// Selects the next subtree once; descendant reads are separate resumable stages.
-    /// # Errors
-    /// Returns invalid path or arithmetic errors.
-    fn advance_route(&mut self) -> Result<bool> {
-        let Some(index) = self.levels.iter().rposition(|level| {
-            level
-                .selected
-                .checked_add(1)
-                .is_some_and(|next| next < level.index.len())
-        }) else {
-            return Ok(false);
-        };
-        let level = self
-            .levels
-            .get_mut(index)
-            .ok_or(Error::InvalidDirectoryEntry)?;
-        level.selected = level
-            .selected
-            .checked_add(1)
-            .ok_or(Error::ArithmeticOverflow)?;
-        self.levels
-            .truncate(index.checked_add(1).ok_or(Error::ArithmeticOverflow)?);
-        Ok(true)
-    }
-}
-
 impl HashWalk {
     /// Advances one route, leaf, collision selection, or yielded raw entry.
     /// # Errors
@@ -588,33 +539,17 @@ impl HashWalk {
         if matches!(self.phase, HashPhase::End) {
             return Ok(WalkStep::End);
         }
-        let expected = usize::from(self.depth)
-            .checked_add(1)
-            .ok_or(Error::ArithmeticOverflow)?;
-        if self.path.levels.len() < expected {
-            let logical = self.path.leaf()?;
-            let block = view.read_directory_logical_block(
-                directory.inode(),
-                mapping,
-                LogicalBlock::try_from(u64::from(logical))?,
-            )?;
+        if let Some(logical) = self.path.pending_index()? {
+            let block = view.read_directory_logical_block(directory.inode(), mapping, logical)?;
             let index =
                 DxIndex::parse_node(block.bytes(), view.directory_checksum(directory.inode()))?;
-            let selected = index.select(self.descend_major);
-            self.path.levels.try_push(HtreePathLevel {
-                logical,
-                index,
-                selected,
-            })?;
+            self.path.append_index(logical, index, ())?;
             self.path.hash_range()?;
             return Ok(WalkStep::Progress);
         }
         if self.leaf.is_none() {
-            let block = view.read_directory_logical_block(
-                directory.inode(),
-                mapping,
-                LogicalBlock::try_from(u64::from(self.path.leaf()?))?,
-            )?;
+            let block =
+                view.read_directory_logical_block(directory.inode(), mapping, self.path.leaf()?)?;
             let range = self.path.hash_range()?;
             let mut candidates = Vec::new();
             for raw in block.entries()? {
@@ -700,7 +635,6 @@ impl HashWalk {
                 if collision.overflow {
                     self.path = collision.start.try_clone()?;
                     self.leaf = None;
-                    self.descend_major = collision.major;
                     collision.overflow = false;
                     self.phase = HashPhase::Collect(collision);
                 }
@@ -735,7 +669,6 @@ impl HashWalk {
             self.phase = HashPhase::End;
         }
         self.leaf = None;
-        self.descend_major = 0;
         Ok(())
     }
 }
@@ -967,7 +900,16 @@ mod tests {
         let mut actual = Vec::new();
         for _page in 0..3 {
             let mut collision = Collision {
-                start: HtreePath { levels: Vec::new() },
+                start: HtreePath::new(
+                    DxIndex::root(
+                        1024,
+                        DirectoryChecksum::None,
+                        alloc::vec![DxEntry::new(0, 1)?],
+                    )?,
+                    0,
+                    2,
+                    (),
+                )?,
                 major: 2,
                 candidates: Vec::new(),
                 overflow: false,
@@ -1038,15 +980,12 @@ mod tests {
                 DirectoryHashVersion::Legacy,
                 DirectoryHashSignedness::Signed,
             )),
-            depth: 0,
-            path: HtreePath {
-                levels: alloc::vec![HtreePathLevel {
-                    logical: 0,
-                    index: DxIndex::root(1024, DirectoryChecksum::None, routes)?,
-                    selected: 0
-                }],
-            },
-            descend_major: 0,
+            path: HtreePath::new(
+                DxIndex::root(1024, DirectoryChecksum::None, routes)?,
+                0,
+                0,
+                (),
+            )?,
             dots: Vec::new().into_iter(),
             leaf: None,
             after: None,
@@ -1063,7 +1002,7 @@ mod tests {
                 for input in 0..301_u32 {
                     let index = input * 173 % 301;
                     let route = if index == 300 { 4 } else { index % 3 + 1 };
-                    if route != leaf {
+                    if u64::from(route) != leaf.as_u64() {
                         continue;
                     }
                     let name = Ext4Name::new(alloc::format!("n-{index:03}").as_bytes())?;

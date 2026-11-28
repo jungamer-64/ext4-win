@@ -2,6 +2,7 @@
 
 use core::num::NonZeroU64;
 
+use super::htree::HtreePath;
 use super::scope::*;
 
 /// Establishes the same initialized-map contract for committed and transaction-overlay readers.
@@ -223,90 +224,6 @@ struct VerityReadPlan {
     metadata: Ext4VerityMetadataLayout,
     /// Descriptor-owned Merkle geometry and proof state factory.
     verifier: FsverityVerifier,
-}
-
-/// One resident routing table in an on-demand HTree path.
-#[derive(Debug, Eq, PartialEq)]
-pub(super) struct HtreePathLevel {
-    /// Logical block containing this table (`0` for the root).
-    pub(super) logical: u32,
-    /// Validated root or interior-node routing table.
-    pub(super) index: DxIndex,
-    /// Child selected inside `index`.
-    pub(super) selected: usize,
-}
-
-/// Root-to-leaf route. Its length is bounded by the mounted HTree depth profile.
-#[derive(Debug, Eq, PartialEq)]
-pub(super) struct HtreePath {
-    /// Resident root-to-leaf index levels.
-    pub(super) levels: Vec<HtreePathLevel>,
-}
-
-impl HtreePath {
-    /// Copies this bounded route without introducing an infallible allocation path.
-    /// # Errors
-    ///
-    /// Returns an error when allocating either the level vector or a copied index fails.
-    pub(super) fn try_clone(&self) -> Result<Self> {
-        let mut levels = Vec::new();
-        levels
-            .try_reserve_exact(self.levels.len())
-            .map_err(|_| Error::OutOfMemory)?;
-        for level in &self.levels {
-            levels.try_push(HtreePathLevel {
-                logical: level.logical,
-                index: level.index.try_clone()?,
-                selected: level.selected,
-            })?;
-        }
-        Ok(Self { levels })
-    }
-
-    /// Returns the currently selected leaf logical block.
-    /// # Errors
-    ///
-    /// Returns an error when the path is empty, its selected route is absent, or it points back to
-    /// a resident index level.
-    pub(super) fn leaf(&self) -> Result<u32> {
-        let leaf = self
-            .levels
-            .last()
-            .and_then(|level| level.index.entry(level.selected))
-            .map(|entry| entry.block())
-            .ok_or(Error::InvalidDirectoryEntry)?;
-        if self.levels.iter().any(|level| level.logical == leaf) {
-            return Err(Error::InvalidDirectoryEntry);
-        }
-        Ok(leaf)
-    }
-
-    /// Returns the effective hash boundary for the currently selected leaf.
-    /// # Errors
-    ///
-    /// Returns an error when the path is empty or its selected route is absent.
-    pub(super) fn boundary(&self) -> Result<u32> {
-        if self.levels.is_empty() {
-            return Err(Error::InvalidDirectoryEntry);
-        }
-        let mut boundary = 0;
-        for level in &self.levels {
-            boundary = level.index.route_boundary(level.selected, boundary)?;
-        }
-        Ok(boundary)
-    }
-
-    /// Reconstructs the primary-hash interval selected by every resident path level.
-    /// # Errors
-    ///
-    /// Returns an error when any selected route is absent or violates its parent interval.
-    pub(super) fn hash_range(&self) -> Result<HtreeHashRange> {
-        let mut range = HtreeHashRange::root();
-        for level in &self.levels {
-            range = range.descend(&level.index, level.selected)?;
-        }
-        Ok(range)
-    }
 }
 
 impl EpochReadView<'_, '_> {
@@ -722,111 +639,20 @@ impl EpochReadView<'_, '_> {
         ))
     }
 
-    /// Builds a root-to-leaf path for a primary hash without reading unrelated leaves.
+    /// Loads only the interior nodes selected by the current validated route.
     /// # Errors
-    ///
-    /// Returns an error when a selected pointer is absent, out of range, cyclic, unreadable, or
-    /// does not contain a valid interior node.
-    fn htree_path_for_hash(
-        &mut self,
-        inode: &Inode,
-        tree: &mut ExtentMappingCursor,
-        root: DxIndex,
-        indirect_levels: u8,
-        major: u32,
-        checksum: DirectoryChecksum,
-    ) -> Result<HtreePath> {
-        let mut levels = Vec::new();
-        let selected = root.select(major);
-        levels.try_push(HtreePathLevel {
-            logical: 0,
-            index: root,
-            selected,
-        })?;
-        for _ in 0..indirect_levels {
-            let logical = levels
-                .last()
-                .and_then(|level| level.index.entry(level.selected))
-                .map(|entry| entry.block())
-                .ok_or(Error::InvalidDirectoryEntry)?;
-            if levels.iter().any(|level| level.logical == logical) {
-                return Err(Error::InvalidDirectoryEntry);
-            }
-            let block = self.read_directory_logical_block(
-                inode,
-                tree,
-                LogicalBlock::try_from(u64::from(logical))?,
-            )?;
-            let index = DxIndex::parse_node(block.bytes(), checksum)?;
-            let selected = index.select(major);
-            levels.try_push(HtreePathLevel {
-                logical,
-                index,
-                selected,
-            })?;
-        }
-        Ok(HtreePath { levels })
-    }
-
-    /// Advances one HTree path to its next leaf using at most one new node per descended level.
-    /// # Errors
-    ///
-    /// Returns an error when the path shape is invalid or a descended node is cyclic, unreadable,
-    /// or malformed.
-    fn advance_htree_path(
+    /// Returns routing, parse, storage or allocation failure.
+    fn complete_htree_descent(
         &mut self,
         inode: &Inode,
         tree: &mut ExtentMappingCursor,
         path: &mut HtreePath,
-        indirect_levels: u8,
-        checksum: DirectoryChecksum,
-    ) -> Result<bool> {
-        let expected_levels = usize::from(indirect_levels)
-            .checked_add(1)
-            .ok_or(Error::ArithmeticOverflow)?;
-        let Some(level_to_advance) = path.levels.iter().rposition(|level| {
-            level
-                .selected
-                .checked_add(1)
-                .is_some_and(|next| next < level.index.len())
-        }) else {
-            return Ok(false);
-        };
-        let level = path
-            .levels
-            .get_mut(level_to_advance)
-            .ok_or(Error::InvalidDirectoryEntry)?;
-        level.selected = level
-            .selected
-            .checked_add(1)
-            .ok_or(Error::ArithmeticOverflow)?;
-        path.levels.truncate(
-            level_to_advance
-                .checked_add(1)
-                .ok_or(Error::ArithmeticOverflow)?,
-        );
-        while path.levels.len() < expected_levels {
-            let logical = path
-                .levels
-                .last()
-                .and_then(|level| level.index.entry(level.selected))
-                .map(|entry| entry.block())
-                .ok_or(Error::InvalidDirectoryEntry)?;
-            if path.levels.iter().any(|level| level.logical == logical) {
-                return Err(Error::InvalidDirectoryEntry);
-            }
-            let block = self.read_directory_logical_block(
-                inode,
-                tree,
-                LogicalBlock::try_from(u64::from(logical))?,
-            )?;
-            path.levels.try_push(HtreePathLevel {
-                logical,
-                index: DxIndex::parse_node(block.bytes(), checksum)?,
-                selected: 0,
-            })?;
-        }
-        Ok(true)
+    ) -> Result<()> {
+        let checksum = self.directory_checksum(inode);
+        path.descend_with(|logical| {
+            let block = self.read_directory_logical_block(inode, tree, logical)?;
+            Ok((DxIndex::parse_node(block.bytes(), checksum)?, ()))
+        })
     }
 
     /// Finds one exact on-disk name without materializing unrelated directory leaves.
@@ -889,35 +715,23 @@ impl EpochReadView<'_, '_> {
                 {
                     return Ok(Some(entry.try_clone()?));
                 }
-                let major = query.major(root.hash_profile(), names)?;
-                let mut path = self.htree_path_for_hash(
-                    inode,
-                    &mut tree,
-                    root.index().try_clone()?,
-                    root.indirect_levels(),
-                    major,
-                    checksum,
-                )?;
+                let hash = root.hash_profile();
+                let major = query.major(hash, names)?;
+                let depth = root.indirect_levels();
+                let mut path = HtreePath::new(root.into_index(), depth, major, ())?;
+                self.complete_htree_descent(inode, &mut tree, &mut path)?;
                 loop {
-                    let leaf = self.read_directory_logical_block(
-                        inode,
-                        &mut tree,
-                        LogicalBlock::try_from(u64::from(path.leaf()?))?,
-                    )?;
+                    let leaf = self.read_directory_logical_block(inode, &mut tree, path.leaf()?)?;
                     let entries = leaf.entries()?;
-                    path.hash_range()?
-                        .validate_leaf(&entries, root.hash_profile(), names)?;
+                    path.hash_range()?.validate_leaf(&entries, hash, names)?;
                     if let Some(entry) = query.find(entries, crypto, names)? {
                         return Ok(Some(entry));
                     }
-                    if !self.advance_htree_path(
-                        inode,
-                        &mut tree,
-                        &mut path,
-                        root.indirect_levels(),
-                        checksum,
-                    )? || path.boundary()? & !1 != major
-                    {
+                    if !path.advance_route()? {
+                        return Ok(None);
+                    }
+                    self.complete_htree_descent(inode, &mut tree, &mut path)?;
+                    if path.boundary()? & !1 != major {
                         return Ok(None);
                     }
                 }

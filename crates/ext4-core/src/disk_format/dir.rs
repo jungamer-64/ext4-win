@@ -723,6 +723,11 @@ impl HtreeRoot {
     pub(crate) const fn index(&self) -> &DxIndex {
         &self.index
     }
+
+    /// Transfers the validated root table into the sole owner of an active route.
+    pub(crate) fn into_index(self) -> DxIndex {
+        self.index
+    }
 }
 
 /// Validates the two ordinary records shared by every root hash profile.

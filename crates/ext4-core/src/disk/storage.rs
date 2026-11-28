@@ -823,6 +823,8 @@ mod tests {
         Ok(())
     }
 
+    /// # Panics
+    /// Panics if a completion with the wrong operation kind is accepted.
     #[test]
     fn completion_kind_is_part_of_the_transfer_identity() {
         let request = || StorageRequest::Write {
