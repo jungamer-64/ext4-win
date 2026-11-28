@@ -386,6 +386,15 @@ pub(super) fn with_debug_privilege<T: Send>(
     with_thread_privilege("SeDebugPrivilege", work)
 }
 
+/// Runs symbolic-link operations with a private token that has the required privilege enabled.
+/// # Errors
+/// Returns privilege admission, operation, reversion or thread failure.
+pub(super) fn with_create_symbolic_link_privilege<T: Send>(
+    work: impl FnOnce() -> io::Result<T> + Send,
+) -> io::Result<T> {
+    with_thread_privilege("SeCreateSymbolicLinkPrivilege", work)
+}
+
 /// Runs synchronous work with one enabled privilege on a private impersonation token.
 /// # Errors
 /// Returns privilege admission, operation, reversion or thread failure.

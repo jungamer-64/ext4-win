@@ -1,6 +1,6 @@
 //! Reparse point and extended attribute observations on a disposable volume.
 
-use super::{FileHandle, completed};
+use super::{FileHandle, completed, identity::with_create_symbolic_link_privilege};
 use core::ptr;
 use std::{fs::File, io, path::Path};
 use windows_sys::{
@@ -25,15 +25,17 @@ use windows_sys::{
 /// Creates one empty probe file and checks the actual Windows FSCTL and EA contracts.
 /// The probe belongs to the caller's disposable volume.
 /// # Errors
-/// Returns native status, output, attribute-state, or handle finalization failures.
+/// Returns privilege admission, native status, output, attribute-state, or finalization failures.
 pub fn verify_reparse_point_lifecycle(path: &Path) -> io::Result<()> {
     super::close_file(File::create_new(path)?)?;
-    let file = FileHandle::open(
-        path,
-        FILE_READ_EA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE,
-        FILE_FLAG_OPEN_REPARSE_POINT,
-    )?;
-    completed(lifecycle(&file), file.close())
+    with_create_symbolic_link_privilege(|| {
+        let file = FileHandle::open(
+            path,
+            FILE_READ_EA | FILE_WRITE_EA | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+        )?;
+        completed(lifecycle(&file), file.close())
+    })
 }
 
 /// Checks both orders of the EA/reparse exclusion and the GET output boundaries.
