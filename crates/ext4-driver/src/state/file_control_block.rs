@@ -484,14 +484,14 @@ impl StagedNodeStreamMetadata {
 /// Preparation does not snapshot FCB addresses: publication resolves inode identities under the
 /// ledger guard after epoch visibility. Future opens initialize from that current epoch.
 #[derive(Debug)]
-pub(crate) struct PreparedStreamMetadataPublications {
+pub(crate) struct StreamMetadataUpdates {
     /// One final metadata projection per live inode changed by the reserved mutation.
     pub(super) nodes: DriverVec<NodeStreamMetadata>,
     /// Freed inode allocations whose current stream bindings must end at epoch visibility.
     pub(super) retired: DriverVec<InodeId>,
 }
 
-impl PreparedStreamMetadataPublications {
+impl StreamMetadataUpdates {
     /// Prepares all conversions and storage before the first lower write.
     /// # Errors
     ///
