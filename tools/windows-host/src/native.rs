@@ -227,6 +227,34 @@ impl Drop for FileHandle {
         }
     }
 }
+/// Checks that reading offset zero through a retained file handle reports a dismounted volume.
+/// # Errors
+/// Returns the unexpected Windows error or a successful read through the retired handle.
+pub fn require_dismounted_file_read(file: &std::fs::File) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    use windows_sys::Win32::Foundation::{RtlNtStatusToDosError, STATUS_VOLUME_DISMOUNTED};
+
+    let expected = unsafe {
+        // SAFETY: The conversion accepts a status value without borrowing any process memory.
+        RtlNtStatusToDosError(STATUS_VOLUME_DISMOUNTED)
+    };
+    match file.seek_read(&mut [0_u8; 1], 0) {
+        Err(error)
+            if error
+                .raw_os_error()
+                .is_some_and(|code| code.cast_unsigned() == expected) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(io::Error::other(format!(
+            "retired handle read returned {error}, expected Win32 error {expected}"
+        ))),
+        Ok(bytes) => Err(io::Error::other(format!(
+            "retired handle read succeeded with {bytes} bytes"
+        ))),
+    }
+}
+
 /// Combines a native operation with its required handle release.
 /// # Errors
 /// Preserves both failures if the operation and close fail.
@@ -2635,6 +2663,9 @@ pub use directory::{
 };
 mod short_names;
 pub use short_names::verify_short_name_lifecycle;
+
+mod reparse;
+pub use reparse::verify_reparse_point_lifecycle;
 
 mod trim;
 pub use trim::{TrimError, TrimSubmission, trim_volume};

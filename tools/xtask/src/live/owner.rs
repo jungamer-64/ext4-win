@@ -948,6 +948,8 @@ fn exercise_io(session: &mut Session<LiveState>, mount: &Path) -> TaskResult<Vec
         &root,
         windows_host::NamespaceAccess::RestorePrivilege,
     )?;
+    println!("live filesystem I/O: verify reparse-point control and extended attributes");
+    windows_host::verify_reparse_point_lifecycle(&root.join("reparse-probe.bin"))?;
     println!("live filesystem I/O: verify file metadata");
     windows_host::verify_metadata(&alpha, "\\live-ci\\alpha.bin", 8_192)?;
     println!("live filesystem I/O: query created-file security");
@@ -1385,6 +1387,8 @@ fn exercise_driver(
         .open(mount.join("live-ci/alpha.bin"))?;
     let remount = (|| -> TaskResult<()> {
         dismount_filesystem(session)?;
+        println!("live remount: verify the old handle rejects reads after dismount");
+        windows_host::require_dismounted_file_read(&retained)?;
         println!("live remount: read through a fresh open while the old handle remains");
         let mut requester = Command::new(env::current_exe()?);
         requester
@@ -1403,6 +1407,7 @@ fn exercise_driver(
             )
             .into());
         }
+        windows_host::require_dismounted_file_read(&retained)?;
         Ok(())
     })();
     println!("live remount: close the retained old handle");
