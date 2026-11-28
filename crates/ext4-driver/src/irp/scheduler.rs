@@ -646,15 +646,24 @@ impl Scheduler {
         index: usize,
         predicate: impl FnOnce(&Phase) -> bool,
     ) -> Option<SlotId> {
-        let slot = self.slots.get_mut(index)?;
-        if !predicate(&slot.phase) {
-            return None;
+        let identity = self.identity(index)?;
+        self.reclaim_phase(identity, predicate).then_some(identity)
+    }
+
+    /// Returns an external carrier only if its generation and phase both still match.
+    pub(super) fn reclaim_phase(
+        &mut self,
+        identity: SlotId,
+        expected: impl FnOnce(&Phase) -> bool,
+    ) -> bool {
+        let Some(slot) = self.slot_mut(identity) else {
+            return false;
+        };
+        if !expected(&slot.phase) {
+            return false;
         }
         slot.phase = Phase::Actor;
-        Some(SlotId {
-            index,
-            generation: slot.generation,
-        })
+        true
     }
 
     /// Returns an FsRtl-owned slot to the actor after synchronous return or callback completion.
@@ -2050,6 +2059,9 @@ mod tests {
         assert!(!scheduler.enter_retry(SlotId::from_parts(first.index(), first.generation())));
         assert!(scheduler.set_phase(reused, Phase::Retry));
         assert!(scheduler.enter_retry(reused));
+        assert!(scheduler.set_phase(reused, Phase::Passive));
+        assert!(!scheduler.reclaim_phase(first, |phase| matches!(phase, Phase::Passive)));
+        assert!(scheduler.reclaim_phase(reused, |phase| matches!(phase, Phase::Passive)));
         assert!(scheduler.complete(reused));
     }
 

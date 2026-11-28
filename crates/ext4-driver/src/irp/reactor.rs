@@ -946,12 +946,15 @@ enum SlotPayload {
     Observation(Box<dyn CompletionOperation>),
     /// Scheduler or the sole actor owns no shell payload in this slot.
     Empty,
-    /// Suspended operation, with an event only while scheduler phase is `Ready`.
-    Operation {
-        /// Owned operation state machine.
-        operation: Box<dyn CompletionOperation>,
-        /// Concrete event selected by the scheduler shell.
-        event: Option<CompletionEvent>,
+    /// Operation parked behind a scheduler grant or timer.
+    #[cfg(not(test))]
+    Waiting(SuspendedOperation),
+    /// Next actor turn together with its event.
+    Ready {
+        /// Owned continuation.
+        operation: SuspendedOperation,
+        /// Event selected by the scheduler shell.
+        event: CompletionEvent,
     },
     /// Reactor-owned media verification ready to resolve its worker outcome.
     #[cfg(not(test))]
@@ -984,8 +987,9 @@ impl fmt::Debug for SlotPayload {
             #[cfg(not(test))]
             Self::Observation(_) => formatter.write_str("Observation"),
             Self::Empty => formatter.write_str("Empty"),
-            Self::Operation { event: Some(_), .. } => formatter.write_str("ReadyOperation"),
-            Self::Operation { event: None, .. } => formatter.write_str("SuspendedOperation"),
+            #[cfg(not(test))]
+            Self::Waiting(_) => formatter.write_str("Waiting"),
+            Self::Ready { .. } => formatter.write_str("Ready"),
             #[cfg(not(test))]
             Self::Verification { .. } => formatter.write_str("ReadyVerification"),
             #[cfg(not(test))]
@@ -1010,6 +1014,77 @@ struct ShellSlot {
     disk_accounting: Option<super::DiskAccounting>,
     /// Pointer-bearing or callback-bearing payload owned by the WDK shell.
     payload: SlotPayload,
+}
+
+/// Registry owned by the sole actor. Callback envelopes live outside this registry.
+struct ActorSlots {
+    /// Pointer-free admission and grant policy.
+    scheduler: Scheduler,
+    /// Owned shell carriers at the corresponding scheduler slot indices.
+    payloads: [ShellSlot; MAX_OPERATIONS],
+}
+
+impl ActorSlots {
+    /// Borrows the carrier for an exact live generation.
+    fn slot_mut(&mut self, identity: SlotId) -> &mut ShellSlot {
+        if self.scheduler.identity(identity.index()) != Some(identity) {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        }
+        self.payloads.get_mut(identity.index()).unwrap_or_else(|| {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+        })
+    }
+
+    /// Changes scheduling and installs the matching carrier in the same actor turn.
+    fn publish(
+        &mut self,
+        identity: SlotId,
+        transition: impl FnOnce(&mut Scheduler) -> Option<SlotPayload>,
+    ) {
+        if self.scheduler.identity(identity.index()) != Some(identity) {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        }
+        let slot = self.payloads.get_mut(identity.index()).unwrap_or_else(|| {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+        });
+        if !matches!(slot.payload, SlotPayload::Empty) {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        }
+        let Some(payload) = transition(&mut self.scheduler) else {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        };
+        slot.payload = payload;
+    }
+
+    /// Takes the next ready carrier after selecting its exact generation.
+    fn take_ready(&mut self) -> Option<(SlotId, SlotPayload)> {
+        let identity = self.scheduler.take_ready()?;
+        let slot = self.slot_mut(identity);
+        Some((
+            identity,
+            core::mem::replace(&mut slot.payload, SlotPayload::Empty),
+        ))
+    }
+
+    /// Relinquishes a parked operation after its dependency resolved.
+    #[cfg(not(test))]
+    fn take_waiting(&mut self, identity: SlotId) -> SuspendedOperation {
+        let SlotPayload::Waiting(operation) =
+            core::mem::replace(&mut self.slot_mut(identity).payload, SlotPayload::Empty)
+        else {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        };
+        operation
+    }
+
+    /// Takes a retry carrier only after the exact timer generation returns.
+    #[cfg(not(test))]
+    fn take_retry(&mut self, identity: SlotId) -> SlotPayload {
+        if !self.scheduler.enter_retry(identity) {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        }
+        core::mem::replace(&mut self.slot_mut(identity).payload, SlotPayload::Empty)
+    }
 }
 
 /// Native relative timer units selected before arming an address-stable envelope.
@@ -1447,10 +1522,8 @@ pub(crate) struct CompletionReactor {
     notifications: super::notification::NotificationPool,
     /// System-thread handle joined during teardown.
     thread_handle: AtomicPtr<c_void>,
-    /// Pure pointer-free scheduling authority owned by the sole actor.
-    scheduler: UnsafeCell<Scheduler>,
-    /// Fixed WDK-shell payload registry; callbacks never dereference these values.
-    payloads: UnsafeCell<[ShellSlot; MAX_OPERATIONS]>,
+    /// Scheduling and shell ownership change together on the actor.
+    slots: UnsafeCell<ActorSlots>,
     /// One address-stable native timer envelope per bounded active slot.
     operation_timers: [OperationTimerEnvelope; MAX_OPERATIONS],
     /// One native timer shared by the complete mounted-volume delayed-close set.
@@ -1900,9 +1973,14 @@ impl CompletionReactor {
             // SAFETY: This field is initialized exactly once before any reactor observer exists.
             destination.write(UnsafeCell::new(target));
         }
+        let actor_slots = unsafe {
+            // SAFETY: The unpublished reactor owns the uninitialized slot registry.
+            core::ptr::addr_of_mut!((*reactor).slots)
+        };
+        let actor_slots = UnsafeCell::raw_get(actor_slots);
         let destination = unsafe {
-            // SAFETY: Project the uninitialized array without borrowing the complete reactor.
-            core::ptr::addr_of_mut!((*reactor).payloads)
+            // SAFETY: Project the disjoint array without borrowing the registry.
+            core::ptr::addr_of_mut!((*actor_slots).payloads)
         };
         let slots = unsafe {
             // SAFETY: UnsafeCell and MaybeUninit preserve layout; every slot is exclusively owned.
@@ -1937,7 +2015,7 @@ impl CompletionReactor {
         }
         let scheduler = unsafe {
             // SAFETY: The scheduler field is still uninitialized and exclusively owned.
-            core::ptr::addr_of_mut!((*reactor).scheduler)
+            core::ptr::addr_of_mut!((*actor_slots).scheduler)
         };
         let scheduler = unsafe {
             // SAFETY: UnsafeCell and MaybeUninit preserve Scheduler layout and alignment.
@@ -2029,8 +2107,7 @@ impl CompletionReactor {
             device: _,
             trace: _,
             target: _,
-            scheduler: _,
-            payloads: _,
+            slots: _,
             operation_timers: _,
             cancel_envelopes: _,
         } = reactor;
@@ -2503,48 +2580,31 @@ impl CompletionReactor {
         core::ptr::null_mut()
     }
 
-    /// Executes one non-suspending transition against the pointer-free scheduler model.
+    /// Gives a non-reentrant actor transition both scheduling and shell authority.
     #[expect(
         unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        reason = "the reactor actor exclusively owns scheduling and shell state"
     )]
+    fn with_slots<R>(&self, transition: impl FnOnce(&mut ActorSlots) -> R) -> R {
+        let slots = unsafe {
+            // SAFETY: Callbacks only access atomics and their inbox, never the actor slots.
+            &mut *self.slots.get()
+        };
+        transition(slots)
+    }
+
+    /// Applies scheduling policy independent of the shell carrier.
     fn with_scheduler<R>(&self, transition: impl FnOnce(&mut Scheduler) -> R) -> R {
-        let scheduler = unsafe {
-            // SAFETY: Scheduler state is accessed only by the sole reactor actor or isolated tests.
-            &mut *self.scheduler.get()
-        };
-        transition(scheduler)
+        self.with_slots(|slots| transition(&mut slots.scheduler))
     }
 
-    /// Executes one non-suspending transition against WDK-shell payload storage.
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
-    fn with_payloads<R>(
-        &self,
-        transition: impl FnOnce(&mut [ShellSlot; MAX_OPERATIONS]) -> R,
-    ) -> R {
-        let payloads = unsafe {
-            // SAFETY: Callbacks publish only atomics and never dereference shell payloads.
-            &mut *self.payloads.get()
-        };
-        transition(payloads)
-    }
-
-    /// Detaches one shell operation payload for sole-actor transition logic.
-    #[cfg(not(test))]
-    fn take_operation_payload(&self, index: usize) -> SuspendedOperation {
-        self.with_payloads(|payloads| {
-            let Some(slot) = payloads.get_mut(index) else {
-                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-            };
-            let payload = core::mem::replace(&mut slot.payload, SlotPayload::Empty);
-            let SlotPayload::Operation { operation, .. } = payload else {
-                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-            };
-            operation
-        })
+    /// Publishes the carrier with the phase that owns it.
+    fn publish_slot(&self, identity: SlotId, phase: Phase, payload: SlotPayload) {
+        self.with_slots(|slots| {
+            slots.publish(identity, |scheduler| {
+                scheduler.set_phase(identity, phase).then_some(payload)
+            });
+        });
     }
 
     /// Reserves one vacant slot before its stable active-cancel envelope becomes visible.
@@ -2618,30 +2678,22 @@ impl CompletionReactor {
         let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index)) else {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         };
-        let Some(start) = self.with_scheduler(|scheduler| {
-            scheduler.install(identity, admission.scheduler_admission(), cancelled)
-        }) else {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        };
-        self.with_payloads(|payloads| {
-            let Some(slot) = payloads.get_mut(index) else {
-                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-            };
-            if !matches!(slot.payload, SlotPayload::Empty) {
-                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-            }
-            slot.payload = SlotPayload::Operation {
-                operation,
-                event: match start {
-                    AdmissionStart::Cancelled => {
-                        Some(CompletionEvent::Core(OperationEvent::CancelRequested))
-                    }
-                    AdmissionStart::HandleTurn => None,
-                    AdmissionStart::Admitted => {
-                        Some(CompletionEvent::Core(OperationEvent::Admitted))
-                    }
-                },
-            };
+        self.with_slots(|slots| {
+            slots.publish(identity, |scheduler| {
+                let start =
+                    scheduler.install(identity, admission.scheduler_admission(), cancelled)?;
+                Some(match start {
+                    AdmissionStart::HandleTurn => SlotPayload::Waiting(operation),
+                    AdmissionStart::Cancelled => SlotPayload::Ready {
+                        operation,
+                        event: CompletionEvent::Core(OperationEvent::CancelRequested),
+                    },
+                    AdmissionStart::Admitted => SlotPayload::Ready {
+                        operation,
+                        event: CompletionEvent::Core(OperationEvent::Admitted),
+                    },
+                })
+            });
         });
 
         if let OperationAdmission::Handle {
@@ -2695,14 +2747,12 @@ impl CompletionReactor {
         let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index)) else {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         };
-        if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Ready)) {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        }
-        self.install_payload(
-            index,
-            SlotPayload::Operation {
+        self.publish_slot(
+            identity,
+            Phase::Ready,
+            SlotPayload::Ready {
                 operation: suspended,
-                event: Some(CompletionEvent::Core(OperationEvent::CancelRequested)),
+                event: CompletionEvent::Core(OperationEvent::CancelRequested),
             },
         );
         None
@@ -2736,15 +2786,10 @@ impl CompletionReactor {
         let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index)) else {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         };
-        if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Ready)) {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        }
-        self.install_payload(
-            index,
-            SlotPayload::Operation {
-                operation,
-                event: Some(event),
-            },
+        self.publish_slot(
+            identity,
+            Phase::Ready,
+            SlotPayload::Ready { operation, event },
         );
     }
 
@@ -2767,11 +2812,9 @@ impl CompletionReactor {
         let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index)) else {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         };
-        if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Ready)) {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        }
-        self.install_payload(
-            index,
+        self.publish_slot(
+            identity,
+            Phase::Ready,
             SlotPayload::Verification {
                 verification,
                 event,
@@ -2829,10 +2872,41 @@ impl CompletionReactor {
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
     fn request_active_cancel(&self, index: usize) {
-        match self.with_scheduler(|scheduler| scheduler.request_cancel(index)) {
+        let disposition = self.with_slots(|slots| {
+            let disposition = slots.scheduler.request_cancel(index);
+            if matches!(disposition, CancelDisposition::ResumeOperation) {
+                let identity = slots.scheduler.identity(index).unwrap_or_else(|| {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+                });
+                let slot = slots.slot_mut(identity);
+                let cancelled = CompletionEvent::Core(OperationEvent::CancelRequested);
+                match &mut slot.payload {
+                    SlotPayload::Ready { event, .. } | SlotPayload::Verification { event, .. } => {
+                        let previous = core::mem::replace(event, cancelled);
+                        *event = previous.prefer_cancellation(true);
+                    }
+                    SlotPayload::Waiting(_) => {
+                        let SlotPayload::Waiting(operation) =
+                            core::mem::replace(&mut slot.payload, SlotPayload::Empty)
+                        else {
+                            KernelWideInconsistency::completion_reactor_state_corruption()
+                                .bugcheck();
+                        };
+                        slot.payload = SlotPayload::Ready {
+                            operation,
+                            event: cancelled,
+                        };
+                    }
+                    _ => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
+                }
+            }
+            disposition
+        });
+        match disposition {
             CancelDisposition::Ignored | CancelDisposition::AwaitRegistration => {}
             CancelDisposition::AwaitRetry => {
-                let observation = self.with_payloads(|payloads| {
+                let observation = self.with_slots(|slots| {
+                    let payloads = &mut slots.payloads;
                     payloads
                         .get(index)
                         .is_some_and(|slot| matches!(slot.payload, SlotPayload::Observation(_)))
@@ -2849,22 +2923,11 @@ impl CompletionReactor {
                             KernelWideInconsistency::completion_reactor_state_corruption()
                                 .bugcheck()
                         });
-                    if !self.with_scheduler(|scheduler| scheduler.enter_retry(identity)) {
+                    let SlotPayload::Observation(operation) =
+                        self.with_slots(|slots| slots.take_retry(identity))
+                    else {
                         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                    }
-                    let operation = self.with_payloads(|payloads| {
-                        let slot = payloads.get_mut(index).unwrap_or_else(|| {
-                            KernelWideInconsistency::completion_reactor_state_corruption()
-                                .bugcheck()
-                        });
-                        let SlotPayload::Observation(operation) =
-                            core::mem::replace(&mut slot.payload, SlotPayload::Empty)
-                        else {
-                            KernelWideInconsistency::completion_reactor_state_corruption()
-                                .bugcheck()
-                        };
-                        operation
-                    });
+                    };
                     self.set_ready_operation_event(
                         index,
                         operation,
@@ -2872,36 +2935,10 @@ impl CompletionReactor {
                     );
                 }
             }
-            CancelDisposition::ResumeOperation => {
-                self.with_payloads(|payloads| {
-                    let Some(slot) = payloads.get_mut(index) else {
-                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                    };
-                    match &mut slot.payload {
-                        SlotPayload::Operation { event, .. } => {
-                            *event = Some(
-                                event
-                                    .take()
-                                    .unwrap_or(CompletionEvent::Core(
-                                        OperationEvent::CancelRequested,
-                                    ))
-                                    .prefer_cancellation(true),
-                            );
-                        }
-                        SlotPayload::Verification { event, .. } => {
-                            let ready = core::mem::replace(
-                                event,
-                                CompletionEvent::Core(OperationEvent::CancelRequested),
-                            );
-                            *event = ready.prefer_cancellation(true);
-                        }
-                        _ => KernelWideInconsistency::completion_reactor_state_corruption()
-                            .bugcheck(),
-                    }
-                });
-            }
+            CancelDisposition::ResumeOperation => {}
             CancelDisposition::CancelLower => {
-                self.with_payloads(|payloads| {
+                self.with_slots(|slots| {
+                    let payloads = &mut slots.payloads;
                     let Some(slot) = payloads.get(index) else {
                         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                     };
@@ -2915,7 +2952,8 @@ impl CompletionReactor {
                 });
             }
             CancelDisposition::CancelOplock => {
-                self.with_payloads(|payloads| {
+                self.with_slots(|slots| {
+                    let payloads = &mut slots.payloads;
                     let Some(slot) = payloads.get(index) else {
                         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                     };
@@ -3522,7 +3560,8 @@ impl CompletionReactor {
                     KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
                 });
                 let accounting = owned.take_disk_accounting();
-                self.with_payloads(|payloads| {
+                self.with_slots(|slots| {
+                    let payloads = &mut slots.payloads;
                     let slot = payloads.get_mut(index).unwrap_or_else(|| {
                         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
                     });
@@ -3576,21 +3615,14 @@ impl CompletionReactor {
     fn drive_ready_operations(&self) -> bool {
         let mut progressed = false;
         loop {
-            let Some(identity) = self.with_scheduler(Scheduler::take_ready) else {
+            let Some((identity, payload)) = self.with_slots(ActorSlots::take_ready) else {
                 return progressed;
             };
             let index = identity.index();
-            let payload = self.with_payloads(|payloads| {
-                let Some(slot) = payloads.get_mut(index) else {
-                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                };
-                core::mem::replace(&mut slot.payload, SlotPayload::Empty)
-            });
             let transition = match payload {
-                SlotPayload::Operation {
-                    operation,
-                    event: Some(event),
-                } => self.with_target(|target| operation.advance(event, target)),
+                SlotPayload::Ready { operation, event } => {
+                    self.with_target(|target| operation.advance(event, target))
+                }
                 SlotPayload::Verification {
                     verification,
                     event,
@@ -3663,11 +3695,13 @@ impl CompletionReactor {
                             KernelWideInconsistency::completion_reactor_state_corruption()
                                 .bugcheck()
                         });
-                    if !self.with_scheduler(|scheduler| scheduler.begin_observation_timer(identity))
-                    {
-                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                    }
-                    self.install_payload(index, SlotPayload::Observation(suspended));
+                    self.with_slots(|slots| {
+                        slots.publish(identity, |scheduler| {
+                            scheduler
+                                .begin_observation_timer(identity)
+                                .then_some(SlotPayload::Observation(suspended))
+                        });
+                    });
                     self.operation_timers
                         .get(index)
                         .unwrap_or_else(|| {
@@ -3785,29 +3819,22 @@ impl CompletionReactor {
                     else {
                         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                     };
-                    let Some(disposition) = self
-                        .with_scheduler(|scheduler| scheduler.request_intent(identity, request))
-                    else {
-                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                    };
-                    match disposition {
-                        IntentDisposition::Retained => self.install_payload(
-                            index,
-                            SlotPayload::Operation {
-                                operation: suspended,
-                                event: Some(CompletionEvent::Core(OperationEvent::IntentGranted(
-                                    self.with_mounted_access(|access| access.grant_intent(ticket)),
-                                ))),
-                            },
-                        ),
-                        IntentDisposition::Queued => self.install_payload(
-                            index,
-                            SlotPayload::Operation {
-                                operation: suspended,
-                                event: None,
-                            },
-                        ),
-                    }
+                    self.with_slots(|slots| {
+                        slots.publish(identity, |scheduler| {
+                            let disposition = scheduler.request_intent(identity, request)?;
+                            Some(match disposition {
+                                IntentDisposition::Retained => SlotPayload::Ready {
+                                    operation: suspended,
+                                    event: CompletionEvent::Core(OperationEvent::IntentGranted(
+                                        self.with_mounted_access(|access| {
+                                            access.grant_intent(ticket)
+                                        }),
+                                    )),
+                                },
+                                IntentDisposition::Queued => SlotPayload::Waiting(suspended),
+                            })
+                        });
+                    });
                     self.grant_available_intents();
                 }
                 OperationTransition::RequestCommit { ticket, suspended } => {
@@ -3818,17 +3845,13 @@ impl CompletionReactor {
                     else {
                         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                     };
-                    if !self.with_scheduler(|scheduler| scheduler.request_commit(identity, ticket))
-                    {
-                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                    }
-                    self.install_payload(
-                        index,
-                        SlotPayload::Operation {
-                            operation: suspended,
-                            event: None,
-                        },
-                    );
+                    self.with_slots(|slots| {
+                        slots.publish(identity, |scheduler| {
+                            scheduler
+                                .request_commit(identity, ticket)
+                                .then_some(SlotPayload::Waiting(suspended))
+                        });
+                    });
                     self.grant_available_commit();
                 }
                 OperationTransition::DeliverEvent { operation, event } => {
@@ -3836,16 +3859,10 @@ impl CompletionReactor {
                     else {
                         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                     };
-                    if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Ready))
-                    {
-                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                    }
-                    self.install_payload(
-                        index,
-                        SlotPayload::Operation {
-                            operation,
-                            event: Some(event),
-                        },
+                    self.publish_slot(
+                        identity,
+                        Phase::Ready,
+                        SlotPayload::Ready { operation, event },
                     );
                 }
                 OperationTransition::DeferOperation { suspended } => {
@@ -3855,17 +3872,7 @@ impl CompletionReactor {
                             KernelWideInconsistency::completion_reactor_state_corruption()
                                 .bugcheck()
                         });
-                    if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Retry))
-                    {
-                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                    }
-                    self.install_payload(
-                        index,
-                        SlotPayload::Operation {
-                            operation: suspended,
-                            event: None,
-                        },
-                    );
+                    self.publish_slot(identity, Phase::Retry, SlotPayload::Waiting(suspended));
                     self.operation_timers
                         .get(index)
                         .unwrap_or_else(|| {
@@ -3894,17 +3901,13 @@ impl CompletionReactor {
                     else {
                         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                     };
-                    if !self.with_scheduler(|scheduler| scheduler.request_wait(identity, condition))
-                    {
-                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                    }
-                    self.install_payload(
-                        index,
-                        SlotPayload::Operation {
-                            operation: suspended,
-                            event: None,
-                        },
-                    );
+                    self.with_slots(|slots| {
+                        slots.publish(identity, |scheduler| {
+                            scheduler
+                                .request_wait(identity, condition)
+                                .then_some(SlotPayload::Waiting(suspended))
+                        });
+                    });
                     self.grant_available_wait(index);
                 }
                 OperationTransition::WaitForClosingDrain {
@@ -3915,18 +3918,13 @@ impl CompletionReactor {
                     else {
                         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                     };
-                    if !self.with_scheduler(|scheduler| {
-                        scheduler.request_closing_wait(identity, condition)
-                    }) {
-                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                    }
-                    self.install_payload(
-                        index,
-                        SlotPayload::Operation {
-                            operation: suspended,
-                            event: None,
-                        },
-                    );
+                    self.with_slots(|slots| {
+                        slots.publish(identity, |scheduler| {
+                            scheduler
+                                .request_closing_wait(identity, condition)
+                                .then_some(SlotPayload::Waiting(suspended))
+                        });
+                    });
                     self.grant_available_wait(index);
                 }
                 OperationTransition::Publish { publication } => {
@@ -4023,7 +4021,8 @@ impl CompletionReactor {
     /// Ends attribution only when no continuation or lower completion retains this slot.
     #[cfg(not(test))]
     fn release_disk_accounting(&self, index: usize) {
-        let accounting = self.with_payloads(|payloads| {
+        let accounting = self.with_slots(|slots| {
+            let payloads = &mut slots.payloads;
             payloads
                 .get_mut(index)
                 .unwrap_or_else(|| {
@@ -4038,7 +4037,8 @@ impl CompletionReactor {
     /// Observes the exact physical transfer after successful registration and before submission.
     #[cfg(not(test))]
     fn record_physical_io(&self, index: usize, transfer: super::lower::PhysicalIo) {
-        self.with_payloads(|payloads| {
+        self.with_slots(|slots| {
+            let payloads = &mut slots.payloads;
             let slot = payloads.get(index).unwrap_or_else(|| {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
             });
@@ -4054,23 +4054,25 @@ impl CompletionReactor {
         let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index)) else {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         };
-        if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Registering)) {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        }
+        self.publish_slot(identity, Phase::Registering, SlotPayload::Empty);
     }
 
     /// Publishes a registered lower identity into the WDK shell.
     #[cfg(not(test))]
     fn finish_registering_lower(&self, index: usize, lower: PublishedReactorLower) {
-        let Some(identity) = self.with_scheduler(|scheduler| {
-            scheduler.enter_phase(index, |phase| matches!(phase, Phase::Registering))
-        }) else {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        };
-        if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Lower)) {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        }
-        self.install_payload(index, SlotPayload::Lower(lower));
+        self.with_slots(|slots| {
+            let Some(identity) = slots
+                .scheduler
+                .enter_phase(index, |phase| matches!(phase, Phase::Registering))
+            else {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            };
+            slots.publish(identity, |scheduler| {
+                scheduler
+                    .set_phase(identity, Phase::Lower)
+                    .then_some(SlotPayload::Lower(lower))
+            });
+        });
         if self.cancellation_is_pending(index) {
             self.request_active_cancel(index);
         }
@@ -4109,13 +4111,12 @@ impl CompletionReactor {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
             });
             ready &= !slot_bit(index);
-            if self
-                .with_scheduler(|scheduler| scheduler.grant_handle_turn(index))
-                .is_none()
-            {
-                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-            }
-            let operation = self.take_operation_payload(index);
+            let operation = self.with_slots(|slots| {
+                let Some(identity) = slots.scheduler.grant_handle_turn(index) else {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                };
+                slots.take_waiting(identity)
+            });
             self.set_ready_operation_event(
                 index,
                 operation,
@@ -4211,9 +4212,7 @@ impl CompletionReactor {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
             });
             let prepared = prepared.bind(NonNull::from(self), identity, work, suspended);
-            if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Passive)) {
-                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-            }
+            self.publish_slot(identity, Phase::Passive, SlotPayload::Empty);
             PassiveWorkEnvelope::queue(prepared);
             return;
         }
@@ -4226,9 +4225,7 @@ impl CompletionReactor {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
             });
             let prepared = reserve.bind(NonNull::from(self), identity, work, suspended);
-            if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Passive)) {
-                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-            }
+            self.publish_slot(identity, Phase::Passive, SlotPayload::Empty);
             PassiveWorkEnvelope::queue(prepared);
             return;
         }
@@ -4270,9 +4267,7 @@ impl CompletionReactor {
             self.set_ready_continuation(index, suspended, work.cancel_before_execution());
             return;
         }
-        if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Passive)) {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        }
+        self.publish_slot(identity, Phase::Passive, SlotPayload::Empty);
         PassiveWorkEnvelope::queue(prepared);
     }
 
@@ -4350,11 +4345,8 @@ impl CompletionReactor {
     #[cfg(not(test))]
     fn submit_prepared_oplock(&self, index: usize, prepared: Box<OplockEnvelope>) {
         let identity = prepared.identity();
-        if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Oplock)) {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        }
         let publication = prepared.publication();
-        self.install_payload(index, SlotPayload::Oplock(publication));
+        self.publish_slot(identity, Phase::Oplock, SlotPayload::Oplock(publication));
         match OplockEnvelope::submit(prepared) {
             OplockSubmission::Immediate { envelope, status } => {
                 self.take_oplock_slot(identity, NonNull::from(envelope.as_ref()));
@@ -4369,10 +4361,7 @@ impl CompletionReactor {
                         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
                     }),
                 ));
-                if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Retry)) {
-                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                }
-                self.install_payload(index, SlotPayload::OplockRetry(envelope));
+                self.publish_slot(identity, Phase::Retry, SlotPayload::OplockRetry(envelope));
                 self.operation_timers
                     .get(index)
                     .unwrap_or_else(|| {
@@ -4570,9 +4559,7 @@ impl CompletionReactor {
         };
         match prepared {
             Ok(prepared) => {
-                if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, phase)) {
-                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                }
+                self.publish_slot(identity, phase, SlotPayload::Empty);
                 PassiveWorkEnvelope::start_verification(prepared);
                 self.grant_available_intents();
             }
@@ -5306,20 +5293,15 @@ impl CompletionReactor {
                 envelope.as_ref().identity()
             };
             let index = identity.index();
-            let entered = self.with_scheduler(|scheduler| {
-                scheduler.enter_phase(index, |phase| {
-                    matches!(phase, Phase::Passive | Phase::Verifying)
-                })
+            self.with_slots(|slots| {
+                if !matches!(slots.slot_mut(identity).payload, SlotPayload::Empty)
+                    || !slots.scheduler.reclaim_phase(identity, |phase| {
+                        matches!(phase, Phase::Passive | Phase::Verifying)
+                    })
+                {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                }
             });
-            if entered != Some(identity)
-                || !self.with_payloads(|payloads| {
-                    payloads
-                        .get(index)
-                        .is_some_and(|slot| matches!(slot.payload, SlotPayload::Empty))
-                })
-            {
-                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-            }
             let envelope = unsafe {
                 // SAFETY: Inbox removal and exact slot-generation validation grant unique ownership.
                 Box::from_raw(envelope.as_ptr())
@@ -5331,11 +5313,7 @@ impl CompletionReactor {
                     reserve,
                 } => (continuation, completion, reserve),
                 super::passive::PassiveReclaim::Deferred(envelope) => {
-                    if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Retry))
-                    {
-                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                    }
-                    self.install_payload(index, SlotPayload::PassiveRetry(envelope));
+                    self.publish_slot(identity, Phase::Retry, SlotPayload::PassiveRetry(envelope));
                     self.operation_timers
                         .get(index)
                         .unwrap_or_else(|| {
@@ -5456,22 +5434,15 @@ impl CompletionReactor {
     /// Immediate returns and queued completions must cross this same boundary before resumption.
     #[cfg(not(test))]
     fn take_oplock_slot(&self, identity: SlotId, envelope: NonNull<OplockEnvelope>) {
-        if !self.with_scheduler(|scheduler| scheduler.reclaim_oplock(identity)) {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        }
-        let index = identity.index();
-        self.with_payloads(|payloads| {
-            let Some(slot) = payloads.get_mut(index) else {
-                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-            };
+        self.with_slots(|slots| {
             let identifies = matches!(
-                &slot.payload,
+                &slots.slot_mut(identity).payload,
                 SlotPayload::Oplock(publication) if publication.identifies(envelope)
             );
-            if !identifies {
+            if !identifies || !slots.scheduler.reclaim_oplock(identity) {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
             }
-            slot.payload = SlotPayload::Empty;
+            slots.slot_mut(identity).payload = SlotPayload::Empty;
         });
     }
 
@@ -5504,64 +5475,50 @@ impl CompletionReactor {
     /// Detaches the active lower cancellation identity before reclaim can free the envelope.
     #[cfg(not(test))]
     fn take_completed_lower_slot(&self, envelope: NonNull<ReactorStorageEnvelope>) -> usize {
-        let index = self.with_payloads(|payloads| {
-            payloads.iter_mut().enumerate().find_map(|(index, slot)| {
-                let identifies = matches!(
-                    &slot.payload,
-                    SlotPayload::Lower(PublishedReactorLower::Storage { lower, .. })
-                        if lower.identifies(envelope)
-                );
-                identifies.then(|| {
-                    slot.payload = SlotPayload::Empty;
-                    index
-                })
-            })
-        });
-        let Some(index) = index else {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        };
-        if self
-            .with_scheduler(|scheduler| {
-                scheduler.enter_phase(index, |phase| matches!(phase, Phase::Lower))
-            })
-            .is_none()
-        {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        }
-        index
+        self.take_lower_slot(|published| {
+            matches!(
+                published,
+                PublishedReactorLower::Storage { lower, .. } if lower.identifies(envelope)
+            )
+        })
     }
 
-    /// Detaches one completed device-control identity before reclaim frees its envelope.
+    /// Detaches the matching device-control carrier before freeing its envelope.
     #[cfg(not(test))]
     fn take_completed_device_control_slot(
         &self,
         envelope: NonNull<ReactorDeviceControlEnvelope>,
     ) -> usize {
-        let index = self.with_payloads(|payloads| {
-            payloads.iter_mut().enumerate().find_map(|(index, slot)| {
-                let identifies = matches!(
-                    &slot.payload,
-                    SlotPayload::Lower(PublishedReactorLower::DeviceControl(lower))
-                        if lower.identifies(envelope)
-                );
-                identifies.then(|| {
-                    slot.payload = SlotPayload::Empty;
-                    index
-                })
-            })
-        });
-        let Some(index) = index else {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        };
-        if self
-            .with_scheduler(|scheduler| {
-                scheduler.enter_phase(index, |phase| matches!(phase, Phase::Lower))
-            })
-            .is_none()
-        {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        }
-        index
+        self.take_lower_slot(|published| {
+            matches!(
+                published,
+                PublishedReactorLower::DeviceControl(lower) if lower.identifies(envelope)
+            )
+        })
+    }
+
+    /// Exact envelope identity selects the live generation before returning to actor ownership.
+    #[cfg(not(test))]
+    fn take_lower_slot(&self, identifies: impl Fn(&PublishedReactorLower) -> bool) -> usize {
+        self.with_slots(|slots| {
+            let index = slots
+                .payloads
+                .iter()
+                .position(
+                    |slot| matches!(&slot.payload, SlotPayload::Lower(lower) if identifies(lower)),
+                )
+                .unwrap_or_else(|| {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+                });
+            let Some(identity) = slots
+                .scheduler
+                .enter_phase(index, |phase| matches!(phase, Phase::Lower))
+            else {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            };
+            slots.slot_mut(identity).payload = SlotPayload::Empty;
+            identity.index()
+        })
     }
 
     /// Retains one retry command until its concrete fixed-delay timer event arrives.
@@ -5582,10 +5539,7 @@ impl CompletionReactor {
         let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index)) else {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         };
-        if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Retry)) {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        }
-        self.install_payload(index, SlotPayload::Retry(retry));
+        self.publish_slot(identity, Phase::Retry, SlotPayload::Retry(retry));
         let Some(timer) = self.operation_timers.get(index) else {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         };
@@ -5617,15 +5571,7 @@ impl CompletionReactor {
                 None => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
             };
             let identity = SlotId::from_parts(index, generation);
-            if !self.with_scheduler(|scheduler| scheduler.enter_retry(identity)) {
-                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-            }
-            let payload = self.with_payloads(|payloads| {
-                let Some(slot) = payloads.get_mut(index) else {
-                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                };
-                core::mem::replace(&mut slot.payload, SlotPayload::Empty)
-            });
+            let payload = self.with_slots(|slots| slots.take_retry(identity));
             let retry = match payload {
                 SlotPayload::OplockRetry(envelope) => {
                     if self.cancellation_is_pending(index) {
@@ -5637,10 +5583,7 @@ impl CompletionReactor {
                     }
                     continue;
                 }
-                SlotPayload::Operation {
-                    operation,
-                    event: None,
-                } => {
+                SlotPayload::Waiting(operation) => {
                     self.set_ready_operation_event(
                         index,
                         operation,
@@ -5666,12 +5609,7 @@ impl CompletionReactor {
                             work.cancel_before_execution(),
                         );
                     } else {
-                        if !self.with_scheduler(|scheduler| {
-                            scheduler.set_phase(identity, Phase::Passive)
-                        }) {
-                            KernelWideInconsistency::completion_reactor_state_corruption()
-                                .bugcheck();
-                        }
+                        self.publish_slot(identity, Phase::Passive, SlotPayload::Empty);
                         PassiveWorkEnvelope::queue(envelope);
                     }
                     continue;
@@ -5729,10 +5667,12 @@ impl CompletionReactor {
     #[cfg(not(test))]
     fn grant_intents_in_fifo_order(&self) {
         loop {
-            let Some((identity, ticket)) = self.with_scheduler(Scheduler::grant_next_intent) else {
+            let Some((identity, ticket, operation)) = self.with_slots(|slots| {
+                let (identity, ticket) = slots.scheduler.grant_next_intent()?;
+                Some((identity, ticket, slots.take_waiting(identity)))
+            }) else {
                 return;
             };
-            let operation = self.take_operation_payload(identity.index());
             self.set_ready_operation_event(
                 identity.index(),
                 operation,
@@ -5759,22 +5699,27 @@ impl CompletionReactor {
             };
             *was_attempted = true;
             let grant = self.with_mounted_access(|access| access.acquire_commit(ticket));
-            let event = match grant {
-                Ok(Some(grant)) => {
-                    if !self.with_scheduler(|scheduler| scheduler.grant_commit(identity, ticket)) {
+            let (operation, event) = match grant {
+                Ok(Some(grant)) => self.with_slots(|slots| {
+                    if !slots.scheduler.grant_commit(identity, ticket) {
                         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                     }
-                    CompletionEvent::Core(OperationEvent::CommitGranted(grant))
-                }
+                    (
+                        slots.take_waiting(identity),
+                        CompletionEvent::Core(OperationEvent::CommitGranted(grant)),
+                    )
+                }),
                 Ok(None) => continue,
-                Err(error) => {
-                    if !self.with_scheduler(|scheduler| scheduler.reject_commit(identity, ticket)) {
+                Err(error) => self.with_slots(|slots| {
+                    if !slots.scheduler.reject_commit(identity, ticket) {
                         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                     }
-                    CompletionEvent::VolumeFailed(error)
-                }
+                    (
+                        slots.take_waiting(identity),
+                        CompletionEvent::VolumeFailed(error),
+                    )
+                }),
             };
-            let operation = self.take_operation_payload(index);
             self.set_ready_operation_event(index, operation, event);
         }
     }
@@ -5844,13 +5789,12 @@ impl CompletionReactor {
         let Some(event) = event else {
             return;
         };
-        if self
-            .with_scheduler(|scheduler| scheduler.grant_wait(index))
-            .is_none()
-        {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        }
-        let operation = self.take_operation_payload(index);
+        let operation = self.with_slots(|slots| {
+            let Some(identity) = slots.scheduler.grant_wait(index) else {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            };
+            slots.take_waiting(identity)
+        });
         self.set_ready_operation_event(index, operation, event);
     }
 }
@@ -7015,20 +6959,10 @@ mod tests {
         assert_eq!(reactor.cancel_ready.load(Ordering::Acquire), 0);
         let resumed = reactor.resume_cancel_if_requested(index, test_operation!());
         assert!(resumed.is_none());
-        let Some(identity) = reactor.with_scheduler(super::Scheduler::take_ready) else {
+        let Some((identity, payload)) = reactor.with_slots(super::ActorSlots::take_ready) else {
             return;
         };
-        let payload = reactor.with_payloads(|payloads| {
-            let Some(slot) = payloads.get_mut(index) else {
-                return SlotPayload::Empty;
-            };
-            core::mem::replace(&mut slot.payload, SlotPayload::Empty)
-        });
-        let SlotPayload::Operation {
-            operation,
-            event: Some(event),
-        } = payload
-        else {
+        let SlotPayload::Ready { operation, event } = payload else {
             return;
         };
         assert!(matches!(
