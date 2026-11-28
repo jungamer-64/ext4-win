@@ -45,19 +45,14 @@ pub use trim::{
     TrimIoOutcome, TrimRange, TrimRequest, TrimScanOperation, TrimScanTransition, TrimSelection,
 };
 
-pub use directory::{DirectoryScanCursor, ScannedDirectoryEntry};
-pub use event::{CheckpointLease, CommitLease, MutationLease, OperationEvent, VisibilityLease};
 pub use close::{CleanCloseDurability, CleanCloseOperation, CleanCloseTransition};
+pub use directory::{DirectoryScanCursor, ScannedDirectoryEntry};
+pub use event::OperationEvent;
 pub use mount::{
     CompletedMount, ExternalJournalProbeOperation, ExternalJournalProbeOutcome,
     ExternalJournalProbeTransition, ExternalJournalRequirement, MountFailure, MountMediaOutcome,
     MountOperation, MountProbeOperation, MountProbeTransition, MountTransition, ProbedMount,
     ValidatedExternalJournal,
-};
-pub use session::{
-    CommittedEpoch, CommittedReadContext, EpochSequence, MountedProfile, MutationCoordinatorState,
-    MutationResolveContext, MutationResource, ObservedResourceVersionSet, ResourceVersion,
-    VolumeGeometry, VolumeIdentity,
 };
 pub use node::{
     ChildLookup, ContiguousFileStorage, DataAllocationRun, DirectoryChild, DirectoryEntry,
@@ -67,6 +62,12 @@ pub use node::{
 pub use operation::{
     CommittedReadPass, EpochReadOperation, EpochReadPass, MutationResolveOperation,
     MutationResolveReady, MutationResolveTransition, ReadTransition,
+};
+pub use session::{
+    CheckpointLease, CommitLease, CommittedEpoch, CommittedReadContext, EpochSequence,
+    MountedProfile, MutationCoordinatorState, MutationLease, MutationResolveContext,
+    MutationResource, ObservedResourceVersionSet, ResourceVersion, VisibilityLease, VolumeGeometry,
+    VolumeIdentity,
 };
 pub use transaction::{
     CheckpointOperation, CheckpointPublication, CleanJournalDurability, CleanJournalRecordPhase,

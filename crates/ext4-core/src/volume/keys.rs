@@ -1,6 +1,7 @@
 //! Mount-local key publication, serialized with filesystem commits but issuing no storage I/O.
 
 use super::scope::*;
+use super::session::PublishedEpochId;
 use super::{CommitLease, MutationLease, VisibilityLease};
 
 /// Replacement key snapshot resolved against one committed key-set version.
@@ -52,12 +53,10 @@ impl ResolvedKeyChange {
         coordinator: &MutationCoordinatorState,
         ticket: u64,
     ) -> Result<Self> {
-        if coordinator.mount != epoch.mount
-            || coordinator.published_epoch() != (epoch.identity().uuid(), epoch.sequence())
-        {
+        if coordinator.published_epoch() != epoch.publication_id() {
             return Err(Error::StaleReadContext);
         }
-        let mut observed = ObservedResourceVersionSet::new(ticket, &coordinator.mount);
+        let mut observed = ObservedResourceVersionSet::new(ticket, &coordinator.mount());
         observed.include(
             MutationResource::KEY_SET,
             coordinator.resource_version(MutationResource::KEY_SET),
@@ -82,9 +81,8 @@ impl ResolvedKeyChange {
         intent: MutationLease,
         coordinator: &MutationCoordinatorState,
     ) -> Result<ReservedKeyChange> {
-        if intent.consume(&coordinator.mount)? != self.observed.ticket()
-            || !coordinator.revalidate(&self.observed)
-        {
+        coordinator.consume_intent(intent, self.observed.ticket())?;
+        if !coordinator.revalidate(&self.observed) {
             return Err(Error::ClusterReferenceConflict);
         }
         Ok(ReservedKeyChange { resolved: self })
@@ -130,14 +128,7 @@ impl ReservedKeyChange {
         if !coordinator.revalidate(&self.resolved.observed) {
             return Err(Error::ClusterReferenceConflict);
         }
-        if coordinator.mount != current.mount {
-            return Err(Error::StaleReadContext);
-        }
-        let expected_epoch = (current.identity().uuid(), current.sequence());
-        match &coordinator.journal {
-            PublicationState::Ready { epoch, .. } if *epoch == expected_epoch => {}
-            _ => return Err(Error::StaleReadContext),
-        }
+        let expected_epoch = coordinator.key_change_predecessor(current)?;
         let versions = coordinator.prepare_version_publication(&self.resolved.observed)?;
         let epoch = CommittedEpoch::prepared(
             current,
@@ -167,7 +158,7 @@ pub struct PreparedKeyChange {
     /// Mutation whose exclusive grants protect this publication.
     claim: CommitClaim,
     /// Published epoch that must still be current at the consuming transition.
-    expected_epoch: (crate::FilesystemUuid, super::EpochSequence),
+    expected_epoch: PublishedEpochId,
     /// Complete successor requiring no allocation during the swap.
     epoch: CommittedEpoch,
     /// Key-resource freshness publication, prepared under commit serialization.
@@ -205,24 +196,15 @@ impl PreparedKeyChange {
         visibility: VisibilityLease,
         coordinator: &mut MutationCoordinatorState,
     ) -> core::result::Result<CommittedEpoch, (Error, Self)> {
-        if let Err(error) = coordinator.validate_visibility(visibility, self.claim) {
-            return Err((error, self));
+        if let Err((error, versions)) = coordinator.publish_keys(
+            visibility,
+            self.claim,
+            self.expected_epoch,
+            &self.epoch,
+            self.versions,
+        ) {
+            return Err((error, Self { versions, ..self }));
         }
-        if coordinator.mount != self.epoch.mount {
-            return Err((Error::ClusterReferenceConflict, self));
-        }
-        let PublicationState::Ready {
-            epoch, admission, ..
-        } = &mut coordinator.journal
-        else {
-            return Err((Error::StaleReadContext, self));
-        };
-        if *epoch != self.expected_epoch {
-            return Err((Error::StaleReadContext, self));
-        }
-        *epoch = (self.epoch.identity().uuid(), self.epoch.sequence());
-        *admission = CommitAdmission::Available;
-        coordinator.publish_versions(self.versions);
         Ok(self.epoch)
     }
 }

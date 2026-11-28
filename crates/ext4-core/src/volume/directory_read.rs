@@ -258,19 +258,22 @@ impl DirectoryReader {
             return Err(error);
         }
         view.observe_inode(self.directory.inode())?;
-        let (_, epoch) = view.epoch.ok_or(Error::DeviceIo)?;
-        let filesystem = view.mount.ok_or(Error::DeviceIo)?;
+        let publication = view.published_epoch().ok_or(Error::DeviceIo)?;
         let version = view.inode_version(self.directory.inode());
         if let Some(binding) = &self.binding {
             let matches = match binding {
                 DirectoryReadBinding::Observed {
                     filesystem: origin,
                     version: expected,
-                } => origin == filesystem && Some(*expected) == version,
+                } => *origin == publication.mount && Some(*expected) == version,
                 DirectoryReadBinding::Resolution {
                     filesystem: origin,
                     epoch: expected,
-                } => origin == filesystem && version.is_none() && *expected == epoch,
+                } => {
+                    *origin == publication.mount
+                        && version.is_none()
+                        && *expected == publication.sequence
+                }
             };
             if !matches {
                 self.state = ReaderState::Failed(Error::ReadConflict);
@@ -279,12 +282,12 @@ impl DirectoryReader {
         } else {
             self.binding = Some(match version {
                 Some(version) => DirectoryReadBinding::Observed {
-                    filesystem: *filesystem,
+                    filesystem: publication.mount,
                     version,
                 },
                 None => DirectoryReadBinding::Resolution {
-                    filesystem: *filesystem,
-                    epoch,
+                    filesystem: publication.mount,
+                    epoch: publication.sequence,
                 },
             });
         }

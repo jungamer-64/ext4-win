@@ -543,12 +543,16 @@ impl EpochReadView<'_, '_> {
             return Err(Error::UnsupportedInodeMutation);
         }
         let context = self.extent_tree_context(inode);
+        let mount = self
+            .published_epoch()
+            .ok_or(Error::InvalidWriteRange)?
+            .mount;
         initialized_contiguous_storage(
             inode,
             self.superblock.block_size(),
             context,
             &mut self.device,
-            *self.mount.ok_or(Error::InvalidWriteRange)?,
+            mount,
             None,
         )?
         .ok_or(Error::InvalidWriteRange)

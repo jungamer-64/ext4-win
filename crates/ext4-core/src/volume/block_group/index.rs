@@ -966,6 +966,7 @@ mod tests {
             Some(ClusterReferenceIndex::new()),
             crate::MountAccess::ReadWrite,
             crate::volume::session::MountIdentity::new()?,
+            None,
         );
         let mut cache = crate::MetadataCache::try_new(&initial)?;
         let transcript = || {
@@ -1731,10 +1732,11 @@ mod tests {
             DeviceLength::from_bytes(4096 * 1024),
         );
         let keys = crate::FscryptKeySet::empty();
-        let orphans = ValidatedOrphanInventory::load(&mut EpochReadView::mounting(
+        let orphans = ValidatedOrphanInventory::load(&mut EpochReadView::recovery(
             OperationDevice::new(&mut transcript),
             superblock,
             &keys,
+            None,
         ))?;
         let mut build = AllocationIndexBuild::new();
         let mut observed = Vec::new();
@@ -1931,6 +1933,7 @@ mod tests {
                 Some(ClusterReferenceIndex::new()),
                 crate::MountAccess::ReadWrite,
                 crate::volume::session::MountIdentity::new()?,
+                None,
             );
             let mut root = [0_u8; 60];
             for (offset, value) in [(0, 0xf30a), (2, 3), (4, 4), (6, 1)] {

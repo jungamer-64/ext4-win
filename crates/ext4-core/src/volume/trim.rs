@@ -7,13 +7,13 @@ use alloc::vec::Vec;
 use core::num::{NonZeroU32, NonZeroU64};
 use ext4_shared::Shared;
 
-use super::session::{
-    CommittedEpoch, CommittedReadContext, EpochSequence, MountIdentity, MountedProfile,
-    MutationCoordinatorState,
-};
 use super::scope::{
     AllocationBitmapInitialization, AllocationBitmapKind, BitmapBitState, BlockGroupDescriptor,
     ClusterAddress, ClusterBitmapPosition, Superblock, cluster_bitmap_bit_state,
+};
+use super::session::{
+    CommittedEpoch, CommittedReadContext, EpochSequence, MountIdentity, MountedProfile,
+    MutationCoordinatorState,
 };
 use crate::disk::storage::{OperationDevice, StorageTranscript};
 use crate::memory::FallibleVec;
@@ -324,10 +324,9 @@ impl TrimSelection {
     ) -> Result<TrimAdmission> {
         coordinator.require_session_authority()?;
         epoch.require_writable()?;
-        if self.mount != coordinator.mount
-            || self.mount != epoch.mount
+        if self.mount != epoch.mount
             || self.epoch != epoch.sequence()
-            || coordinator.published_epoch() != (epoch.identity().uuid(), epoch.sequence())
+            || coordinator.published_epoch() != epoch.publication_id()
         {
             return Err(Error::StaleReadContext);
         }
@@ -471,7 +470,7 @@ impl PendingTrim {
         completion: TrimCompletion,
     ) -> core::result::Result<TrimBatchResult, TrimCompletionMismatch> {
         let claim = &completion.request.claim;
-        if self.mount != coordinator.mount
+        if self.mount != coordinator.mount()
             || self.mount != claim.get().mount
             || self.identity != claim.get().identity
             || coordinator

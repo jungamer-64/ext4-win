@@ -1874,6 +1874,126 @@ fn read_only_home_view_needs_no_journal_or_global_inode_scan() -> Result<()> {
     Ok(())
 }
 
+/// Seeds a linked inode with a truncation still tracked by the legacy orphan chain.
+/// # Errors
+/// Returns fixture construction and raw-format access failures.
+fn truncating_orphan_fixture() -> Result<Fixture> {
+    let mut fixture = Fixture::new()?;
+    let node = NodeId::File(fixture.b);
+    let inode = fixture_inode_offset(&fixture.disk, node)?;
+    let disk = &mut fixture.disk;
+    for offset in [4, 108, 20] {
+        let start = inode.checked_add(offset).ok_or(Error::DeviceRange)?;
+        let end = start.checked_add(4).ok_or(Error::DeviceRange)?;
+        disk.filesystem
+            .get_mut(start..end)
+            .ok_or(Error::DeviceRange)?
+            .fill(0);
+    }
+    let flags_offset = inode.checked_add(32).ok_or(Error::DeviceRange)?;
+    let flags = fixture_u32(&disk.filesystem, flags_offset)?;
+    disk.encode_inode(node, flags, None)?;
+    for (target, byte) in disk
+        .filesystem
+        .get_mut(1256..1260)
+        .ok_or(Error::DeviceRange)?
+        .iter_mut()
+        .zip(node.inode().as_u32().to_le_bytes())
+    {
+        *target = byte;
+    }
+    let crc = fixture_crc32c(
+        u32::MAX,
+        disk.filesystem.get(1024..2044).ok_or(Error::DeviceRange)?,
+    );
+    for (target, byte) in disk
+        .filesystem
+        .get_mut(2044..2048)
+        .ok_or(Error::DeviceRange)?
+        .iter_mut()
+        .zip(crc.to_le_bytes())
+    {
+        *target = byte;
+    }
+    Ok(fixture)
+}
+
+/// # Errors
+/// Returns mount, fixture, or post-recovery transaction failure.
+/// # Panics
+/// Fails if the initial published view disagrees with the recovered disk or its next checkpoint.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare published counters and first transaction with raw ext4 fields"
+)]
+fn writable_mount_publishes_checkpointed_orphan_state() -> Result<()> {
+    let mut fixture = truncating_orphan_fixture()?;
+    let node = NodeId::File(fixture.b);
+    let inode = fixture_inode_offset(&fixture.disk, node)?;
+    let free_before = fixture.epoch.geometry().free_cluster_count().as_u64();
+
+    fixture.remount()?;
+    let disk = &fixture.disk.filesystem;
+    assert_eq!(fixture_u32(disk, 1256)?, 0);
+    assert_eq!(fixture_u32(disk, inode + 28)?, 0);
+    let free_after =
+        u64::from(fixture_u32(disk, 1036)?) | (u64::from(fixture_u32(disk, 1368)?) << 32);
+    assert!(free_after > free_before);
+    assert_eq!(
+        fixture.epoch.geometry().free_cluster_count().as_u64(),
+        free_after
+    );
+
+    let label = Ext4VolumeLabel::new(b"after-orphan")?;
+    fixture.mutate(|pass| pass.set_volume_label(label))?;
+    assert_eq!(fixture.epoch.identity().label(), label);
+    assert_eq!(
+        fixture.disk.filesystem.get(1144..1156),
+        Some(b"after-orphan".as_slice())
+    );
+    assert!(fixture.coordinator.publication_is_idle());
+    Ok(())
+}
+
+/// # Errors
+/// Returns raw-format fixture access or observer setup failure.
+/// # Panics
+/// Fails if a rejected final journal flush still publishes a mount or is retried.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions verify which mount effect failed and that no session was published"
+)]
+fn failed_orphan_checkpoint_flush_prevents_mount_publication() -> Result<()> {
+    let mut fixture = truncating_orphan_fixture()?;
+    let mut home_flushed = false;
+    let mut final_flushes = 0;
+    let result = fixture
+        .disk
+        .mount_observing(MountAccess::ReadWrite, |disk, boundary, _| {
+            match boundary {
+                MountBoundary::Lower(StorageRequest::Flush {
+                    target: StorageTarget::Filesystem,
+                }) if fixture_u32(&disk.filesystem, 1256)? == 0 => {
+                    home_flushed = true;
+                }
+                MountBoundary::Lower(StorageRequest::Flush {
+                    target: StorageTarget::ExternalJournal,
+                }) if home_flushed => {
+                    final_flushes += 1;
+                    disk.fail_next_flush = true;
+                }
+                _ => {}
+            }
+            Ok(())
+        });
+    assert!(home_flushed);
+    assert_eq!(final_flushes, 1);
+    assert!(matches!(result, Err(Error::DeviceIo)));
+    Ok(())
+}
+
 /// # Errors
 /// Returns independent linked-orphan fixture encoding or RO recovery failure.
 /// # Panics
@@ -1893,40 +2013,10 @@ fn ro_orphan_cleanup_uses_selected_persistence_and_physical_access() -> Result<(
         },
     ] {
         for physical in [DeviceWriteAccess::Writable, DeviceWriteAccess::ReadOnly] {
-            let fixture = Fixture::new()?;
+            let fixture = truncating_orphan_fixture()?;
             let node = NodeId::File(fixture.b);
             let mut disk = fixture.disk;
             let inode = fixture_inode_offset(&disk, node)?;
-            for offset in [4, 108, 20] {
-                disk.filesystem
-                    .get_mut(inode + offset..inode + offset + 4)
-                    .ok_or(Error::DeviceRange)?
-                    .fill(0);
-            }
-            let flags = fixture_u32(&disk.filesystem, inode + 32)?;
-            disk.encode_inode(node, flags, None)?;
-            for (target, byte) in disk
-                .filesystem
-                .get_mut(1256..1260)
-                .ok_or(Error::DeviceRange)?
-                .iter_mut()
-                .zip(node.inode().as_u32().to_le_bytes())
-            {
-                *target = byte;
-            }
-            let crc = fixture_crc32c(
-                u32::MAX,
-                disk.filesystem.get(1024..2044).ok_or(Error::DeviceRange)?,
-            );
-            for (target, byte) in disk
-                .filesystem
-                .get_mut(2044..2048)
-                .ok_or(Error::DeviceRange)?
-                .iter_mut()
-                .zip(crc.to_le_bytes())
-            {
-                *target = byte;
-            }
             let original = disk.filesystem.clone();
             let journal = disk.journal.clone();
             disk.storage_effects = 0;
@@ -3305,6 +3395,8 @@ struct Disk {
     journal: Vec<u8>,
     /// Submitted writes and flushes, including requests made before mount publication.
     storage_effects: usize,
+    /// Fail one submitted barrier after its request ownership reaches the lower simulator.
+    fail_next_flush: bool,
 }
 
 impl Disk {
@@ -3462,6 +3554,7 @@ impl Disk {
             )
             .to_vec(),
             storage_effects: 0,
+            fail_next_flush: false,
         }
     }
 
@@ -3473,6 +3566,14 @@ impl Disk {
                 .storage_effects
                 .checked_add(1)
                 .ok_or(Error::ArithmeticOverflow)?;
+        }
+        if matches!(request, StorageRequest::Flush { .. })
+            && core::mem::take(&mut self.fail_next_flush)
+        {
+            return Ok(StorageCompletion::failure(
+                CompletedStorageTransfer::from_request(request),
+                Error::DeviceIo,
+            ));
         }
         let image = match request.target() {
             StorageTarget::Filesystem => &mut self.filesystem,
@@ -6444,6 +6545,7 @@ fn persisted_metadata_checksums_precede_mount_authority() -> Result<()> {
             filesystem: fixture.disk.filesystem.to_vec(),
             journal: fixture.disk.journal.to_vec(),
             storage_effects: 0,
+            fail_next_flush: false,
         };
         *disk.filesystem.get_mut(offset).ok_or(Error::DeviceRange)? ^= mask;
         assert_eq!(

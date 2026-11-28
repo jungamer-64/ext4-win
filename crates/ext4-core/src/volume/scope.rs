@@ -34,8 +34,8 @@ pub(super) use crate::disk_format::inode::{
 pub(super) use crate::disk_format::journal::{CleanJournal, DirtyJournal, Journal, JournalBlock};
 pub(super) use crate::disk_format::name::Ext4Name;
 pub(super) use crate::disk_format::superblock::{
-    BlockGroupId, ClusterAddress, DirectoryIndexing, Ext4VolumeLabel,
-    FreeClusterDelta, InodeTimestampEncoding, MetadataChecksum, SparseSuperblockLayout, Superblock,
+    BlockGroupId, ClusterAddress, DirectoryIndexing, Ext4VolumeLabel, FreeClusterDelta,
+    InodeTimestampEncoding, MetadataChecksum, SparseSuperblockLayout, Superblock,
     XattrMutationSupport,
 };
 pub(super) use crate::disk_format::xattr::{
@@ -64,21 +64,21 @@ pub(super) use super::directory::{
     PreparedDirectoryLookup, ScannedDirectoryEntry,
 };
 pub(super) use super::directory_read::DirectoryReader;
-pub(super) use super::event::CommitClaim;
 pub(super) use super::inode_record::{
     AllocatedInodeRecord, AttributeInodeRecord, DeletedInodeRecord, InlinePayloadUpdate,
     LiveInodeRecord, RawInodeRecord, RecoverableOrphanInode, StagedInodeIndex, StagedInodeRecord,
 };
-pub(super) use super::session::{
-    CommittedEpoch, MountIdentity, MountedProfile, MutationCoordinatorState, MutationResource,
-    ObservedResourceVersionSet, ReadObservations, ResourceVersion, ResourceVersionPublication,
-};
-pub(super) use super::view::EpochReadView;
 pub(super) use super::node::{
     ChildLookup, DirectoryEntry, DirectoryNode, DirectoryNodeId, FileNode, FileNodeId,
     HardLinkEntry, HardLinkNodeId, HardLinks, LoadedNode, NodeId, NodeMetadataSnapshot,
     NodeMetadataUpdate, SymlinkNode, SymlinkNodeId,
 };
+pub(super) use super::session::{
+    CommitClaim, CommittedEpoch, MountIdentity, MountedProfile, MutationCoordinatorState,
+    MutationResource, ObservedResourceVersionSet, ReadObservations, ResourceVersion,
+    ResourceVersionPublication,
+};
+pub(super) use super::view::EpochReadView;
 
 /// Builds a volume-owned on-disk field offset.
 pub(super) const fn disk_offset(offset: usize) -> DiskOffset {

@@ -124,10 +124,11 @@ impl DeltaReplayOperation {
             let phase = core::mem::replace(&mut self.phase, DeltaReplayPhase::Failed);
             let result = match phase {
                 DeltaReplayPhase::ReadOrphans { superblock, seed } => {
-                    let mut view = EpochReadView::mounting(
+                    let mut view = EpochReadView::recovery(
                         OperationDevice::new(&mut self.transcript),
                         superblock,
                         keys,
+                        None,
                     );
                     match ValidatedOrphanInventory::load(&mut view) {
                         Ok(orphans) => {
@@ -177,11 +178,11 @@ impl DeltaReplayOperation {
                     clusters,
                     orphans,
                 } => {
-                    let view = EpochReadView::recovering(
+                    let view = EpochReadView::recovery(
                         OperationDevice::new(&mut self.transcript),
                         superblock,
                         keys,
-                        &clusters,
+                        Some(&clusters),
                     );
                     match super::transaction::resolve_delta_postconditions(
                         view,
@@ -213,7 +214,8 @@ impl DeltaReplayOperation {
                         &candidate.images,
                         None,
                     );
-                    let mut view = EpochReadView::mounting(device, candidate.superblock, keys);
+                    let mut view =
+                        EpochReadView::recovery(device, candidate.superblock, keys, None);
                     match ValidatedOrphanInventory::load(&mut view) {
                         Ok(orphans) => {
                             self.phase = DeltaReplayPhase::IndexCandidate {

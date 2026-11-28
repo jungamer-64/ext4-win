@@ -270,14 +270,12 @@ impl MetadataMutation<'_, '_> {
         now: Ext4Timestamp,
     ) -> Result<ResolvedMutation> {
         coordinator.require_session_authority()?;
-        if self.volume.mount != Some(&coordinator.mount)
-            || self.volume.epoch != Some(coordinator.published_epoch())
-        {
+        if self.volume.published_epoch() != Some(coordinator.published_epoch()) {
             return Err(Error::ClusterReferenceConflict);
         }
         let mut journal_blocks = self.metadata_images(Some(now))?.into_blocks();
         let _validated_next_state = self.committed_cluster_state()?;
-        let mut observed = ObservedResourceVersionSet::new(ticket, &coordinator.mount);
+        let mut observed = ObservedResourceVersionSet::new(ticket, &coordinator.mount());
         let key_version = self
             .volume
             .key_dependency()
@@ -395,19 +393,7 @@ impl ReservedMutation {
         }
         let version_publication =
             coordinator.prepare_version_publication(&self.resolved.observed)?;
-        let PublicationState::Ready {
-            journal: Some(journal),
-            epoch,
-            ..
-        } = &coordinator.journal
-        else {
-            return Err(Error::JournalCorrupt);
-        };
-        if coordinator.mount != current_epoch.mount
-            || *epoch != (current_epoch.identity().uuid(), current_epoch.sequence())
-        {
-            return Err(Error::ClusterReferenceConflict);
-        }
+        let journal = coordinator.journal_for_commit(current_epoch)?;
 
         let durable_clusters = current_epoch
             .clusters
@@ -576,24 +562,21 @@ impl DurableMutation {
         visibility: super::super::VisibilityLease,
         coordinator: &mut MutationCoordinatorState,
     ) -> core::result::Result<PublishedMutation, (Error, Self)> {
-        if let Err(error) = coordinator.validate_visibility(visibility, self.claim) {
-            return Err((error, self));
-        }
-        let valid = coordinator.mount == self.durable_epoch.mount
-            && matches!(coordinator.journal, PublicationState::Ready { .. })
-            && coordinator.published_epoch().1.next() == Ok(self.durable_epoch.sequence());
-        if !valid {
-            return Err((Error::ClusterReferenceConflict, self));
+        if let Err((error, version_publication)) = coordinator.publish_durable(
+            visibility,
+            self.claim,
+            &self.durable_epoch,
+            self.version_publication,
+        ) {
+            return Err((
+                error,
+                Self {
+                    version_publication,
+                    ..self
+                },
+            ));
         }
         let _durable_journal = self.durable_journal;
-        coordinator.journal = PublicationState::CheckpointPending {
-            admission: CheckpointAdmission::Available,
-            epoch: (
-                self.durable_epoch.identity().uuid(),
-                self.durable_epoch.sequence(),
-            ),
-        };
-        coordinator.publish_versions(self.version_publication);
         Ok(PublishedMutation {
             epoch: self.durable_epoch,
             checkpoint: self.checkpoint,
@@ -616,25 +599,8 @@ impl CheckpointOperation {
         checkpoint: super::super::CheckpointLease,
         coordinator: &MutationCoordinatorState,
     ) -> core::result::Result<StorageRequestSequence<HomeBlockDurability>, (Error, Self)> {
-        if let Err(error) = coordinator.require_session_authority() {
+        if let Err(error) = coordinator.authorize_checkpoint(checkpoint, &self.checkpointed_epoch) {
             return Err((error, self));
-        }
-        if coordinator.mount != self.checkpointed_epoch.mount
-            || coordinator.published_epoch().0 != self.checkpointed_epoch.identity().uuid()
-            || coordinator.published_epoch().1.next() != Ok(self.checkpointed_epoch.sequence())
-            || !matches!(
-                coordinator.journal,
-                PublicationState::CheckpointPending {
-                    admission: CheckpointAdmission::Granted,
-                    ..
-                }
-            )
-            || checkpoint
-                .consume(&self.checkpointed_epoch.mount)
-                .and_then(|epoch| epoch.next())
-                != Ok(self.checkpointed_epoch.sequence())
-        {
-            return Err((Error::ClusterReferenceConflict, self));
         }
         let journal_target = self.clean_write.target();
         Ok(StorageRequestSequence::new(
@@ -663,29 +629,17 @@ impl CheckpointPublication {
         self,
         coordinator: &mut MutationCoordinatorState,
     ) -> core::result::Result<CommittedEpoch, (Error, Self)> {
-        if let Err(error) = coordinator.require_session_authority() {
-            return Err((error, self));
-        }
-        if coordinator.mount != self.checkpointed_epoch.mount
-            || !matches!(
-                coordinator.journal,
-                PublicationState::CheckpointPending {
-                    admission: CheckpointAdmission::Granted,
-                    ..
-                }
-            )
-            || coordinator.published_epoch().1.next() != Ok(self.checkpointed_epoch.sequence())
+        if let Err((error, clean_journal)) =
+            coordinator.publish_checkpoint(&self.checkpointed_epoch, self.clean_journal)
         {
-            return Err((Error::ClusterReferenceConflict, self));
+            return Err((
+                error,
+                Self {
+                    clean_journal,
+                    ..self
+                },
+            ));
         }
-        coordinator.journal = PublicationState::Ready {
-            admission: CommitAdmission::Available,
-            journal: Some(self.clean_journal),
-            epoch: (
-                self.checkpointed_epoch.identity().uuid(),
-                self.checkpointed_epoch.sequence(),
-            ),
-        };
         Ok(self.checkpointed_epoch)
     }
 }

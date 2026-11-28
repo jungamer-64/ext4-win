@@ -104,24 +104,13 @@ impl CleanCloseOperation {
         coordinator: &MutationCoordinatorState,
         now: Ext4Timestamp,
     ) -> CleanCloseTransition {
-        if !matches!(self.phase, CleanClosePhase::Ready) || self.mount != coordinator.mount {
+        if !matches!(self.phase, CleanClosePhase::Ready) || self.mount != coordinator.mount() {
             return CleanCloseTransition::Complete(Err(Error::ClusterReferenceConflict));
         }
         if matches!(self.access, super::MediaAccess::ReadOnly) {
             return CleanCloseTransition::Complete(Ok(CleanCloseDurability { mount: self.mount }));
         }
-        if let Err(error) = coordinator.require_session_authority() {
-            return CleanCloseTransition::Complete(Err(error));
-        }
-        let PublicationState::Ready {
-            journal: Some(journal),
-            admission: CommitAdmission::Available,
-            ..
-        } = &coordinator.journal
-        else {
-            return CleanCloseTransition::Complete(Err(Error::ClusterReferenceConflict));
-        };
-        let journal = match journal.try_clone() {
+        let journal = match coordinator.drained_journal() {
             Ok(journal) => journal,
             Err(error) => return CleanCloseTransition::Complete(Err(error)),
         };

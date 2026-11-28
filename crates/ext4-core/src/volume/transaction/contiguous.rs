@@ -137,7 +137,12 @@ impl MutationResolvePass<'_, '_, '_> {
                 )?;
                 pass.mutation.replace_live_inode(index, raw)?;
                 initialized = Some(super::super::node::ContiguousFileStorage {
-                    mount: *pass.mutation.volume.mount.ok_or(Error::InvalidWriteRange)?,
+                    mount: pass
+                        .mutation
+                        .volume
+                        .published_epoch()
+                        .ok_or(Error::InvalidWriteRange)?
+                        .mount,
                     inode: inode.id(),
                     generation: inode.generation(),
                     physical: size.offset_of(origin)?,

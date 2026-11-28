@@ -1,10 +1,13 @@
 //! Pass-local metadata views for recovery and mounted operations.
 
 use super::block_group::ClusterReferenceIndex;
-use super::session::{CommittedEpoch, EpochSequence, MountIdentity, MutationResource, ReadObservations, ResourceVersion, ResourceVersionTable};
+use super::session::{
+    CommittedEpoch, MutationResource, PublishedEpochId, ReadObservations, ResourceVersion,
+    ResourceVersionTable,
+};
 use crate::disk::storage::OperationDevice;
 use crate::disk_format::inode::InodeId;
-use crate::disk_format::superblock::{FilesystemUuid, Superblock};
+use crate::disk_format::superblock::Superblock;
 use crate::protection::fscrypt::FscryptKeySet;
 use crate::{Error, Result};
 
@@ -42,12 +45,10 @@ pub(super) struct EpochReadView<'storage, 'epoch> {
     pub(super) superblock: Superblock,
     /// Immutable key snapshot selected by the epoch lease.
     pub(super) fscrypt_keys: &'epoch FscryptKeySet,
-    /// Identity of the immutable snapshot; absent before mount has committed.
-    pub(super) epoch: Option<(FilesystemUuid, EpochSequence)>,
-    /// Session identity borrowed from the selected epoch.
-    pub(super) mount: Option<&'epoch MountIdentity>,
+    /// Publication provenance, present only for a committed view.
+    publication: Option<PublishedEpochId>,
     /// Allocation ownership snapshot used only by mutation resolution.
-    pub(super) clusters: Option<&'epoch ClusterReferenceIndex>,
+    clusters: Option<&'epoch ClusterReferenceIndex>,
 }
 
 impl<'storage, 'epoch> EpochReadView<'storage, 'epoch> {
@@ -63,16 +64,16 @@ impl<'storage, 'epoch> EpochReadView<'storage, 'epoch> {
             superblock: epoch.superblock,
             fscrypt_keys: &epoch.fscrypt_keys,
             clusters: epoch.clusters.as_ref(),
-            epoch: Some((epoch.identity().uuid(), epoch.sequence())),
-            mount: Some(&epoch.mount),
+            publication: Some(epoch.publication_id()),
         }
     }
 
-    /// Builds a mount-time view before the allocation ownership index exists.
-    pub(super) const fn mounting(
+    /// Borrows validated mount-private metadata before the first live epoch exists.
+    pub(super) const fn recovery(
         device: OperationDevice<'storage>,
         superblock: Superblock,
         fscrypt_keys: &'epoch FscryptKeySet,
+        clusters: Option<&'epoch ClusterReferenceIndex>,
     ) -> Self {
         Self {
             key_dependency: KeySetDependency::Independent,
@@ -80,29 +81,14 @@ impl<'storage, 'epoch> EpochReadView<'storage, 'epoch> {
             device,
             superblock,
             fscrypt_keys,
-            clusters: None,
-            epoch: None,
-            mount: None,
+            clusters,
+            publication: None,
         }
     }
 
-    /// Pairs mount-private allocation evidence with its unchanged recovered filesystem.
-    pub(super) const fn recovering(
-        device: OperationDevice<'storage>,
-        superblock: Superblock,
-        fscrypt_keys: &'epoch FscryptKeySet,
-        clusters: &'epoch ClusterReferenceIndex,
-    ) -> Self {
-        Self {
-            key_dependency: KeySetDependency::Independent,
-            observation: None,
-            device,
-            superblock,
-            fscrypt_keys,
-            clusters: Some(clusters),
-            epoch: None,
-            mount: None,
-        }
+    /// Returns the publication that authorized this view, when already mounted.
+    pub(super) const fn published_epoch(&self) -> Option<PublishedEpochId> {
+        self.publication
     }
 
     /// Constructs a read view whose lower bytes are checked against committed inode versions.

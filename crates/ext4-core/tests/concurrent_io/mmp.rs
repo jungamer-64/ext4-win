@@ -218,6 +218,7 @@ fn torn_session_primary_is_authenticated_before_physical_ownership() -> Result<(
         filesystem: disk.filesystem.clone(),
         journal: disk.journal.clone(),
         storage_effects: 0,
+        fail_next_flush: false,
     };
     let payload = logged_primary
         .ok_or(Error::DeviceRange)?

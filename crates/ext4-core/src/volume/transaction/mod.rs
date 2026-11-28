@@ -440,9 +440,8 @@ impl ResolvedMutation {
         if matches!(coordinator.mount_access(), super::MediaAccess::ReadOnly) {
             return Err(Error::ReadOnlyFilesystem);
         }
-        if intent.consume(&coordinator.mount)? != self.observed.ticket()
-            || !self.is_current(coordinator)
-        {
+        coordinator.consume_intent(intent, self.observed.ticket())?;
+        if !self.is_current(coordinator) {
             return Err(Error::ClusterReferenceConflict);
         }
         Ok(ReservedMutation { resolved: self })
@@ -954,6 +953,12 @@ impl MutationResolvePass<'_, '_, '_> {
         }
         let context = self.mutation.volume.extent_tree_context(&inode);
         let size = self.mutation.volume.superblock.block_size();
+        let mount = self
+            .mutation
+            .volume
+            .published_epoch()
+            .ok_or(Error::InvalidWriteRange)?
+            .mount;
         let mut source = TransactionExtentSource {
             device: &mut self.mutation.volume.device,
             staged: &self.mutation.extent_updates,
@@ -964,7 +969,7 @@ impl MutationResolvePass<'_, '_, '_> {
             size,
             context,
             &mut source,
-            *self.mutation.volume.mount.ok_or(Error::InvalidWriteRange)?,
+            mount,
             retained,
         )?;
         if retained.is_some_and(|retained| {

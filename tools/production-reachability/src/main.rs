@@ -35,6 +35,8 @@ enum OperationStackPhase {
     MountDeltaReplay,
     /// Preparation of the initial write-session checkpoint and mount state.
     MountMarker,
+    /// Final construction of the first live session after recovery.
+    MountPublication,
     /// Resolves names and publication for a rename.
     RenameResolve,
     /// Stages a resolved rename after parent-directory oplock admission.
@@ -66,6 +68,7 @@ impl OperationStackPhase {
                 "drive_step" => Some(Self::MountDispatch),
                 "prepare_deltas" => Some(Self::MountDeltaReplay),
                 "prepare_marker" => Some(Self::MountMarker),
+                "publish_mount" => Some(Self::MountPublication),
                 _ => None,
             };
         }
@@ -85,8 +88,14 @@ impl OperationStackPhase {
                 true
             }
             (
-                Self::MountDispatch | Self::MountDeltaReplay | Self::MountMarker,
-                Self::MountDispatch | Self::MountDeltaReplay | Self::MountMarker,
+                Self::MountDispatch
+                | Self::MountDeltaReplay
+                | Self::MountMarker
+                | Self::MountPublication,
+                Self::MountDispatch
+                | Self::MountDeltaReplay
+                | Self::MountMarker
+                | Self::MountPublication,
             ) => self != callee,
             (
                 Self::Event | Self::Resolve | Self::Reserve | Self::Commit,
@@ -3174,6 +3183,10 @@ mod tests {
             (
                 "<ext4_core::volume::mount::MountOperation>::drive_step",
                 "<ext4_core::volume::mount::MountOperation>::prepare_marker",
+            ),
+            (
+                "<ext4_core::volume::mount::MountOperation>::drive_step",
+                "<ext4_core::volume::mount::MountOperation>::publish_mount",
             ),
             (
                 "<ext4win::request::file_info::set::PreparedRenameMutation>::prepare::<pass>",
