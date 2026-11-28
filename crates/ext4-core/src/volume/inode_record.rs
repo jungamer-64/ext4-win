@@ -113,22 +113,6 @@ pub(super) enum StagedInodeRecord {
     Recovering(RecoverableOrphanInode),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Index into this transaction's staged inode records.
-pub(super) struct StagedInodeIndex(usize);
-
-impl StagedInodeIndex {
-    /// Creates a typed staged-inode index from vector position arithmetic.
-    pub(super) const fn new(index: usize) -> Self {
-        Self(index)
-    }
-
-    /// Returns the vector index at the local staging boundary.
-    pub(super) const fn get(self) -> usize {
-        self.0
-    }
-}
-
 impl From<LiveInodeRecord> for StagedInodeRecord {
     fn from(record: LiveInodeRecord) -> Self {
         Self::Live(record)
