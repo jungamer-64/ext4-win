@@ -332,50 +332,6 @@ pub(crate) struct StreamContext {
     namespace_query_fallback: AtomicBool,
 }
 
-/// Stream-domain-specific Rust ownership retained until native destruction.
-enum StreamRuntime {
-    /// Node-only consuming MDL completion resource.
-    Node {
-        /// Sole paging-map state, retained through native dispatch and lower completion.
-        paging: NativeAllocation<super::paging_file::PagingFile>,
-        /// Address-stable completion ownership, prepared before cache pages are exposed.
-        #[cfg(not(test))]
-        completion: core::pin::Pin<Box<crate::irp::mdl_completion::MdlCompletionQueue>>,
-    },
-    /// Sole admission allocation owner, retained until the native stream is destroyed.
-    Volume(NativeAllocation<StorageAdmission>),
-}
-
-impl StreamRuntime {
-    /// Prepares node-only completion ownership before any native header is exposed.
-    /// # Errors
-    /// Returns nonpaged completion-inbox allocation failure.
-    fn try_node() -> DriverResult<Self> {
-        Ok(Self::Node {
-            paging: super::paging_file::PagingFile::try_new()?,
-            #[cfg(not(test))]
-            completion: crate::irp::mdl_completion::MdlCompletionQueue::try_new()?,
-        })
-    }
-
-    /// Immutable owner domain implied by the resource variant.
-    const fn kind(&self) -> StreamOwnerKind {
-        match self {
-            Self::Node { .. } => StreamOwnerKind::Node,
-            Self::Volume(_) => StreamOwnerKind::Volume,
-        }
-    }
-
-    /// Stable runtime identity borrowed by the corresponding native header.
-    #[cfg(not(test))]
-    fn as_ptr(&self) -> *mut c_void {
-        match self {
-            Self::Node { completion, .. } => completion.as_ref().as_ptr(),
-            Self::Volume(admission) => admission.address().as_ptr().cast(),
-        }
-    }
-}
-
 /// Terminal PnP observations carry different mounted-device retirement authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StorageRemovalNotification {
