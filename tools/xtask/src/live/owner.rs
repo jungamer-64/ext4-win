@@ -304,29 +304,10 @@ impl VerifierObservation {
     }
 }
 
-/// Checks required for the two independently configured Verifier workloads.
-#[derive(Clone, Copy)]
-enum VerifierRules {
-    /// Full DIF coverage during live filesystem I/O.
-    FilesystemIo,
-    /// Deadlock detection must remain active through the complete live workload.
-    DeadlockDetection,
-}
-
-impl VerifierRules {
-    /// Required bits in the current-boot Verifier report.
-    const fn flags(self) -> u32 {
-        match self {
-            Self::FilesystemIo => 0x0002_091b,
-            Self::DeadlockDetection => 0x0000_0020,
-        }
-    }
-}
-
 /// Parses current-boot Driver Verifier activity and requires the requested observation.
 /// # Errors
 /// Returns unknown/localized, ambiguous, insufficient or unloaded reports.
-fn verifier_activity(report: &str, rules: VerifierRules) -> TaskResult<()> {
+fn verifier_activity(report: &str, verifier: VerifierPlan) -> TaskResult<()> {
     let mut flags = Vec::new();
     let mut modules = Vec::new();
     for line in report.lines().map(str::trim) {
@@ -365,7 +346,12 @@ fn verifier_activity(report: &str, rules: VerifierRules) -> TaskResult<()> {
     if loads <= unloads {
         return Err(io::Error::other("Verifier does not observe ext4win.sys loaded").into());
     }
-    let required = rules.flags();
+    const FILESYSTEM_IO: u32 = 0x0002_091b;
+    const DEADLOCK_DETECTION: u32 = 0x0000_0020;
+    let required = match verifier {
+        VerifierPlan::Runtime => FILESYSTEM_IO,
+        VerifierPlan::ConfiguredAtBoot => FILESYSTEM_IO | DEADLOCK_DETECTION,
+    };
     if flags & required != required {
         return Err(io::Error::other(format!(
             "Verifier flags {flags:#010x} do not include {required:#010x}"
@@ -402,11 +388,11 @@ fn require_idle_verifier() -> TaskResult<()> {
 fn observe_verifier(
     session: &mut Session<LiveState>,
     observation: VerifierObservation,
-    rules: VerifierRules,
+    verifier: VerifierPlan,
 ) -> TaskResult<()> {
     let report = query_verifier()?;
     fs::write(session.directory().join(observation.file_name()), &report)?;
-    verifier_activity(&report, rules)?;
+    verifier_activity(&report, verifier)?;
     session.publish(Phase::Observed(Operation::ObserveVerifier))
 }
 
@@ -498,7 +484,6 @@ fn verify_loaded_image(
     session: &mut Session<LiveState>,
     verifier: VerifierPlan,
     observation: VerifierObservation,
-    rules: VerifierRules,
 ) -> TaskResult<()> {
     if verifier == VerifierPlan::Runtime {
         if session.state().verifier_effect.is_none() {
@@ -524,7 +509,7 @@ fn verify_loaded_image(
         run_dif(command, "live Driver Verifier activation")?;
         session.publish(Phase::Observed(Operation::ActivateVerifier))?;
     }
-    observe_verifier(session, observation, rules)
+    observe_verifier(session, observation, verifier)
 }
 
 /// Checks live-host prerequisites without storage, package or driver mutation.
@@ -1396,29 +1381,19 @@ fn exercise_driver(
     let scope = scope(session)?;
     storage::validate(&scope)?;
     let id = session.id().clone();
-    let rules = match verifier {
-        VerifierPlan::Runtime | VerifierPlan::ConfiguredAtBoot => VerifierRules::FilesystemIo,
-        VerifierPlan::DeadlockDetection => VerifierRules::DeadlockDetection,
-    };
     let artifact = driver_load::start_session(root, &id, Some(&scope), || {
         if windows_host::driver_image_loaded("ext4win.sys")? {
             return Err(io::Error::other("live startup requires an unloaded driver image").into());
         }
-        if verifier != VerifierPlan::ConfiguredAtBoot {
+        if verifier == VerifierPlan::Runtime {
             require_idle_verifier()?;
         }
         session.state_mut().driver = DriverStage::Starting;
-        session.publish(Phase::Intent(Operation::StartDriver))?;
-        Ok(())
+        session.publish(Phase::Intent(Operation::StartDriver))
     })?;
     session.state_mut().driver = DriverStage::Running;
     session.publish(Phase::Observed(Operation::StartDriver))?;
-    verify_loaded_image(
-        session,
-        verifier,
-        VerifierObservation::BeforeFilesystemIo,
-        rules,
-    )?;
+    verify_loaded_image(session, verifier, VerifierObservation::BeforeFilesystemIo)?;
     let mount = mount_namespace(session)?;
     if matches!(session.state().workload, LiveWorkload::Assurance) {
         if fs::read(mount.join(LIVE_RECOVERY_PATH))? != LIVE_RECOVERY_PAYLOAD {
@@ -1475,7 +1450,7 @@ fn exercise_driver(
     remove_namespace(session)?;
     exercise_offline_online(session, &payload)?;
     storage::validate(&scope)?;
-    observe_verifier(session, VerifierObservation::BeforeAttachedUnload, rules)?;
+    observe_verifier(session, VerifierObservation::BeforeAttachedUnload, verifier)?;
     println!("live unload: stop the driver with the session VHDX still attached");
     let driver = driver_load::quiesce_session(root, session.id())?;
     dismount_filesystem(session)?;
@@ -1488,12 +1463,7 @@ fn exercise_driver(
         session.publish(Phase::Intent(Operation::StartDriver))
     })?;
     session.publish(Phase::Observed(Operation::StartDriver))?;
-    verify_loaded_image(
-        session,
-        verifier,
-        VerifierObservation::BeforeHotAttach,
-        rules,
-    )?;
+    verify_loaded_image(session, verifier, VerifierObservation::BeforeHotAttach)?;
     attachment(session, true)?;
     let mount = mount_namespace(session)?;
     if fs::read(mount.join("live-ci/alpha.bin"))? != payload {
@@ -1519,7 +1489,7 @@ fn exercise_driver(
         return Err(io::Error::other("reattachment lost durable identity mapping").into());
     }
     storage::validate(&scope)?;
-    observe_verifier(session, VerifierObservation::AfterHotAttach, rules)?;
+    observe_verifier(session, VerifierObservation::AfterHotAttach, verifier)?;
     let mut driver = driver_load::quiesce_session(root, session.id())?;
     dismount_filesystem(session)?;
     remove_namespace(session)?;
@@ -1614,20 +1584,17 @@ pub(crate) fn cleanup_live_vhdx_session(root: &Path, id: &OsStr) -> TaskResult<(
 /// Returns build, workload, integrity or mandatory joined cleanup failures.
 pub(crate) fn benchmark_multi_file(root: &Path) -> TaskResult<()> {
     let id = SessionId::create(root)?;
-    prepare_fresh_session(root, LiveWorkload::RandomIo, id.clone())?;
+    prepare_session(root, LiveWorkload::RandomIo, id.clone())?;
     verify_live_vhdx(root, OsStr::new(id.as_str()), VerifierPlan::Runtime)
 }
 
 /// Creates disposable storage and an identity-bound stopped installation for later activation.
 /// # Errors
 /// Returns preflight, build, storage or installation failures, preserving cleanup failures.
-fn prepare_session(
-    root: &Path,
-    workload: LiveWorkload,
-    id: SessionId,
-    install: impl FnOnce(SessionId, &DisposablePartition) -> TaskResult<()>,
-) -> TaskResult<()> {
+fn prepare_session(root: &Path, workload: LiveWorkload, id: SessionId) -> TaskResult<()> {
+    check_live_driver_host(root)?;
     let helper = fixture::executable(root)?;
+    let bundle = build_verified_production_bundle(root)?;
     println!("live VHDX session: {}", id.as_str());
     let state = LiveState {
         workload,
@@ -1646,7 +1613,7 @@ fn prepare_session(
         storage::validate(&scope)?;
         session.state_mut().driver = DriverStage::Installing;
         session.publish(Phase::Intent(Operation::InstallPackage))?;
-        install(session.id().clone(), &scope)?;
+        driver_load::install_session(root, &bundle, session.id().clone(), Some(&scope))?;
         session.state_mut().driver = DriverStage::Installed;
         session.publish(Phase::Observed(Operation::InstallPackage))
     })();
@@ -1661,23 +1628,12 @@ fn prepare_session(
     Ok(())
 }
 
-/// Builds the package once before acquiring disposable resources.
-/// # Errors
-/// Returns preflight, build, preparation, or cleanup failures.
-fn prepare_fresh_session(root: &Path, workload: LiveWorkload, id: SessionId) -> TaskResult<()> {
-    check_live_driver_host(root)?;
-    let bundle = build_verified_production_bundle(root)?;
-    prepare_session(root, workload, id, |id, scope| {
-        driver_load::install_session(root, &bundle, id, Some(scope))
-    })
-}
-
 /// Prepares one caller-named session without issuing a driver-start request.
 /// Successful preparation transfers finalization responsibility to verification or explicit cleanup.
 /// # Errors
 /// Returns malformed identity, build, storage, installation or mandatory cleanup failures.
 pub(crate) fn prepare_live_vhdx(root: &Path, id: &OsStr) -> TaskResult<()> {
-    prepare_fresh_session(root, LiveWorkload::Assurance, SessionId::parse(id)?)
+    prepare_session(root, LiveWorkload::Assurance, SessionId::parse(id)?)
 }
 
 /// Consumes a prepared session through live validation, cleanup and joined ETW completion.
@@ -1878,7 +1834,7 @@ mod tests {
     )]
     fn runtime_and_partition_admission() -> TaskResult<()> {
         let report = "Verifier Flags: 0x0012091b\nMODULE: ext4win.sys (load: 1 / unload: 0)";
-        let rules = VerifierRules::FilesystemIo;
+        let rules = VerifierPlan::Runtime;
         verifier_activity(report, rules)?;
         assert!(verifier_activity(&report.replace("0x0012091b", "0x00000000"), rules).is_err());
         assert!(verifier_activity(&report.replace("load: 1", "load: 0"), rules).is_err());
@@ -1923,13 +1879,15 @@ mod tests {
     }
 
     /// # Panics
-    /// Fails if an unloaded image or rules covering only runtime I/O satisfy the deadlock workload.
+    /// Fails if the boot workload accepts an unloaded image or an incomplete set of checks.
     #[test]
-    fn live_deadlock_verifier_requires_deadlock_detection_on_the_loaded_driver() {
-        let rules = VerifierRules::DeadlockDetection;
-        let report = "Verifier Flags: 0x00000020\nMODULE: ext4win.sys (load: 1 / unload: 0)";
-        assert!(verifier_activity(report, rules).is_ok());
-        assert!(verifier_activity(&report.replace("0x00000020", "0x0012091b"), rules).is_err());
-        assert!(verifier_activity(&report.replace("unload: 0", "unload: 1"), rules).is_err());
+    fn boot_verifier_requires_deadlock_and_io_rules_on_the_loaded_driver() {
+        let plan = VerifierPlan::ConfiguredAtBoot;
+        let report = "Verifier Flags: 0x0012093b\nMODULE: ext4win.sys (load: 2 / unload: 1)";
+        assert!(verifier_activity(report, plan).is_ok());
+        for flags in ["0x0012091b", "0x00000020"] {
+            assert!(verifier_activity(&report.replace("0x0012093b", flags), plan).is_err());
+        }
+        assert!(verifier_activity(&report.replace("unload: 1", "unload: 2"), plan).is_err());
     }
 }

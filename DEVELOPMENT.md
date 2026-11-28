@@ -21,12 +21,11 @@ Cargo commands for a canonical gate.
 | `cargo xtask verify-production-driver` | Windows with MSVC, WDK, `cargo-wdk`, WSL/e2fsprogs, and WSL root loop-mount authority | Runs the development and interoperability gates, builds and signs one identity-bound package, and verifies release reachability. |
 | `cargo xtask check-hosted-driver-host` | Elevated Windows host with `TESTSIGNING`, PnPUtil, SCM, and no existing ext4win package/service | Performs the read-only preflight for a kernel-load smoke session. |
 | `cargo xtask verify-hosted-driver-load` | A host that passes the hosted preflight and trusts the production signer in LocalMachine Root and Trusted Publishers | Builds one verified production bundle, installs that exact package, completes demand-start driver initialization, and requires service/package cleanup. |
-| `cargo xtask verify-live-vhdx-deadlock <live-session-id> <deadlock-session-id>` | Disposable hosted Windows boot, idle Driver Verifier, a finalized live VHDX session and a fresh session ID | Repeats the live workload on fresh storage with the sealed package and Deadlock Detection active from driver load. |
 | `cargo xtask cleanup-driver-load-session <session-id>` | Elevated Windows host | Reconciles an interrupted service/package session only after its durable bundle, signer, and package identities match. |
 | `cargo xtask check-live-driver-host` | Dedicated host that passes the hosted preflight and also provides Hyper-V PowerShell, WSL/e2fsprogs, and Driver Verifier | Performs the read-only preflight for disposable live VHDX validation. |
 | `cargo xtask prepare-live-vhdx <session-id>` | A host that passes the live preflight; a fresh 32-digit lowercase hexadecimal session ID | Builds one verified bundle, creates disposable ext4 storage and binds its installed service in the stopped state. |
 | `cargo xtask verify-live-vhdx <session-id>` | The same host with a prepared session, unchanged source inputs, an idle Driver Verifier, and English Windows runtime output | Exercises live I/O and remount with session-owned runtime verification. |
-| `cargo xtask verify-live-vhdx-boot-verifier <session-id>` | A dedicated guest booted with the required Verifier classes for the test driver, with the same preparation and evidence requirements | Exercises the same workload with Driver Verifier enabled from driver initialization. |
+| `cargo xtask verify-live-vhdx-boot-verifier <session-id>` | A dedicated guest booted with the required I/O and Deadlock Detection rules for the test driver, with the same preparation and evidence requirements | Exercises the same workload with all required rules active from driver initialization. |
 | `cargo xtask benchmark-multi-file` | A host that passes the live preflight | Measures native random reads and writes on independently populated disposable storage, retaining artifact-bound latency and flush evidence. |
 | `cargo xtask cleanup-live-vhdx-session <session-id>` | Dedicated elevated Windows host | Reconciles an interrupted session and removes only resources whose recorded identities still match. |
 
@@ -302,21 +301,17 @@ departure and checks that the Verifier is idle. A boot-scoped selection that
 requires a reboot can be reconciled by running the session cleanup command after
 a new boot. Unknown report formats fail validation.
 
-The hosted live job then repeats the workload on a fresh VHDX with the same
-package. Deadlock Detection is selected before SCM start and checked before I/O,
-around the attached-storage unload and after reload. The disposable runner owns
-the named selection until shutdown.
-
-To apply the full DIF rule set from startup, configure the dedicated guest before reboot:
+To verify the live workload with Deadlock Detection active from initialization,
+configure the dedicated guest before reboot:
 
 ```powershell
-verifier.exe /dif 1 2 4 5 9 12 18 /driver ext4win.sys
+verifier.exe /dif 1 2 4 5 6 9 12 18 /driver ext4win.sys
 verifier.exe /bootmode oneboot
 ```
 
 After reboot, prepare the VHDX and run `verify-live-vhdx-boot-verifier` in that
 boot. The boot configuration belongs to the guest operator. The workload
-requires the same rule classes on each load and reads their runtime status
+requires both the I/O and Deadlock Detection rules on each load and reads their runtime status
 without reconfiguring them. See the [Driver Verifier command syntax](https://learn.microsoft.com/en-us/windows-hardware/drivers/devtest/verifier-command-line).
 
 Disk offline/online cycles must preserve the volume GUID and drive letters.

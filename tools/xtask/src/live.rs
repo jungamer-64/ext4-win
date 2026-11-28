@@ -8,7 +8,7 @@ pub(crate) use owner::benchmark_multi_file;
 #[cfg(windows)]
 pub(crate) use owner::{
     READ_REMOUNT_PAYLOAD, check_live_driver_host, cleanup_live_vhdx_session, prepare_live_vhdx,
-    read_remount_payload, verify_live_vhdx, verify_live_vhdx_deadlock,
+    read_remount_payload, verify_live_vhdx,
 };
 #[cfg(not(windows))]
 use std::{ffi::OsStr, io, path::Path};
@@ -17,11 +17,8 @@ use std::{ffi::OsStr, io, path::Path};
 pub(crate) enum VerifierPlan {
     /// The session enables the runtime rule classes on each loaded image.
     Runtime,
-    /// The dedicated guest boots with the rule classes enabled.
+    /// The dedicated guest boots with all I/O rules and Deadlock Detection enabled.
     ConfiguredAtBoot,
-    /// The disposable host retains its pre-load deadlock selection through image reloads.
-    #[cfg(windows)]
-    DeadlockDetection,
 }
 
 /// Rejects Windows live validation on portable hosts.
@@ -43,17 +40,6 @@ pub(crate) fn verify_live_vhdx(
     root: &Path,
     _id: &OsStr,
     _verifier: VerifierPlan,
-) -> TaskResult<()> {
-    check_live_driver_host(root)
-}
-/// Rejects the hosted deadlock workload outside Windows.
-/// # Errors
-/// Always returns Unsupported on non-Windows hosts.
-#[cfg(not(windows))]
-pub(crate) fn verify_live_vhdx_deadlock(
-    root: &Path,
-    _live_id: &OsStr,
-    _deadlock_id: &OsStr,
 ) -> TaskResult<()> {
     check_live_driver_host(root)
 }

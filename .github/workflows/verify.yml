@@ -851,15 +851,6 @@ jobs:
           ./.github/scripts/invoke-cargo-with-log.ps1 -LogPath target/live-vhdx-ci.log -CargoArguments @('xtask', 'verify-live-vhdx', $env:LIVE_VHDX_SESSION)
           exit $LASTEXITCODE
 
-      - name: Verify live filesystem I/O with Deadlock Detection active from driver load
-        if: env.EXT4WIN_DRIVER_SCENARIO == 'live'
-        timeout-minutes: 150
-        shell: pwsh
-        run: |
-          $deadlockId = [Guid]::NewGuid().ToString("N")
-          ./.github/scripts/invoke-cargo-with-log.ps1 -LogPath target/live-deadlock-ci.log -CargoArguments @('xtask', 'verify-live-vhdx-deadlock', $env:LIVE_VHDX_SESSION, $deadlockId)
-          exit $LASTEXITCODE
-
       - name: Reconcile interrupted live sessions
         if: always()
         timeout-minutes: 10
@@ -897,7 +888,6 @@ jobs:
           path: |
             target/sdk*.log
             target/driver-load-ci.log
-            target/live-deadlock-ci.log
             target/live-vhdx-ci.log
             target/live-driver-trace/*.etl
             target/live-vhdx-sessions/**/*.json
