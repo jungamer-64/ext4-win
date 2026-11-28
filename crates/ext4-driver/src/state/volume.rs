@@ -903,15 +903,6 @@ pub(crate) struct VolumeCloseOutcome {
     retirement: VolumeRetirement,
 }
 
-/// Lifecycle transition retained while a durability barrier drains earlier work.
-#[derive(Debug)]
-pub(crate) struct PreparedVolumeStateTransition {
-    /// Exact mounted owner whose state may be published or failed.
-    volume: MountedVolumeRef,
-    /// Publication variant that owns the expected pre-state and authorized post-state.
-    kind: PreparedVolumeStateTransitionKind,
-}
-
 /// Unique reversible exclusion; sealing consumes it into terminal close authority.
 #[derive(Debug)]
 pub(crate) struct PreparedVolumeClose {
@@ -935,21 +926,6 @@ impl PreparedVolumeLock {
     pub(crate) fn into_parts(self) -> (PreparedVolumeStateTransition, PreparedStreamCacheDrain) {
         (self.transition, self.cache_drain)
     }
-}
-
-#[derive(Debug)]
-/// Lifecycle publication authorized only after its matching durability barrier.
-enum PreparedVolumeStateTransitionKind {
-    /// Ordinary volume-lock publication after one filesystem flush.
-    Lock {
-        /// FILE_OBJECT whose lock attempt has already closed namespace admission.
-        owner: KernelFileObject,
-    },
-    /// Logical session termination; successful raw access additionally requires clean finalization.
-    SessionEnd {
-        /// Terminal selected when the current `Closing` state was entered.
-        target: VolumeCloseTarget,
-    },
 }
 
 impl VolumeCloseOutcome {
