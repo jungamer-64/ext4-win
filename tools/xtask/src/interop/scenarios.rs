@@ -348,7 +348,7 @@ fn stage_live_recovery_fixture(linux: LinuxEnvironment, image: &Path) -> TaskRes
         &format!("write \"{payload_path}\" /{LIVE_RECOVERY_PATH}"),
         &image_path,
     ]);
-    run_checked(debugfs, "write the live fixture's home block")?;
+    linux.oracle_output(debugfs, "write the live fixture's home block")?;
     let mut debugfs = linux.command("debugfs");
     debugfs.args([
         "-w",
@@ -356,10 +356,7 @@ fn stage_live_recovery_fixture(linux: LinuxEnvironment, image: &Path) -> TaskRes
         &format!("set_inode_field /{LIVE_RECOVERY_PATH} mode 0100644"),
         &image_path,
     ]);
-    run_checked(
-        debugfs,
-        "make the recovery probe readable before identity setup",
-    )?;
+    linux.oracle_output(debugfs, "set the live recovery probe permissions")?;
     let blocks =
         debugfs_block_sequence(linux, &image_path, &format!("blocks /{LIVE_RECOVERY_PATH}"))?;
     let [block] = blocks.as_slice() else {
@@ -376,7 +373,7 @@ fn stage_live_recovery_fixture(linux: LinuxEnvironment, image: &Path) -> TaskRes
     )?;
     let mut debugfs = linux.command("debugfs");
     debugfs.args(["-w", "-f", &commands_path, &image_path]);
-    run_checked(debugfs, "commit the live fixture's journal transaction")?;
+    linux.oracle_output(debugfs, "commit the live fixture's journal transaction")?;
     let evidence = normalize_debugfs_descriptors(
         image,
         JournalImageLayout::Internal(&journal),
@@ -408,7 +405,7 @@ fn require_live_recovery_payload(
 ) -> TaskResult<()> {
     let mut debugfs = linux.command("debugfs");
     debugfs.args(["-R", &format!("cat /{LIVE_RECOVERY_PATH}"), image]);
-    let observed = run_checked_output(debugfs, "inspect the live recovery probe")?;
+    let observed = linux.oracle_output(debugfs, "inspect the live recovery probe")?;
     if observed.stdout != expected {
         return Err(io::Error::other("the live recovery probe has unexpected home bytes").into());
     }
@@ -2645,7 +2642,7 @@ fn debugfs_block_sequence(
 ) -> TaskResult<Vec<u64>> {
     let mut command = linux.command_with_environment("debugfs", "LC_ALL", "C");
     command.args(["-R", request, image]);
-    let output = run_checked_output(command, "debugfs block query")?;
+    let output = linux.oracle_output(command, &format!("debugfs block query `{request}`"))?;
     decode_debugfs_block_sequence(&output.stdout, &output.stderr)
 }
 

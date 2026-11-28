@@ -193,15 +193,39 @@ fn drain(pipe: &mut (impl AsRawHandle + Read), bytes: &mut Vec<u8>) -> io::Resul
             .ok_or_else(|| io::Error::other("capture range invalid"))?,
     )
 }
+/// Executes one WSL requester with independently bounded observation and captured diagnostics.
+/// # Errors
+/// Returns process, exit or uncertain completion errors labeled with the Linux operation.
+pub(crate) fn wsl_request(
+    mut command: Command,
+    operation: &str,
+    timeout: Duration,
+) -> TaskResult<Output> {
+    let label = format!("WSL {operation}");
+    eprintln!("{label}: begin");
+    command.stderr(Stdio::piped());
+    let output = checked_output(bounded(command, timeout)?, &label)?;
+    eprintln!("{label}: complete");
+    Ok(output)
+}
+
 /// Checks a requester result while keeping timeout distinguishable from returned errors.
 /// # Errors
 /// Returns an explicit TimedOut classification for uncertain acceptance, or exit-code diagnostics.
 pub(crate) fn checked_outcome(outcome: CommandOutcome, description: &str) -> TaskResult<Vec<u8>> {
+    Ok(checked_output(outcome, description)?.stdout)
+}
+
+/// Preserves both streams on success for oracles that interpret diagnostics independently.
+/// # Errors
+/// Returns an explicit TimedOut classification for uncertain acceptance, or exit-code diagnostics.
+pub(crate) fn checked_output(outcome: CommandOutcome, description: &str) -> TaskResult<Output> {
     match outcome {
-        CommandOutcome::Exited(output) if output.status.success() => Ok(output.stdout),
+        CommandOutcome::Exited(output) if output.status.success() => Ok(output),
         CommandOutcome::Exited(output) => Err(io::Error::other(format!(
-            "{description} failed: {}; {}",
+            "{description} failed: {}; stdout={} stderr={}",
             output.status,
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         ))
         .into()),

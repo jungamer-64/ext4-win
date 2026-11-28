@@ -126,6 +126,21 @@ impl LinuxEnvironment {
         }
     }
 
+    /// Executes one Linux oracle carrying operation-specific diagnostics.
+    /// # Errors
+    /// Returns native command failure or an uncertain WSL timeout.
+    fn oracle_output(self, command: Command, operation: &str) -> TaskResult<std::process::Output> {
+        match self {
+            #[cfg(windows)]
+            Self::Wsl => crate::windows::wsl_request(
+                command,
+                operation,
+                core::time::Duration::from_secs(120),
+            ),
+            _ => run_checked_output(command, operation),
+        }
+    }
+
     /// Converts one host path into the namespace used by the selected Linux tools.
     ///
     /// # Errors
@@ -147,7 +162,7 @@ impl LinuxEnvironment {
                 //
                 command.args(["--exec", "/usr/bin/wslpath", "-a"]).arg(path);
 
-                let output = run_checked_output(command, "WSL path conversion")?;
+                let output = self.oracle_output(command, "path conversion")?;
 
                 let converted = String::from_utf8(output.stdout)?;
 

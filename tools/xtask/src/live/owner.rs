@@ -3,10 +3,7 @@ use super::VerifierPlan;
 use crate::{
     TaskResult, driver_load, fixture,
     interop::{LIVE_RECOVERY_PATH, LIVE_RECOVERY_PAYLOAD, stage_live_journal_recovery},
-    process::{
-        combine_verification_and_cleanup, create_task_directory, remove_task_directory,
-        run_checked, run_checked_output,
-    },
+    process::{combine_verification_and_cleanup, run_checked, run_checked_output},
     production::build_verified_production_bundle,
     session::{Operation, Phase, Session, SessionId},
     storage::{self, DisposablePartition, Partition},
@@ -173,23 +170,38 @@ impl LiveState {
 /// Returns requester or external command errors.
 fn wsl_output(arguments: &[OsString]) -> TaskResult<Output> {
     let mut command = Command::new("wsl.exe");
-    if arguments
-        .first()
-        .is_some_and(|argument| argument == "--exec")
-    {
-        command.args([
-            "--user",
-            "root",
-            "--exec",
-            "/usr/bin/env",
-            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            "LC_ALL=C",
-        ]);
-        command.args(arguments.iter().skip(1));
-    } else {
-        command.args(arguments);
-    }
-    run_checked_output(command, "WSL session operation")
+    let (operation, timeout) = match arguments {
+        [exec, program, args @ ..] if exec == "--exec" => {
+            command.args([
+                "--user",
+                "root",
+                "--exec",
+                "/usr/bin/env",
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "LC_ALL=C",
+            ]);
+            command.arg(program).args(args);
+            let program = Path::new(program)
+                .file_name()
+                .and_then(OsStr::to_str)
+                .ok_or_else(|| io::Error::other("WSL program has no executable name"))?;
+            let timeout = match program {
+                "ext4-fixture" => Duration::from_secs(600),
+                "mke2fs" | "dd" | "e2fsck" => Duration::from_secs(300),
+                _ => Duration::from_secs(120),
+            };
+            (program, timeout)
+        }
+        [verb, ..] if verb != "--exec" => {
+            command.args(arguments);
+            let verb = verb
+                .to_str()
+                .ok_or_else(|| io::Error::other("WSL verb is not UTF-8"))?;
+            (verb, Duration::from_secs(120))
+        }
+        _ => return Err(io::Error::other("WSL request requires an operation").into()),
+    };
+    windows::wsl_request(command, operation, timeout)
 }
 
 /// Decodes a WSL management response whose output is text.
@@ -633,11 +645,56 @@ fn attach_wsl_partition(session: &mut Session<LiveState>) -> TaskResult<String> 
     Ok(partition)
 }
 
+/// Private image used before the staged transaction is copied to the identified partition.
+fn recovery_image(session: &Session<LiveState>) -> PathBuf {
+    session
+        .directory()
+        .join("recovery-image")
+        .join("filesystem.img")
+}
+
+/// Releases session scratch after no Linux requester can still be using the image.
+/// # Errors
+/// Returns unresolved WSL ownership, unexpected scratch contents or file removal failure.
+fn remove_recovery_image(session: &Session<LiveState>) -> TaskResult<()> {
+    if session.state().wsl != WslAttachment::Detached {
+        return Err(io::Error::other("recovery image remains owned by the WSL session").into());
+    }
+    let image = recovery_image(session);
+    let directory = image
+        .parent()
+        .ok_or_else(|| io::Error::other("recovery image has no parent"))?;
+    match fs::symlink_metadata(directory) {
+        // Reject junctions as well as symbolic links before opening the known child paths.
+        Ok(metadata) if metadata.is_dir() && metadata.file_attributes() & 0x400 == 0 => {}
+        Ok(_) => {
+            return Err(
+                io::Error::other("recovery image directory is not session-owned storage").into(),
+            );
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    let probe = image.with_extension("probe");
+    let commands = image.with_extension("debugfs");
+    for path in [&probe, &commands, &image] {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    match fs::remove_dir(directory) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Formats and populates through Linux tools before any Windows-driver mount can occur.
 /// # Errors
 /// Returns device-difference, GPT identity, oracle, helper or WSL detachment failures.
 fn format_storage(
-    root: &Path,
     session: &mut Session<LiveState>,
     helper: &Path,
     workload: LiveWorkload,
@@ -647,43 +704,43 @@ fn format_storage(
     let helper = linux_path(helper)?;
     match workload {
         LiveWorkload::Assurance => {
-            let directory = create_task_directory(root, "live-recovery-image")?;
-            let operation = (|| {
-                let image = directory.join("filesystem.img");
-                let length = scope(session)?.partition.length;
-                fs::File::create_new(&image)?.set_len(length)?;
-                let path = linux_path(&image)?;
-                format_filesystem(&path, &helper, workload)?;
-                stage_live_journal_recovery(&image)?;
-                wsl_words(&[
-                    "--exec",
-                    "dd",
-                    &format!("if={path}"),
-                    &format!("of={partition}"),
-                    "bs=1M",
-                    "conv=fsync,notrunc",
-                    "status=none",
-                ])?;
-                let staged = wsl_words(&["--exec", "debugfs", "-R", "stats -h", &partition])?;
-                let features = superblock_features(&staged)?;
-                if !features.contains(&"has_journal") || !features.contains(&"needs_recovery") {
-                    return Err(io::Error::other(
-                        "the disposable partition lacks the staged journal recovery marker",
-                    )
-                    .into());
-                }
-                println!(
-                    "live recovery fixture: pending internal transaction transferred to the disposable partition"
-                );
-                Ok(())
-            })();
-            let cleanup = remove_task_directory(root, &directory, "live-recovery-image");
-            combine_verification_and_cleanup(operation, cleanup)?;
+            let image = recovery_image(session);
+            let directory = image
+                .parent()
+                .ok_or_else(|| io::Error::other("recovery image has no parent"))?;
+            fs::create_dir(directory)?;
+            let length = scope(session)?.partition.length;
+            fs::File::create_new(&image)?.set_len(length)?;
+            let path = linux_path(&image)?;
+            format_filesystem(&path, &helper, workload)?;
+            eprintln!("live recovery fixture: stage the pending journal transaction");
+            stage_live_journal_recovery(&image)?;
+            wsl_words(&[
+                "--exec",
+                "dd",
+                &format!("if={path}"),
+                &format!("of={partition}"),
+                "bs=1M",
+                "conv=fsync,notrunc",
+                "status=none",
+            ])?;
+            let staged = wsl_words(&["--exec", "debugfs", "-R", "stats -h", &partition])?;
+            let features = superblock_features(&staged)?;
+            if !features.contains(&"has_journal") || !features.contains(&"needs_recovery") {
+                return Err(io::Error::other(
+                    "the disposable partition lacks the staged journal recovery marker",
+                )
+                .into());
+            }
+            println!(
+                "live recovery fixture: pending internal transaction transferred to the disposable partition"
+            );
         }
         LiveWorkload::RandomIo => format_filesystem(&partition, &helper, workload)?,
     }
     session.publish(Phase::Observed(Operation::Format))?;
-    finish_wsl(session, wsl)
+    finish_wsl(session, wsl)?;
+    remove_recovery_image(session)
 }
 
 /// Prepares the clean home filesystem before any test-specific journal staging.
@@ -1535,6 +1592,7 @@ fn cleanup(root: &Path, session: &mut Session<LiveState>) -> TaskResult<()> {
         return Ok(());
     }
     finish_wsl(session, wsl)?;
+    remove_recovery_image(session)?;
     if let Some(disk) = storage::disk(&vhdx(session))? {
         if session
             .state()
@@ -1607,7 +1665,7 @@ fn prepare_session(root: &Path, workload: LiveWorkload, id: SessionId) -> TaskRe
     let mut session = Session::create(root, "live-vhdx-sessions", id, state)?;
     let operation = (|| {
         create_storage(&mut session, workload)?;
-        format_storage(root, &mut session, &helper, workload)?;
+        format_storage(&mut session, &helper, workload)?;
         attachment(&mut session, true)?;
         let scope = scope(&session)?;
         storage::validate(&scope)?;
@@ -1745,7 +1803,17 @@ mod tests {
                         identity: None,
                     },
                 )?;
-                session.publish(Phase::Intent(Operation::AttachWsl))?;
+                session.publish(Phase::Intent(Operation::Format))?;
+                let image = recovery_image(&session);
+                fs::create_dir(
+                    image
+                        .parent()
+                        .ok_or_else(|| io::Error::other("missing image directory"))?,
+                )?;
+                fs::write(&image, b"staged recovery fixture")?;
+                fs::write(image.with_extension("probe"), b"probe")?;
+                assert!(remove_recovery_image(&session).is_err());
+                assert!(image.exists());
                 let mut effects = Vec::new();
                 assert!(
                     finish_wsl(&mut session, |arguments| {
@@ -1766,6 +1834,8 @@ mod tests {
                 assert_eq!(effects.last().and_then(Option::as_deref), Some(interrupted));
                 let mut recovered: Session<LiveState> = Session::load(&fixture, "sessions", &id)?;
                 assert_eq!(recovered.state().wsl, WslAttachment::Detaching);
+                assert!(remove_recovery_image(&recovered).is_err());
+                assert!(image.exists());
                 let mut shutdowns = 0;
                 finish_wsl(&mut recovered, |arguments| {
                     match arguments.first().and_then(|value| value.to_str()) {
@@ -1781,6 +1851,10 @@ mod tests {
                 let mut completed: Session<LiveState> = Session::load(&fixture, "sessions", &id)?;
                 assert_eq!(completed.state().wsl, WslAttachment::Detached);
                 assert_eq!(completed.phase(), Phase::Observed(Operation::ShutdownWsl));
+                remove_recovery_image(&completed)?;
+                assert!(!image.exists());
+                assert!(!image.with_extension("probe").exists());
+                remove_recovery_image(&completed)?;
                 finish_wsl(&mut completed, |_| {
                     Err(
                         io::Error::other("completed finalization repeated an external effect")
