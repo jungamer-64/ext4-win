@@ -198,8 +198,8 @@ impl PreparedJournalCheckpoint {
 /// Journal transaction serialized completely before its first lower write.
 #[derive(Debug)]
 pub(crate) struct PreparedJournalCommit {
-    /// Dirty-superblock, descriptor, and journal data writes before the first durability flush.
-    precommit_writes: Vec<PlannedStorageWrite>,
+    /// Tail publication and journal payload requests, with any required intervening barrier.
+    precommit: Vec<StorageRequest>,
     /// Commit-record write issued after precommit writes are durable.
     commit_write: PlannedStorageWrite,
     /// Journal device whose flush establishes commit durability.
@@ -208,6 +208,15 @@ pub(crate) struct PreparedJournalCommit {
     overlay: Vec<JournalBlock>,
     /// Independent checkpoint work prepared before the first lower write.
     checkpoint: PreparedJournalCheckpoint,
+}
+
+/// Publication of the tail that locates a pending full commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JournalTailPublication {
+    /// The previous durable tail is clean and does not reference occupied ring blocks.
+    ActivateCleanLog,
+    /// The previous durable tail still reaches the full prefix that selects the fast-commit TID.
+    RelocateRecoveryTail,
 }
 
 /// Transaction checksum profile selected by validated JBD2 features.
@@ -444,14 +453,14 @@ impl PreparedJournalCommit {
     pub(crate) fn into_parts(
         self,
     ) -> (
-        Vec<PlannedStorageWrite>,
+        Vec<StorageRequest>,
         PlannedStorageWrite,
         StorageTarget,
         Vec<JournalBlock>,
         PreparedJournalCheckpoint,
     ) {
         (
-            self.precommit_writes,
+            self.precommit,
             self.commit_write,
             self.journal_target,
             self.overlay,
@@ -575,7 +584,7 @@ pub(crate) enum JournalRecoveryCompletion {
 /// The immutable program and its checkpointed journal cannot be repacked into a foreign pair.
 #[derive(Debug)]
 pub(crate) struct DeltaRecoverySeed {
-    /// Free full-journal ring with its original filesystem target restrictions.
+    /// Checkpointed full prefix and the cursor whose TID owns the pending delta log.
     base: JournalData,
     /// Reauthenticated operands from that exact full-journal scan.
     program: DeltaProgram,
@@ -602,7 +611,11 @@ impl DeltaRecoverySeed {
         block_size: BlockSize,
         blocks: Vec<JournalBlock>,
     ) -> Result<PreparedJournalCommit> {
-        self.base.prepare_full_commit(block_size, blocks)
+        self.base.prepare_full_commit(
+            block_size,
+            blocks,
+            JournalTailPublication::RelocateRecoveryTail,
+        )
     }
 }
 
@@ -1734,7 +1747,8 @@ impl Journal<CleanJournal> {
         block_size: BlockSize,
         blocks: Vec<JournalBlock>,
     ) -> Result<PreparedJournalCommit> {
-        self.data.prepare_full_commit(block_size, blocks)
+        self.data
+            .prepare_full_commit(block_size, blocks, JournalTailPublication::ActivateCleanLog)
     }
 
     /// Admits a bounded metadata operation before any of its persistent effects begin.
@@ -1926,6 +1940,7 @@ impl JournalData {
         &self,
         block_size: BlockSize,
         journal_blocks: Vec<JournalBlock>,
+        tail_publication: JournalTailPublication,
     ) -> Result<PreparedJournalCommit> {
         if block_size != self.geometry.block_size {
             return Err(Error::InvalidWriteRange);
@@ -1939,27 +1954,38 @@ impl JournalData {
             self.superblock
                 .encode_dirty(block_size, prepared.descriptor, prepared.sequence)?;
 
-        let additional_precommit = prepared
+        let tail_requests = match tail_publication {
+            JournalTailPublication::ActivateCleanLog => 1,
+            JournalTailPublication::RelocateRecoveryTail => 2,
+        };
+        let precommit_count = prepared
             .log_blocks
             .len()
-            .checked_add(1)
+            .checked_add(tail_requests)
             .ok_or(Error::ArithmeticOverflow)?;
-        let mut precommit_writes = Vec::new();
-        precommit_writes
-            .try_reserve_exact(additional_precommit)
+        let mut precommit = Vec::new();
+        precommit
+            .try_reserve_exact(precommit_count)
             .map_err(|_| Error::OutOfMemory)?;
-        precommit_writes.try_push(PlannedStorageWrite::new(
-            journal_target,
-            self.location.superblock_offset(block_size)?,
-            dirty_superblock,
-        ))?;
+        precommit.try_push(StorageRequest::Write {
+            target: journal_target,
+            offset: self.location.superblock_offset(block_size)?,
+            buffer: dirty_superblock,
+        })?;
+        if tail_publication == JournalTailPublication::RelocateRecoveryTail {
+            // The full prefix is durable at home. Publish the fast-commit TID in the tail
+            // before any ring write can remove the old path to that TID.
+            precommit.try_push(StorageRequest::Flush {
+                target: journal_target,
+            })?;
+        }
         let mut cursor = prepared.descriptor;
         for block in prepared.log_blocks {
-            precommit_writes.try_push(PlannedStorageWrite::new(
-                journal_target,
-                self.offset_of(cursor, block_size)?,
-                block,
-            ))?;
+            precommit.try_push(StorageRequest::Write {
+                target: journal_target,
+                offset: self.offset_of(cursor, block_size)?,
+                buffer: block,
+            })?;
             cursor = self.next_logical(cursor)?;
         }
         if cursor != prepared.commit {
@@ -1991,7 +2017,7 @@ impl JournalData {
         }
 
         Ok(PreparedJournalCommit {
-            precommit_writes,
+            precommit,
             commit_write,
             journal_target,
             overlay: journal_blocks,
@@ -3789,7 +3815,6 @@ mod tests {
                         full.checkpoint.clean_journal.0.cursor.sequence,
                         JournalSequence::new(9)
                     );
-                    assert!(!full.precommit_writes.is_empty());
                 }
             }
             Ok(())
@@ -3844,13 +3869,19 @@ mod tests {
                                 .checked_add(1)
                                 .ok_or(Error::ArithmeticOverflow)?;
                             crate::memory::copy_exact(buffer, &old_delta)?;
-                        } else if let Some(image) = full
-                            .precommit_writes
-                            .iter()
-                            .chain(core::iter::once(&full.commit_write))
-                            .find(|write| write.offset == *offset)
+                        } else if *offset == full.commit_write.offset {
+                            crate::memory::copy_exact(buffer, &full.commit_write.bytes)?;
+                        } else if let Some(bytes) =
+                            full.precommit.iter().find_map(|request| match request {
+                                StorageRequest::Write {
+                                    offset: write_offset,
+                                    buffer,
+                                    ..
+                                } if *write_offset == *offset => Some(buffer),
+                                _ => None,
+                            })
                         {
-                            crate::memory::copy_exact(buffer, &image.bytes)?;
+                            crate::memory::copy_exact(buffer, bytes)?;
                         }
                     }
                     StorageRequest::Write {

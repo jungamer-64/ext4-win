@@ -392,15 +392,8 @@ impl ReservedMutation {
             current_epoch.superblock.block_size(),
             self.resolved.journal_blocks,
         )?;
-        let (planned_journal_writes, planned_commit_write, journal_target, overlay, checkpoint) =
+        let (journal_writes, planned_commit_write, journal_target, overlay, checkpoint) =
             prepared.into_parts();
-        let mut journal_writes = Vec::new();
-        journal_writes
-            .try_reserve_exact(planned_journal_writes.len())
-            .map_err(|_| Error::OutOfMemory)?;
-        for write in planned_journal_writes {
-            journal_writes.try_push(write.into_request())?;
-        }
         let commit_write = planned_commit_write.into_request();
         let (planned_home_writes, planned_clean_write, clean_journal) = checkpoint.into_parts();
         let mut home_writes = Vec::new();

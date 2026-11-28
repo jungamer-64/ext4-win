@@ -1,37 +1,7 @@
 //! Independent delta-log records driven through production mount and storage continuations.
+use super::journal::{JOURNAL_SUPER, be32, put};
 use super::*;
 
-/// The independently generated fixture has a 4 KiB external journal superblock at block one.
-const JOURNAL_SUPER: usize = 4096;
-
-/// Writes explicit vector bytes without using a production encoder.
-/// # Errors
-/// Returns an overflowing or truncated fixture field.
-fn put(bytes: &mut [u8], offset: usize, value: &[u8]) -> Result<()> {
-    let end = offset.checked_add(value.len()).ok_or(Error::DeviceRange)?;
-    for (to, from) in bytes
-        .get_mut(offset..end)
-        .ok_or(Error::DeviceRange)?
-        .iter_mut()
-        .zip(value)
-    {
-        *to = *from;
-    }
-    Ok(())
-}
-/// Reads a big-endian journal field independently of the production parser.
-/// # Errors
-/// Returns a malformed fixture coordinate or scalar.
-fn be32(bytes: &[u8], offset: usize) -> Result<u32> {
-    let end = offset.checked_add(4).ok_or(Error::DeviceRange)?;
-    Ok(u32::from_be_bytes(
-        bytes
-            .get(offset..end)
-            .ok_or(Error::DeviceRange)?
-            .try_into()
-            .map_err(|_| Error::DeviceRange)?,
-    ))
-}
 /// Encodes one complete TLV with its independently chosen wire opcode and field lengths.
 /// # Errors
 /// Returns field-width overflow or a record crossing this vector's block.
@@ -54,7 +24,7 @@ fn record(block: &mut [u8], at: &mut usize, tag: u16, value: &[u8]) -> Result<()
 /// The inode root in INODE is deliberately unrelated; ADD owns the replacement mapping.
 /// # Errors
 /// Returns fixture geometry, checksum, TLV or data-range construction failure.
-fn inject_range(fixture: &mut Fixture, physical: u32) -> Result<u32> {
+pub(super) fn inject_range(fixture: &mut Fixture, physical: u32) -> Result<u32> {
     let inode = NodeId::File(fixture.a).inode().as_u32();
     let offset = fixture_inode_offset(&fixture.disk, NodeId::File(fixture.a))?;
     let end = offset.checked_add(256).ok_or(Error::DeviceRange)?;
@@ -169,7 +139,7 @@ fn install_delta(fixture: &mut Fixture, records: &[(u16, &[u8])]) -> Result<()> 
 /// Reads the independently encoded group-zero block bitmap.
 /// # Errors
 /// Returns malformed bitmap geometry or a truncated byte.
-fn allocated(disk: &Disk, block: u32) -> Result<bool> {
+pub(super) fn allocated(disk: &Disk, block: u32) -> Result<bool> {
     let bitmap = usize::try_from(fixture_u32(&disk.filesystem, 4096)?)
         .map_err(|_| Error::DeviceRange)?
         .checked_mul(4096)

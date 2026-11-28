@@ -607,9 +607,9 @@ impl<Next> StorageRequestSequence<Next> {
         flush_before: &[crate::StorageTarget],
         next: impl FnOnce(PreparedCleanJournal) -> Next,
     ) -> Result<Self> {
-        let (writes, commit, target, _overlay, checkpoint) = prepared.into_parts();
+        let (precommit, commit, target, _overlay, checkpoint) = prepared.into_parts();
         let (homes, clean, journal) = checkpoint.into_parts();
-        let capacity = writes
+        let capacity = precommit
             .len()
             .checked_add(homes.len())
             .and_then(|count| count.checked_add(6))
@@ -622,8 +622,8 @@ impl<Next> StorageRequestSequence<Next> {
         for target in flush_before {
             requests.try_push(crate::StorageRequest::Flush { target: *target })?;
         }
-        for write in writes {
-            requests.try_push(write.into_request())?;
+        for request in precommit {
+            requests.try_push(request)?;
         }
         requests.try_push(crate::StorageRequest::Flush { target })?;
         requests.try_push(commit.into_request())?;
