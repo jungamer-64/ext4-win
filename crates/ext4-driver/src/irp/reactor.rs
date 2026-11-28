@@ -2532,19 +2532,6 @@ impl CompletionReactor {
         transition(payloads)
     }
 
-    /// Installs one shell payload only while its slot has no other carrier.
-    fn install_payload(&self, index: usize, payload: SlotPayload) {
-        self.with_payloads(|payloads| {
-            let Some(slot) = payloads.get_mut(index) else {
-                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-            };
-            if !matches!(slot.payload, SlotPayload::Empty) {
-                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-            }
-            slot.payload = payload;
-        });
-    }
-
     /// Detaches one shell operation payload for sole-actor transition logic.
     #[cfg(not(test))]
     fn take_operation_payload(&self, index: usize) -> SuspendedOperation {
