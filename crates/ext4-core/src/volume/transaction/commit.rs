@@ -304,7 +304,7 @@ impl MetadataMutation<'_, '_> {
             key_version,
             node_metadata_updates,
             data_writes,
-            image: self.commit_image(journal_blocks)?,
+            journal_blocks,
             cluster_deltas: core::mem::take(&mut self.cluster_deltas),
             free_clusters_delta: self.free_clusters_delta,
             free_inodes_delta: self.free_inodes_delta,
@@ -388,8 +388,10 @@ impl ReservedMutation {
             })?;
         }
 
-        let prepared =
-            journal.prepare_commit(current_epoch.superblock.block_size(), self.resolved.image)?;
+        let prepared = journal.prepare_commit(
+            current_epoch.superblock.block_size(),
+            self.resolved.journal_blocks,
+        )?;
         let (planned_journal_writes, planned_commit_write, journal_target, overlay, checkpoint) =
             prepared.into_parts();
         let mut journal_writes = Vec::new();

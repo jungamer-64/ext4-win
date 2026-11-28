@@ -110,13 +110,25 @@ fn install_delta(fixture: &mut Fixture, records: &[(u16, &[u8])]) -> Result<()> 
     }
     // A clean journal persists the last committed sequence; its running transaction is the successor.
     let tid = be32(raw_sb, 0x18)?.wrapping_add(1);
+    let full_start = be32(raw_sb, 0x14)?;
     let end = be32(raw_sb, 0x10)?;
     let flags = be32(raw_sb, 0x28)? | 0x20;
+    put(raw_sb, 0x18, &tid.to_be_bytes())?;
+    put(raw_sb, 0x1c, &full_start.to_be_bytes())?;
     put(raw_sb, 0x28, &flags.to_be_bytes())?;
     put(raw_sb, 0x54, &16_u32.to_be_bytes())?;
     put(raw_sb, 0xfc, &[0; 4])?;
     let crc = fixture_crc32c(u32::MAX, raw_sb.get(..1024).ok_or(Error::DeviceRange)?);
     put(raw_sb, 0xfc, &crc.to_be_bytes())?;
+    let frontier = usize::try_from(full_start)
+        .map_err(|_| Error::DeviceRange)?
+        .checked_mul(4096)
+        .ok_or(Error::DeviceRange)?;
+    journal
+        .get_mut(frontier..)
+        .and_then(|bytes| bytes.get_mut(..4096))
+        .ok_or(Error::DeviceRange)?
+        .fill(0);
     let first = usize::try_from(end.checked_sub(15).ok_or(Error::DeviceRange)?)
         .map_err(|_| Error::DeviceRange)?
         .checked_mul(4096)
@@ -229,6 +241,17 @@ fn standard_ro_replays_mapping_and_noload_preserves_home_view() -> Result<()> {
         ext4_core::ReadOnlyRecovery::NoLoad,
     ] {
         let mut fixture = Fixture::new()?;
+        let features = fixture_u32(&fixture.disk.filesystem, 1116)? | 0x0400;
+        put(&mut fixture.disk.filesystem, 1116, &features.to_le_bytes())?;
+        let checksum = fixture_crc32c(
+            u32::MAX,
+            fixture
+                .disk
+                .filesystem
+                .get(1024..2044)
+                .ok_or(Error::DeviceRange)?,
+        );
+        put(&mut fixture.disk.filesystem, 2044, &checksum.to_le_bytes())?;
         put(&mut fixture.disk.filesystem, 1000 * 4096, b"replayed")?;
         inject_range(&mut fixture, 1000)?;
         let physical = fixture.disk.filesystem.clone();
@@ -1533,8 +1556,10 @@ fn inline_records_restore_full_payload_and_preserve_attribute_bindings() -> Resu
         )?;
         let free_inodes = fixture_u32(&fixture.disk.filesystem, 1040)?;
         let free_blocks = fixture_u32(&fixture.disk.filesystem, 1036)?;
-        for _ in 0..2 {
-            install_delta(&mut fixture, &[(6, &image)])?;
+        for attempt in 0..2 {
+            if attempt == 0 || access == MountAccess::ReadWrite {
+                install_delta(&mut fixture, &[(6, &image)])?;
+            }
             let original_fs = fixture.disk.filesystem.clone();
             let original_journal = fixture.disk.journal.clone();
             fixture.disk.storage_effects = 0;

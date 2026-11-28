@@ -185,10 +185,7 @@ pub(in crate::volume) fn prepare_orphan_batch(
         return Err(Error::TransactionTooLarge);
     }
     let sequence = if let Some(journal) = journal {
-        let prepared = journal.prepare_commit(
-            block_size,
-            crate::disk_format::journal::JournalCommitImage::full(metadata),
-        )?;
+        let prepared = journal.prepare_commit(block_size, metadata)?;
         StorageRequestSequence::checkpoint(prepared, &[], |journal| OrphanBatchCompletion {
             journal: Some(journal),
             clusters,

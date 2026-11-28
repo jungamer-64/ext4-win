@@ -26,10 +26,7 @@ pub(super) fn prepare_session_checkpoint(
     flush_before: &[StorageTarget],
 ) -> Result<StorageRequestSequence<PreparedCleanJournal>> {
     let blocks = prepare_primary_images(device, raw, block_size)?;
-    let prepared = journal.prepare_commit(
-        block_size,
-        crate::disk_format::journal::JournalCommitImage::full(blocks),
-    )?;
+    let prepared = journal.prepare_commit(block_size, blocks)?;
     StorageRequestSequence::checkpoint(prepared, flush_before, |journal| journal)
 }
 

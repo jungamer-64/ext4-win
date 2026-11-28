@@ -140,88 +140,6 @@ impl JournalBlock {
     }
 }
 
-/// Immutable commit images own both full-block publication and their lossless delta projection.
-/// The optional inode region points into this same vector; no independently mutable copy exists.
-#[derive(Debug)]
-pub(crate) struct JournalCommitImage {
-    /// Authoritative metadata and journaled-data postimages.
-    blocks: Vec<JournalBlock>,
-    /// A single-inode metadata change can use the reserved delta area.
-    inode: Option<JournalInodeRegion>,
-}
-/// Region in the commit's unique block, established together with its immutable backing bytes.
-#[derive(Debug)]
-struct JournalInodeRegion {
-    /// Filesystem inode identity.
-    id: crate::disk_format::inode::InodeId,
-    /// Byte position within the sole filesystem block.
-    first: usize,
-    /// First byte beyond the complete inode metadata prefix.
-    end: usize,
-}
-impl JournalCommitImage {
-    /// Full commits retain arbitrary admitted block postimages without a delta interpretation.
-    pub(crate) const fn full(blocks: Vec<JournalBlock>) -> Self {
-        Self {
-            blocks,
-            inode: None,
-        }
-    }
-    /// Captures a lossless inode projection after the filesystem has checked its unchanged bytes.
-    /// # Errors
-    /// Rejects a foreign block, multiple blocks or a byte region outside its owning image.
-    pub(crate) fn inode(
-        blocks: Vec<JournalBlock>,
-        size: BlockSize,
-        id: crate::disk_format::inode::InodeId,
-        offset: ByteOffset,
-        length: usize,
-    ) -> Result<Self> {
-        let unit = u64::from(size.bytes());
-        let address = BlockAddress::new(
-            offset
-                .get()
-                .checked_div(unit)
-                .ok_or(Error::InvalidWriteRange)?,
-        );
-        let first = usize::try_from(
-            offset
-                .get()
-                .checked_rem(unit)
-                .ok_or(Error::InvalidWriteRange)?,
-        )
-        .map_err(|_| Error::ArithmeticOverflow)?;
-        let end = first.checked_add(length).ok_or(Error::ArithmeticOverflow)?;
-        let block = blocks.first().ok_or(Error::InvalidWriteRange)?;
-        if blocks.len() != 1 || block.block() != address || block.bytes().get(first..end).is_none()
-        {
-            return Err(Error::InvalidWriteRange);
-        }
-        Ok(Self {
-            blocks,
-            inode: Some(JournalInodeRegion { id, first, end }),
-        })
-    }
-    /// Borrows the projection while its authoritative image remains immutable and owned here.
-    /// # Errors
-    /// Rejects an inconsistent internal region before producing any write request.
-    fn delta(&self) -> Result<Option<fast_commit::DeltaRecord<'_>>> {
-        self.inode
-            .as_ref()
-            .map(|region| {
-                Ok(fast_commit::DeltaRecord::Inode {
-                    inode: region.id,
-                    encoded: self
-                        .blocks
-                        .first()
-                        .and_then(|block| block.bytes().get(region.first..region.end))
-                        .ok_or(Error::JournalCorrupt)?,
-                })
-            })
-            .transpose()
-    }
-}
-
 /// One fully allocated storage write in a journal or checkpoint phase.
 #[derive(Debug)]
 pub(crate) struct PlannedStorageWrite {
@@ -1294,7 +1212,7 @@ impl JournalRecoveryOperation {
                 let CompletedStorageTransfer::Flush { .. } = transfer else {
                     return Err(Error::DeviceIo);
                 };
-                self.phase = RecoveryPhase::WriteCleanJournal;
+                self.phase = self.after_home_checkpoint();
             }
             RecoveryIoAction::CleanJournalWrite => {
                 let CompletedStorageTransfer::Write { .. } = transfer else {
@@ -1366,11 +1284,20 @@ impl JournalRecoveryOperation {
                     self.phase = if self.wrote_home {
                         RecoveryPhase::FlushFilesystem
                     } else {
-                        RecoveryPhase::WriteCleanJournal
+                        self.after_home_checkpoint()
                     };
                 }
                 _ => return Ok(()),
             }
+        }
+    }
+
+    /// Keep the on-disk log discoverable while its fast commits still own recovery.
+    fn after_home_checkpoint(&self) -> RecoveryPhase {
+        if self.deltas.is_some() {
+            RecoveryPhase::Complete
+        } else {
+            RecoveryPhase::WriteCleanJournal
         }
     }
 
@@ -1536,11 +1463,7 @@ impl JournalRecoveryOperation {
                 return Ok(());
             }
         }
-        self.phase = if self.journal.data.superblock.start() == 0 {
-            RecoveryPhase::Complete
-        } else {
-            RecoveryPhase::Validate
-        };
+        self.phase = RecoveryPhase::Validate;
         self.reset_walk();
         Ok(())
     }
@@ -1554,11 +1477,7 @@ impl JournalRecoveryOperation {
             return Err(Error::JournalCorrupt);
         }
         self.deltas = Some(program);
-        self.phase = if self.journal.data.superblock.start() == 0 {
-            RecoveryPhase::Complete
-        } else {
-            RecoveryPhase::Validate
-        };
+        self.phase = RecoveryPhase::Validate;
         self.reset_walk();
         Ok(())
     }
@@ -1683,14 +1602,14 @@ impl JournalRecoveryOperation {
             head: self.summary.end_cursor,
         };
         let (clean_write, clean_journal) = self.journal.data.prepare_clean(cursor)?;
-        self.clean_write = Some(clean_write);
+        self.clean_write = self.deltas.is_none().then_some(clean_write);
         self.clean_journal = Some(clean_journal);
         self.tags.clear();
         self.reset_walk();
         self.phase = if self.policy == RecoveryPolicy::Replay && self.summary.transactions != 0 {
             RecoveryPhase::Replay
         } else {
-            RecoveryPhase::WriteCleanJournal
+            self.after_home_checkpoint()
         };
         Ok(())
     }
@@ -1792,117 +1711,17 @@ impl Journal<CleanJournal> {
         })
     }
 
-    /// Delta durability and full-image checkpoint use the same coordinator and epoch boundaries.
-    /// The clean superblock advances past the delta TID only after home blocks have been flushed.
+    /// Prepares one full JBD2 transaction from its complete block postimages.
     /// # Errors
-    /// Returns invalid geometry, payload, checksum serialization or pre-effect allocation failure.
-    fn prepare_fast_commit(
-        &self,
-        block_size: BlockSize,
-        journal_blocks: Vec<JournalBlock>,
-        area: FastCommitArea,
-        encoded: Vec<Vec<u8>>,
-    ) -> Result<PreparedJournalCommit> {
-        if encoded.is_empty() {
-            return Err(Error::JournalCorrupt);
-        }
-        for block in &journal_blocks {
-            self.data.validate_replay_target(block.block())?;
-            if block.bytes().len()
-                != usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?
-            {
-                return Err(Error::InvalidWriteRange);
-            }
-        }
-        let journal_target = self.data.location.storage_target();
-        let final_index = encoded.len().checked_sub(1).ok_or(Error::JournalCorrupt)?;
-        let mut precommit_writes = Vec::new();
-        precommit_writes
-            .try_reserve_exact(final_index)
-            .map_err(|_| Error::OutOfMemory)?;
-        let mut commit_write = None;
-        for (index, bytes) in encoded.into_iter().enumerate() {
-            let logical =
-                area.block_at(u32::try_from(index).map_err(|_| Error::ArithmeticOverflow)?)?;
-            let write = PlannedStorageWrite::new(
-                journal_target,
-                self.data.offset_of(logical, block_size)?,
-                bytes,
-            );
-            if index == final_index {
-                commit_write = Some(write);
-            } else {
-                precommit_writes.try_push(write)?;
-            }
-        }
-        let cursor = JournalCursor {
-            sequence: self.data.cursor.sequence.next(),
-            head: self.data.cursor.head,
-        };
-        let (clean_bytes, clean_journal) = self.data.prepare_clean(cursor)?;
-        let clean_write = PlannedStorageWrite::new(
-            journal_target,
-            self.data.location.superblock_offset(block_size)?,
-            clean_bytes,
-        );
-        let mut home_writes = Vec::new();
-        home_writes
-            .try_reserve_exact(journal_blocks.len())
-            .map_err(|_| Error::OutOfMemory)?;
-        for block in &journal_blocks {
-            home_writes.try_push(PlannedStorageWrite::new(
-                StorageTarget::Filesystem,
-                block_size.offset_of(block.block())?,
-                memory::copied_slice(block.bytes())?,
-            ))?;
-        }
-        Ok(PreparedJournalCommit {
-            precommit_writes,
-            commit_write: commit_write.ok_or(Error::JournalCorrupt)?,
-            journal_target,
-            overlay: journal_blocks,
-            checkpoint: PreparedJournalCheckpoint {
-                home_writes,
-                clean_write,
-                clean_journal,
-            },
-        })
-    }
-
-    /// Chooses a complete bounded wire encoding only while no earlier commit awaits checkpoint.
-    /// # Errors
-    /// Returns inconsistent journal state, invalid postimages or pre-effect allocation failure.
+    /// Rejects a foreign block width or inconsistent journal state before any write.
     pub(crate) fn prepare_commit(
         &self,
         block_size: BlockSize,
-        image: JournalCommitImage,
+        blocks: Vec<JournalBlock>,
     ) -> Result<PreparedJournalCommit> {
-        if block_size != self.data.geometry.block_size {
-            return Err(Error::InvalidWriteRange);
-        }
-        if self.data.superblock.start() != 0 {
-            return Err(Error::JournalCorrupt);
-        }
-        if let (Some(area), Some(record)) = (self.data.geometry.fast_commits()?, image.delta()?) {
-            let capacity = area
-                .end
-                .checked_sub(area.first)
-                .ok_or(Error::JournalCorrupt)?;
-            match fast_commit::encode(
-                block_size,
-                self.data.cursor.sequence,
-                capacity,
-                [Ok(record)],
-            ) {
-                Ok(encoded) => {
-                    return self.prepare_fast_commit(block_size, image.blocks, area, encoded);
-                }
-                Err(Error::TransactionTooLarge | Error::OutOfMemory) => {}
-                Err(error) => return Err(error),
-            }
-        }
-        self.data.prepare_full_commit(block_size, image.blocks)
+        self.data.prepare_full_commit(block_size, blocks)
     }
+
     /// Admits a bounded metadata operation before any of its persistent effects begin.
     /// # Errors
     /// Returns an unsupported-journal error if the complete reserved payload cannot fit the ring.
@@ -2093,6 +1912,9 @@ impl JournalData {
         block_size: BlockSize,
         journal_blocks: Vec<JournalBlock>,
     ) -> Result<PreparedJournalCommit> {
+        if block_size != self.geometry.block_size {
+            return Err(Error::InvalidWriteRange);
+        }
         if self.superblock.start() != 0 {
             return Err(Error::JournalCorrupt);
         }
@@ -3864,33 +3686,42 @@ mod tests {
         0x0F,
     ];
 
+    /// HEAD, inode 12 with a 128-byte record, and a tail for TID 8.
+    /// The CRC is a known answer over the first 156 bytes.
+    fn inode_delta_block() -> [u8; 4096] {
+        let mut block = [0; 4096];
+        for (target, value) in block.iter_mut().zip([
+            9, 0, 8, 0, 0, 0, 0, 0, 8, 0, 0, 0, 6, 0, 132, 0, 12, 0, 0, 0,
+        ]) {
+            *target = value;
+        }
+        for (target, value) in block.iter_mut().skip(148).zip([8, 0, 104, 15, 8, 0, 0, 0]) {
+            *target = value;
+        }
+        for (target, value) in block.iter_mut().skip(156).zip(0xdbfe1c9e_u32.to_le_bytes()) {
+            *target = value;
+        }
+        block
+    }
+
     /// # Panics
     /// Fails if an authenticated program is published as clean or a changed reread causes effects.
     #[test]
     fn semantic_recovery_obligation_survives_the_consuming_read_handoff() {
         let result = (|| -> Result<()> {
-            use super::{JournalRecoveryCompletion, fast_commit};
-            use crate::disk_format::inode::InodeId;
+            use super::JournalRecoveryCompletion;
             use crate::{CompletedStorageTransfer, StorageCompletion, StorageRequest};
             let journal = test_external_journal::<LoadedJournal>(
                 2,
                 JBD2_FEATURE_INCOMPAT_FAST_COMMIT,
                 512,
-                7,
-                0,
+                8,
+                2,
                 2,
                 1000,
             )?;
             let size = journal.data.geometry.block_size;
-            let data = fast_commit::encode(
-                size,
-                JournalSequence::new(8),
-                1,
-                [Ok(fast_commit::DeltaRecord::Inode {
-                    inode: InodeId::try_from(12)?,
-                    encoded: &[0; 128],
-                })],
-            )?;
+            let data = inode_delta_block();
             for change_reread in [false, true] {
                 let mut operation = JournalRecoveryOperation::new(
                     Journal {
@@ -3912,10 +3743,7 @@ mod tests {
                         delta_reads = delta_reads
                             .checked_add(1)
                             .ok_or(Error::ArithmeticOverflow)?;
-                        crate::memory::copy_exact(
-                            buffer,
-                            data.first().ok_or(Error::JournalCorrupt)?,
-                        )?;
+                        crate::memory::copy_exact(buffer, &data)?;
                         if change_reread && delta_reads == 2 {
                             *buffer.get_mut(24).ok_or(Error::JournalCorrupt)? ^= 1;
                         }
@@ -3959,8 +3787,7 @@ mod tests {
     #[test]
     fn committed_full_transaction_invalidates_the_earlier_delta_tid() {
         let result = (|| -> Result<()> {
-            use super::{CleanJournal, JournalCommitImage, JournalRecoveryCompletion, fast_commit};
-            use crate::disk_format::inode::InodeId;
+            use super::{CleanJournal, JournalRecoveryCompletion};
             use crate::{
                 CompletedStorageTransfer, StorageCompletion, StorageRequest, StorageTarget,
             };
@@ -3974,21 +3801,10 @@ mod tests {
                 1000,
             )?;
             let size = journal.data.geometry.block_size;
-            let old_delta = fast_commit::encode(
-                size,
-                JournalSequence::new(8),
-                1,
-                [Ok(fast_commit::DeltaRecord::Inode {
-                    inode: InodeId::try_from(12)?,
-                    encoded: &[0; 128],
-                })],
-            )?;
+            let old_delta = inode_delta_block();
             let full = journal.prepare_commit(
                 size,
-                JournalCommitImage::full(vec![JournalBlock::new(
-                    BlockAddress::new(10),
-                    vec![0x44; 4096],
-                )]),
+                vec![JournalBlock::new(BlockAddress::new(10), vec![0x44; 4096])],
             )?;
             let mut operation = JournalRecoveryOperation::new(
                 test_external_journal::<LoadedJournal>(
@@ -4012,10 +3828,7 @@ mod tests {
                             delta_reads = delta_reads
                                 .checked_add(1)
                                 .ok_or(Error::ArithmeticOverflow)?;
-                            crate::memory::copy_exact(
-                                buffer,
-                                old_delta.first().ok_or(Error::JournalCorrupt)?,
-                            )?;
+                            crate::memory::copy_exact(buffer, &old_delta)?;
                         } else if let Some(image) = full
                             .precommit_writes
                             .iter()
@@ -4048,78 +3861,6 @@ mod tests {
                 operation.into_recovered()?,
                 JournalRecoveryCompletion::Clean(_)
             ));
-            Ok(())
-        })();
-        assert_eq!(result, Ok(()));
-    }
-
-    /// # Panics
-    /// Fails if delta commits advance the full ring, lose their home postimage, or lack full fallback.
-    #[test]
-    fn delta_commit_and_full_fallback_share_checkpoint_durability() {
-        let result = (|| -> Result<()> {
-            use super::{CleanJournal, JournalCommitImage};
-            use crate::disk::block::ByteOffset;
-            use crate::disk_format::inode::InodeId;
-            let journal = test_external_journal::<CleanJournal>(
-                2,
-                JBD2_FEATURE_INCOMPAT_FAST_COMMIT,
-                512,
-                7,
-                0,
-                2,
-                1000,
-            )?;
-            let size = journal.data.geometry.block_size;
-            let blocks = vec![JournalBlock::new(BlockAddress::new(10), vec![0x44; 4096])];
-            let image = JournalCommitImage::inode(
-                blocks,
-                size,
-                InodeId::try_from(12)?,
-                ByteOffset::new(10 * 4096 + 128),
-                128,
-            )?;
-            let prepared = journal.prepare_commit(size, image)?;
-            assert!(prepared.precommit_writes.is_empty());
-            assert_eq!(prepared.commit_write.offset, ByteOffset::new(257 * 4096));
-            assert_eq!(
-                prepared.commit_write.bytes.get(..4),
-                Some([9, 0, 8, 0].as_slice())
-            );
-            assert_eq!(
-                prepared.checkpoint.clean_journal.0.cursor.head,
-                journal.data.cursor.head
-            );
-            assert_eq!(
-                prepared.checkpoint.clean_journal.0.cursor.sequence,
-                JournalSequence::new(9)
-            );
-            assert_eq!(prepared.overlay.len(), 1);
-            assert_eq!(prepared.checkpoint.home_writes.len(), 1);
-            assert_eq!(
-                prepared
-                    .checkpoint
-                    .home_writes
-                    .first()
-                    .map(|write| write.offset),
-                Some(ByteOffset::new(10 * 4096))
-            );
-            assert_eq!(prepared.checkpoint.clean_journal.0.superblock.start(), 0);
-            assert_eq!(
-                prepared.checkpoint.clean_journal.0.superblock.sequence,
-                JournalSequence::new(8)
-            );
-            let full = JournalCommitImage::full(vec![JournalBlock::new(
-                BlockAddress::new(10),
-                vec![0x44; 4096],
-            )]);
-            let prepared = journal.prepare_commit(size, full)?;
-            assert!(!prepared.precommit_writes.is_empty());
-            assert!(prepared.commit_write.offset.get() < 256 * 4096);
-            assert_eq!(
-                prepared.checkpoint.clean_journal.0.superblock.sequence,
-                JournalSequence::new(8)
-            );
             Ok(())
         })();
         assert_eq!(result, Ok(()));

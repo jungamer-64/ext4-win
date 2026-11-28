@@ -12,10 +12,8 @@ use crate::disk_format::{
 };
 use crate::memory;
 
-mod encode;
 use crate::{Error, Result};
 use alloc::vec::Vec;
-pub(super) use encode::{DeltaRecord, encode};
 
 /// Context-free wire interpretation, independent of inode allocation and mutation permission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,20 +38,6 @@ enum Tag {
     Head,
 }
 impl Tag {
-    /// Projects the wire opcode at the single serialization boundary.
-    const fn code(self) -> u16 {
-        match self {
-            Self::AddRange => 1,
-            Self::RemoveRange => 2,
-            Self::Create => 3,
-            Self::Link => 4,
-            Self::Unlink => 5,
-            Self::Inode => 6,
-            Self::Padding => 7,
-            Self::Tail => 8,
-            Self::Head => 9,
-        }
-    }
     /// The fixed opcode and value-length contract is shared by authentication and decoding.
     /// # Errors
     /// Rejects unknown opcodes and structurally invalid values before any payload interpretation.
@@ -602,16 +586,6 @@ mod tests {
             assert_eq!(range.first.as_u32(), u32::MAX);
             assert_eq!(range.end, 1_u64 << 32);
             assert_eq!(encoded.len(), 128);
-            let generated = encode(
-                size,
-                tid,
-                1,
-                program
-                    .records()
-                    .iter()
-                    .map(|record| Ok(DeltaRecord::from(record))),
-            )?;
-            assert_eq!(generated.first().map(Vec::as_slice), Some(block.as_slice()));
             assert!(matches!(
                 LogicalRange::new(u32::MAX, 2),
                 Err(Error::JournalCorrupt)
@@ -622,32 +596,32 @@ mod tests {
     }
 
     /// # Panics
-    /// Fails if physical-area exhaustion leaks a partial batch or PAD bytes escape authentication.
+    /// Fails if the decoder skips authenticated padding between journal blocks.
     #[test]
-    fn multi_block_padding_has_an_independent_crc_and_finite_capacity() {
+    fn multi_block_padding_has_an_independent_crc() {
         let result = (|| -> Result<()> {
             let size = BlockSize::from_superblock_log(0)?;
             let tid = JournalSequence::new(0x1234_5678);
-            let inode = InodeId::try_from(12)?;
-            let bytes = [0; 128];
-            let input = [Ok(DeltaRecord::Inode {
-                inode,
-                encoded: &bytes,
-            }); 8];
-            assert!(matches!(
-                encode(size, tid, 1, input),
-                Err(Error::TransactionTooLarge)
-            ));
-            let blocks = encode(size, tid, 2, input)?;
-            assert_eq!(blocks.len(), 2);
-            assert_eq!(
-                blocks.first().and_then(|block| block.get(964..968)),
-                Some([7, 0, 56, 0].as_slice())
-            );
-            assert_eq!(
-                blocks.get(1).and_then(|block| block.get(144..148)),
-                Some(0x76755acf_u32.to_le_bytes().as_slice())
-            );
+            let mut first = [0_u8; 1024];
+            let mut second = [0_u8; 1024];
+            let head = [9, 0, 8, 0, 0, 0, 0, 0, 0x78, 0x56, 0x34, 0x12];
+            let inode = [6, 0, 132, 0, 12, 0, 0, 0];
+            memory::copy_exact(first.get_mut(..12).ok_or(Error::JournalCorrupt)?, &head)?;
+            for offset in [12, 148, 284, 420, 556, 692, 828] {
+                let span = first.get_mut(offset..).and_then(|bytes| bytes.get_mut(..8));
+                memory::copy_exact(span.ok_or(Error::JournalCorrupt)?, &inode)?;
+            }
+            memory::copy_exact(
+                first.get_mut(964..968).ok_or(Error::JournalCorrupt)?,
+                &[7, 0, 56, 0],
+            )?;
+            memory::copy_exact(second.get_mut(..8).ok_or(Error::JournalCorrupt)?, &inode)?;
+            memory::copy_exact(
+                second.get_mut(136..148).ok_or(Error::JournalCorrupt)?,
+                &[
+                    8, 0, 0x74, 0x03, 0x78, 0x56, 0x34, 0x12, 0xcf, 0x5a, 0x75, 0x76,
+                ],
+            )?;
             let mut decoder = ProgramDecoder::new(
                 tid,
                 size,
@@ -656,8 +630,8 @@ mod tests {
                     records: 8,
                 },
             )?;
-            assert!(!decoder.accept(blocks.first().ok_or(Error::JournalCorrupt)?)?);
-            assert!(decoder.accept(blocks.get(1).ok_or(Error::JournalCorrupt)?)?);
+            assert!(!decoder.accept(&first)?);
+            assert!(decoder.accept(&second)?);
             assert_eq!(decoder.finish()?.records().len(), 8);
             Ok(())
         })();
@@ -665,28 +639,12 @@ mod tests {
     }
 
     /// # Panics
-    /// Fails if the encoder disagrees with independent bytes or a changed reread is accepted.
+    /// Fails if the independent wire vector is misread or a changed reread is accepted.
     #[test]
-    fn generated_batch_matches_independent_vector_and_reauthenticates_reread() {
+    fn independent_batch_reauthenticates_reread() {
         let result = (|| -> Result<()> {
             let size = BlockSize::from_superblock_log(2)?;
             let tid = JournalSequence::new(0x1234_5678);
-            let encoded = encode(
-                size,
-                tid,
-                1,
-                [Ok(DeltaRecord::Namespace {
-                    change: NamespaceChange::Link,
-                    parent: InodeId::try_from(2)?,
-                    inode: InodeId::try_from(12)?,
-                    name: b"x",
-                })],
-            )?;
-            assert_eq!(encoded.len(), 1);
-            assert_eq!(
-                encoded.first().map(Vec::as_slice),
-                Some(first_block().as_slice())
-            );
             let prefix = AuthenticatedPrefix {
                 end: 4096,
                 records: 1,
@@ -702,10 +660,6 @@ mod tests {
             assert!(matches!(
                 ProgramDecoder::new(tid, size, prefix)?.accept(&changed),
                 Err(Error::ChecksumMismatch)
-            ));
-            assert!(matches!(
-                encode(size, tid, 0, core::iter::empty()),
-                Err(Error::TransactionTooLarge)
             ));
             Ok(())
         })();

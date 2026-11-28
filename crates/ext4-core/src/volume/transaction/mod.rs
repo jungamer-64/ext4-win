@@ -396,7 +396,7 @@ pub struct ResolvedMutation {
     /// Ordered data images that must be durable before journal metadata is written.
     data_writes: Vec<RangeWrite>,
     /// Complete metadata and journaled data images supplied to JBD2 serialization.
-    image: crate::disk_format::journal::JournalCommitImage,
+    journal_blocks: Vec<JournalBlock>,
     /// Cluster-reference changes merged into the latest disjoint committed epoch at commit grant.
     cluster_deltas: Vec<ClusterReferenceDelta>,
     /// Free-cluster counter change merged at commit grant.

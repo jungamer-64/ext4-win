@@ -57,19 +57,6 @@ impl StagedInodes {
         self.records.get(position).map(|slot| &slot.record)
     }
 
-    /// Admits the single-record shape eligible for inode-only delta encoding.
-    pub(super) fn only_live(&self) -> Option<&LiveInodeRecord> {
-        match self.records.as_slice() {
-            [
-                InodeStage {
-                    record: StagedInodeRecord::Live(record),
-                    admission: InodeEditAdmission::Available,
-                },
-            ] => Some(record),
-            _ => None,
-        }
-    }
-
     /// Iterates postimages for serialization once no private edit remains.
     /// # Errors
     /// Rejects finalization with an outstanding inode edit.
