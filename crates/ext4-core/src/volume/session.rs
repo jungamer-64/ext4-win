@@ -48,6 +48,11 @@ impl MountIdentitySequence {
 }
 
 impl MountIdentity {
+    /// Opaque mount serial for tagging deferred raw metadata reads.
+    pub(super) const fn serial(self) -> usize {
+        self.0
+    }
+
     /// Reserves a fresh origin before any mount publication write.
     /// # Errors
     /// Returns [`Error::MountIdentityExhausted`] without publishing a mount.

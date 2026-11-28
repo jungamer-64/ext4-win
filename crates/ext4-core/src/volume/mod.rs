@@ -19,10 +19,10 @@ mod metadata_cache;
 mod metadata_image;
 mod mmp;
 mod mount;
+use crate::disk::block_cache::CacheReadStamp;
 pub use media_verification::{
     MediaVerificationOperation, MediaVerificationOutcome, MediaVerificationTransition,
 };
-pub(crate) use metadata_cache::CacheReadStamp;
 pub use metadata_cache::{MetadataCache, MetadataCacheAccess};
 pub use mmp::{
     MmpChange, MmpCompletion, MmpDeadline, MmpEffect, MmpEvent, MmpFailure, MmpLease, MmpOperation,

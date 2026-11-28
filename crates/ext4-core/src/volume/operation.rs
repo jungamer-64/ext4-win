@@ -444,7 +444,11 @@ impl EpochReadOperation {
             self.metadata_stamp = Some(cache.stamp());
         }
         let result = {
-            let device = OperationDevice::with_overlay(&mut self.filesystem, epoch, Some(cache));
+            let device = OperationDevice::with_overlay(
+                &mut self.filesystem,
+                epoch,
+                Some(cache.into_block_access()),
+            );
             let mut view =
                 EpochReadView::observing(device, epoch, context.versions, &mut self.observed);
             let mut pass = EpochReadPass {
@@ -567,7 +571,11 @@ impl MutationResolveReady {
             return Err(Error::StaleReadContext);
         }
         self.epoch = Some(epoch.sequence());
-        let device = OperationDevice::with_overlay(&mut self.filesystem, epoch, Some(cache));
+        let device = OperationDevice::with_overlay(
+            &mut self.filesystem,
+            epoch,
+            Some(cache.into_block_access()),
+        );
         Ok(MutationResolvePass::begin(
             EpochReadView::committed(device, epoch),
             now,

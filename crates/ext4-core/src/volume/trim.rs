@@ -561,8 +561,11 @@ impl TrimScanOperation {
             return TrimScanTransition::Complete(Err(error));
         }
         let result = {
-            let mut reader =
-                OperationDevice::with_overlay(&mut self.filesystem, epoch, Some(cache));
+            let mut reader = OperationDevice::with_overlay(
+                &mut self.filesystem,
+                epoch,
+                Some(cache.into_block_access()),
+            );
             select(&mut reader, epoch, self.cursor, self.alignment)
         };
         match result {

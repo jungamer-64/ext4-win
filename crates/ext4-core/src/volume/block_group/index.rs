@@ -926,8 +926,12 @@ mod tests {
     ) -> Result<usize> {
         let mut reads = 0_usize;
         loop {
-            match OperationDevice::with_overlay(transcript, epoch, Some(cache.access(epoch)))
-                .read_metadata_exact_at(offset, out)
+            match OperationDevice::with_overlay(
+                transcript,
+                epoch,
+                Some(cache.access(epoch).into_block_access()),
+            )
+            .read_metadata_exact_at(offset, out)
             {
                 Ok(()) => return Ok(reads),
                 Err(Error::OperationSuspended) => {
@@ -1013,8 +1017,12 @@ mod tests {
         );
         let mut delayed = transcript();
         assert_eq!(
-            OperationDevice::with_overlay(&mut delayed, &initial, Some(cache.access(&initial)))
-                .read_metadata_exact_at(ByteOffset::new(5120), &mut out),
+            OperationDevice::with_overlay(
+                &mut delayed,
+                &initial,
+                Some(cache.access(&initial).into_block_access())
+            )
+            .read_metadata_exact_at(ByteOffset::new(5120), &mut out),
             Err(Error::OperationSuspended)
         );
         let mut request = delayed.take_pending_request()?;
@@ -1189,8 +1197,12 @@ mod tests {
         assert_eq!(out, [1; 64]);
         let mut short = transcript();
         assert_eq!(
-            OperationDevice::with_overlay(&mut short, &checkpoint, Some(cache.access(&checkpoint)))
-                .read_metadata_exact_at(ByteOffset::new(6144), &mut out),
+            OperationDevice::with_overlay(
+                &mut short,
+                &checkpoint,
+                Some(cache.access(&checkpoint).into_block_access())
+            )
+            .read_metadata_exact_at(ByteOffset::new(6144), &mut out),
             Err(Error::OperationSuspended)
         );
         let request = short.take_pending_request()?;
@@ -1218,7 +1230,7 @@ mod tests {
             OperationDevice::with_overlay(
                 &mut cancelled,
                 &checkpoint,
-                Some(cache.access(&checkpoint))
+                Some(cache.access(&checkpoint).into_block_access())
             )
             .read_metadata_exact_at(ByteOffset::new(7168), &mut out),
             Err(Error::OperationSuspended)
@@ -1247,7 +1259,7 @@ mod tests {
             OperationDevice::with_overlay(
                 &mut payload,
                 &checkpoint,
-                Some(cache.access(&checkpoint))
+                Some(cache.access(&checkpoint).into_block_access())
             )
             .read_exact_at(ByteOffset::new(8192), &mut out),
             Err(Error::OperationSuspended)
@@ -1261,8 +1273,12 @@ mod tests {
             CompletedStorageTransfer::from_request(request),
             count,
         ))?;
-        OperationDevice::with_overlay(&mut payload, &checkpoint, Some(cache.access(&checkpoint)))
-            .read_exact_at(ByteOffset::new(8192), &mut out)?;
+        OperationDevice::with_overlay(
+            &mut payload,
+            &checkpoint,
+            Some(cache.access(&checkpoint).into_block_access()),
+        )
+        .read_exact_at(ByteOffset::new(8192), &mut out)?;
         assert_eq!(
             cached_metadata_read(
                 &mut transcript(),
@@ -2003,7 +2019,7 @@ mod tests {
                     OperationDevice::with_overlay(
                         &mut transcript,
                         epoch,
-                        Some(cache.access(epoch)),
+                        Some(cache.access(epoch).into_block_access()),
                     ),
                     epoch,
                 ));

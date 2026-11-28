@@ -3,6 +3,7 @@
 use alloc::vec::Vec;
 
 use super::block::{ByteOffset, DeviceLength};
+use super::block_cache::{BlockCacheAccess, CacheReadStamp};
 use crate::memory::{self, FallibleVec};
 use crate::{Error, Result};
 
@@ -333,18 +334,30 @@ struct CompletedRead {
     /// Returned bytes.
     bytes: Vec<u8>,
     /// Metadata registration provenance preserved from request creation.
-    stamp: Option<crate::volume::CacheReadStamp>,
+    stamp: Option<CacheReadStamp>,
 }
 
-/// Metadata retained while one read request is owned by a lower-I/O envelope.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct InFlightRead {
-    /// Starting device byte offset.
-    offset: ByteOffset,
-    /// Exact requested byte count.
-    byte_count: usize,
-    /// Metadata registration provenance; payload reads carry none.
-    stamp: Option<crate::volume::CacheReadStamp>,
+/// An exact read is either private to the resolving pass or owned by lower I/O.
+#[derive(Debug)]
+enum TranscriptRead {
+    /// No outstanding read.
+    Idle,
+    /// Read allocated by the current pass and awaiting ownership transfer.
+    Prepared {
+        /// Device offset selected by the caller.
+        offset: ByteOffset,
+        /// Owned buffer moved to the lower transfer.
+        buffer: Vec<u8>,
+        /// Registration provenance selected when the read was prepared.
+        stamp: Option<CacheReadStamp>,
+    },
+    /// The only lower request whose completion this transcript can integrate.
+    Submitted {
+        /// Checked lower kind, device and exact range.
+        expected: StorageRequestIdentity,
+        /// Original provenance, retained without borrowing the mount.
+        stamp: Option<CacheReadStamp>,
+    },
 }
 
 /// Per-device read transcript retained by exactly one filesystem operation.
@@ -360,7 +373,8 @@ pub(crate) struct StorageTranscript {
     length: DeviceLength,
     /// Completed exact reads available to later resolve passes.
     completed_reads: Vec<CompletedRead>,
-
+    /// Sole outstanding read and its ownership phase.
+    read: TranscriptRead,
 }
 
 impl StorageTranscript {
@@ -370,8 +384,7 @@ impl StorageTranscript {
             target,
             length,
             completed_reads: Vec::new(),
-            pending_request: None,
-            in_flight: None,
+            read: TranscriptRead::Idle,
         }
     }
 
@@ -379,7 +392,7 @@ impl StorageTranscript {
     /// Inode validation protects payload and decoded progress, but a cached table block can also
     /// contain an as-yet unobserved neighboring inode. Its raw image cannot acquire new provenance.
     /// Payload completions remain reusable under their owning operation's inode dependencies.
-    pub(crate) fn refresh_metadata(&mut self, stamp: crate::volume::CacheReadStamp) {
+    pub(crate) fn refresh_metadata(&mut self, stamp: CacheReadStamp) {
         self.completed_reads
             .retain(|read| read.stamp.is_none_or(|previous| previous == stamp));
     }
@@ -390,7 +403,7 @@ impl StorageTranscript {
     /// # Errors
     /// Rejects retirement while lower I/O still owns a request.
     pub(crate) fn retire_decoded_stage(&mut self, retained: usize) -> Result<()> {
-        if self.pending_request.is_some() || self.in_flight.is_some() {
+        if !matches!(self.read, TranscriptRead::Idle) {
             return Err(Error::OperationSuspended);
         }
         let discard = self.completed_reads.len().saturating_sub(retained);
@@ -417,8 +430,8 @@ impl StorageTranscript {
         &mut self,
         offset: ByteOffset,
         out: &mut [u8],
-        stamp: Option<crate::volume::CacheReadStamp>,
-    ) -> Result<Option<crate::volume::CacheReadStamp>> {
+        stamp: Option<CacheReadStamp>,
+    ) -> Result<Option<CacheReadStamp>> {
         validate_device_range(self.length, offset, out.len())?;
         if out.is_empty() {
             return Ok(None);
@@ -431,18 +444,15 @@ impl StorageTranscript {
             memory::copy_exact(out, &read.bytes)?;
             return Ok(read.stamp);
         }
-        if self.pending_request.is_some() || self.in_flight.is_some() {
+        if !matches!(self.read, TranscriptRead::Idle) {
             return Err(Error::OperationSuspended);
         }
         let buffer = memory::repeated_vec(0_u8, out.len())?;
-        self.pending_request = Some((
-            StorageRequest::Read {
-                target: self.target,
-                offset,
-                buffer,
-            },
+        self.read = TranscriptRead::Prepared {
+            offset,
+            buffer,
             stamp,
-        ));
+        };
         Err(Error::OperationSuspended)
     }
 
@@ -451,18 +461,25 @@ impl StorageTranscript {
     ///
     /// Returns an invariant error when no read is pending or another transfer is already in flight.
     pub(crate) fn take_pending_request(&mut self) -> Result<StorageRequest> {
-        if self.in_flight.is_some() {
-            return Err(Error::DeviceIo);
-        }
-        let (request, stamp) = self.pending_request.take().ok_or(Error::DeviceIo)?;
-        let StorageRequest::Read { offset, buffer, .. } = &request else {
+        let current = core::mem::replace(&mut self.read, TranscriptRead::Idle);
+        let TranscriptRead::Prepared {
+            offset,
+            buffer,
+            stamp,
+        } = current
+        else {
+            self.read = current;
             return Err(Error::DeviceIo);
         };
-        self.in_flight = Some(InFlightRead {
-            offset: *offset,
-            byte_count: buffer.len(),
+        let request = StorageRequest::Read {
+            target: self.target,
+            offset,
+            buffer,
+        };
+        self.read = TranscriptRead::Submitted {
+            expected: StorageRequestIdentity::from_request(&request),
             stamp,
-        });
+        };
         Ok(request)
     }
 
@@ -471,28 +488,19 @@ impl StorageTranscript {
     ///
     /// Returns an error for a failed, short, duplicate, wrong-device, or mismatched completion.
     pub(crate) fn complete(&mut self, completion: StorageCompletion) -> Result<()> {
-        let expected = self.in_flight.take().ok_or(Error::DeviceIo)?;
-        let (transfer, information, result) = completion.into_parts();
-        result?;
-        let CompletedStorageTransfer::Read {
-            target,
-            offset,
-            buffer,
-        } = transfer
+        let TranscriptRead::Submitted { expected, stamp } = self.read else {
+            return Err(Error::DeviceIo);
+        };
+        self.read = TranscriptRead::Idle;
+        let CompletedStorageTransfer::Read { offset, buffer, .. } =
+            expected.complete_transfer(completion)?
         else {
             return Err(Error::DeviceIo);
         };
-        if target != self.target
-            || offset != expected.offset
-            || buffer.len() != expected.byte_count
-            || information != expected.byte_count
-        {
-            return Err(Error::DeviceIo);
-        }
         self.completed_reads.try_push(CompletedRead {
             offset,
             bytes: buffer,
-            stamp: expected.stamp,
+            stamp,
         })
     }
 }
@@ -505,7 +513,7 @@ pub(crate) struct OperationDevice<'transcript> {
     /// Immutable committed overlay applied after each exact backing read.
     overlay: Option<&'transcript dyn StorageReadOverlay>,
     /// Epoch-bound raw metadata reuse; absent while constructing the mount.
-    cache: Option<crate::MetadataCacheAccess<'transcript>>,
+    cache: Option<BlockCacheAccess<'transcript>>,
 }
 
 /// Immutable overlay capable of patching an exact backing-device read.
@@ -535,7 +543,7 @@ impl<'transcript> OperationDevice<'transcript> {
     pub(crate) const fn with_overlay(
         transcript: &'transcript mut StorageTranscript,
         overlay: &'transcript dyn StorageReadOverlay,
-        cache: Option<crate::MetadataCacheAccess<'transcript>>,
+        cache: Option<BlockCacheAccess<'transcript>>,
     ) -> Self {
         Self {
             transcript,
@@ -565,7 +573,7 @@ impl<'transcript> OperationDevice<'transcript> {
         &mut self,
         offset: ByteOffset,
         out: &mut [u8],
-        stamp: Option<crate::volume::CacheReadStamp>,
+        stamp: Option<CacheReadStamp>,
     ) -> Result<()> {
         if let Some(overlay) = self.overlay
             && overlay.read(self.transcript.target, offset, out)?
@@ -588,7 +596,7 @@ impl<'transcript> OperationDevice<'transcript> {
         out: &mut [u8],
     ) -> Result<()> {
         validate_device_range(self.transcript.len(), offset, out.len())?;
-        let stamp = self.cache.as_ref().map(crate::MetadataCacheAccess::stamp);
+        let stamp = self.cache.as_ref().map(BlockCacheAccess::stamp);
         let Some(cache) = self.cache.as_mut().filter(|cache| cache.enabled()) else {
             return self.read_exact_with_stamp(offset, out, stamp);
         };
@@ -739,6 +747,82 @@ mod tests {
 
     /// # Panics
     /// Fails if bytes read can acknowledge a write or a matching write is rejected.
+    /// Allows the test to observe transcript reads without any covered overlay ranges.
+    #[derive(Debug)]
+    struct EmptyOverlay;
+
+    impl StorageReadOverlay for EmptyOverlay {
+        fn read(
+            &self,
+            _target: StorageTarget,
+            _offset: ByteOffset,
+            _out: &mut [u8],
+        ) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn apply(
+            &self,
+            _target: StorageTarget,
+            _offset: ByteOffset,
+            _out: &mut [u8],
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// # Errors
+    /// Returns fixture construction or lower completion errors.
+    /// # Panics
+    /// Fails if a completed metadata read survives a provenance change or payload is lost.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "checks transcript retirement across cache generations"
+    )]
+    fn disabled_cache_retires_metadata_and_keeps_payload() -> Result<()> {
+        use crate::disk::block::BlockSize;
+        use crate::disk::block_cache::CacheReuse;
+
+        let target = StorageTarget::Filesystem;
+        let mut transcript = StorageTranscript::new(target, DeviceLength::from_bytes(4096));
+        let block_size = BlockSize::from_superblock_log(0)?;
+        let stamp = CacheReadStamp::new(1, 2, 3);
+        let payload = ByteOffset::new(0);
+        let metadata = ByteOffset::new(128);
+        let mut bytes = [0_u8; 8];
+        for (offset, provenance) in [(payload, None), (metadata, Some(stamp))] {
+            let result = if let Some(stamp) = provenance {
+                let cache = BlockCacheAccess::new(CacheReuse::Disabled, stamp, block_size);
+                OperationDevice::with_overlay(&mut transcript, &EmptyOverlay, Some(cache))
+                    .read_metadata_exact_at(offset, &mut bytes)
+            } else {
+                OperationDevice::new(&mut transcript).read_exact_at(offset, &mut bytes)
+            };
+            assert_eq!(result, Err(Error::OperationSuspended));
+            let request = transcript.take_pending_request()?;
+            assert!(matches!(
+                transcript.take_pending_request(),
+                Err(Error::DeviceIo)
+            ));
+            transcript.complete(StorageCompletion::success(
+                CompletedStorageTransfer::from_request(request),
+                bytes.len(),
+            ))?;
+        }
+        let successor = CacheReadStamp::new(1, 2, 4);
+        transcript.refresh_metadata(successor);
+        assert_eq!(
+            transcript.read_exact_at(payload, &mut bytes, None),
+            Ok(None)
+        );
+        assert_eq!(
+            transcript.read_exact_at(metadata, &mut bytes, Some(successor)),
+            Err(Error::OperationSuspended),
+        );
+        Ok(())
+    }
+
     #[test]
     fn completion_kind_is_part_of_the_transfer_identity() {
         let request = || StorageRequest::Write {

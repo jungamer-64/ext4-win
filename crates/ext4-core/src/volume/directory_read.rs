@@ -882,8 +882,11 @@ impl DirectoryReadOperation {
         }
         loop {
             let step = {
-                let device =
-                    OperationDevice::with_overlay(&mut self.storage, epoch, Some(cache.reborrow()));
+                let device = OperationDevice::with_overlay(
+                    &mut self.storage,
+                    epoch,
+                    Some(cache.reborrow().into_block_access()),
+                );
                 let mut view =
                     EpochReadView::observing(device, epoch, context.versions, &mut self.observed);
                 self.reader.step(&mut view, crypto)
