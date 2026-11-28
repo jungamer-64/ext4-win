@@ -127,6 +127,127 @@ fn write_single_payload_transaction(
 }
 
 /// # Errors
+/// Propagates fixture and mount failure.
+/// # Panics
+/// Fails if recovery drops a committed transaction or refuses the incomplete form of the same tail.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare independent corruption and incomplete-write outcomes"
+)]
+fn damaged_descriptor_is_distinguished_from_an_incomplete_transaction() -> Result<()> {
+    let mount_access = MountAccess::ReadOnly {
+        recovery: ReadOnlyRecovery::Replay,
+    };
+    for (field, bit) in [(28, 1), (19, 8)] {
+        for committed in [true, false] {
+            let mut fixture = Fixture::new()?;
+            let journal = &mut fixture.disk.journal;
+            let first = be32(
+                journal.get(JOURNAL_SUPER..).ok_or(Error::DeviceRange)?,
+                0x14,
+            )?;
+            set_tail(journal, first, 79)?;
+            write_single_payload_transaction(journal, first, 79, &[0x91; BLOCK_BYTES])?;
+            let descriptor_byte = block_offset(first)?
+                .checked_add(field)
+                .ok_or(Error::DeviceRange)?;
+            *journal.get_mut(descriptor_byte).ok_or(Error::DeviceRange)? ^= bit;
+            if !committed {
+                let commit = first.checked_add(2).ok_or(Error::DeviceRange)?;
+                put(journal, block_offset(commit)?, &[0; BLOCK_BYTES])?;
+            }
+            let before = fixture.disk.storage_effects;
+            let result = fixture.disk.mount(mount_access);
+            let tail = be32(
+                fixture
+                    .disk
+                    .journal
+                    .get(JOURNAL_SUPER..)
+                    .ok_or(Error::DeviceRange)?,
+                0x1c,
+            )?;
+            if committed {
+                assert!(matches!(result, Err(Error::ChecksumMismatch)));
+                assert_eq!(tail, first);
+                assert_eq!(fixture.disk.storage_effects, before);
+            } else {
+                result?;
+                assert_eq!(tail, 0);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Propagates fixture creation and independently encoded record failures.
+/// # Panics
+/// Fails if a malformed revoke count causes a committed log to be retired.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe committed corruption and physical effects"
+)]
+fn invalid_revoke_count_preserves_the_committed_log() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let journal = &mut fixture.disk.journal;
+    let superblock = journal.get(JOURNAL_SUPER..).ok_or(Error::DeviceRange)?;
+    let first = be32(superblock, 0x14)?;
+    let features = be32(superblock, 0x28)? | 1;
+    put(journal, JOURNAL_SUPER + 0x28, &features.to_be_bytes())?;
+    set_tail(journal, first, 79)?;
+    // A zero r_count cannot cover even the revoke header.
+    put(journal, block_offset(first)?, &control_block(5, 79)?)?;
+    write_commit(journal, first.checked_add(1).ok_or(Error::DeviceRange)?, 79)?;
+    let before = fixture.disk.storage_effects;
+    let result = fixture.disk.mount(MountAccess::ReadOnly {
+        recovery: ReadOnlyRecovery::Replay,
+    });
+    assert!(matches!(result, Err(Error::JournalCorrupt)));
+    assert_eq!(fixture.disk.storage_effects, before);
+    Ok(())
+}
+
+/// # Errors
+/// Propagates fixture and read-only replay failure.
+/// # Panics
+/// Fails if the empty commit prevents recovery of its successor.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions inspect the successor transaction's independent home bytes"
+)]
+fn empty_commit_advances_recovery_to_its_successor() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let journal = &mut fixture.disk.journal;
+    let first = be32(
+        journal.get(JOURNAL_SUPER..).ok_or(Error::DeviceRange)?,
+        0x14,
+    )?;
+    set_tail(journal, first, 79)?;
+    write_commit(journal, first, 79)?;
+    let payload = [0x91; BLOCK_BYTES];
+    write_single_payload_transaction(
+        journal,
+        first.checked_add(1).ok_or(Error::DeviceRange)?,
+        80,
+        &payload,
+    )?;
+    fixture.disk.mount(MountAccess::ReadOnly {
+        recovery: ReadOnlyRecovery::Replay,
+    })?;
+    assert_eq!(
+        fixture
+            .disk
+            .filesystem
+            .get(block_offset(PAYLOAD_HOME)?..block_offset(PAYLOAD_HOME + 1)?),
+        Some(payload.as_slice())
+    );
+    Ok(())
+}
+
+/// # Errors
 /// Propagates fixture encoding, crash injection, remount and file read failures.
 /// # Panics
 /// Fails if pre-commit ring reuse makes a durable fast commit undiscoverable.

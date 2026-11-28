@@ -691,7 +691,7 @@ enum PrimaryRepairValidation {
 #[derive(Debug)]
 enum RecoveryPhase {
     /// Locate the continuous committed prefix and compute allocation maxima.
-    Scan,
+    Scan(RecoveryScan),
     /// Authenticate delta records before any full-journal replay or clean-tail write.
     InspectFastCommit {
         /// Independent logical area cursor; it never wraps through descriptor records.
@@ -715,6 +715,15 @@ enum RecoveryPhase {
     FlushJournal,
     /// Recovery is complete and the clean journal may be published.
     Complete,
+}
+
+/// Evidence used to locate the end of the committed prefix.
+#[derive(Debug)]
+enum RecoveryScan {
+    /// Record lengths locate subsequent journal control blocks.
+    FollowRecords,
+    /// Check whether a damaged control block belongs to a committed transaction.
+    FindCommitAfterDamage(Error),
 }
 
 /// Cursor and transaction-local counters reused by each recovery pass.
@@ -948,7 +957,7 @@ impl JournalRecoveryOperation {
         let phase = if already_clean {
             RecoveryPhase::Complete
         } else {
-            RecoveryPhase::Scan
+            RecoveryPhase::Scan(RecoveryScan::FollowRecords)
         };
         Ok(Self {
             journal,
@@ -1056,7 +1065,7 @@ impl JournalRecoveryOperation {
                 },
                 RecoveryIoAction::JournalFlush,
             ),
-            RecoveryPhase::Scan | RecoveryPhase::Validate | RecoveryPhase::Replay => {
+            RecoveryPhase::Scan(_) | RecoveryPhase::Validate | RecoveryPhase::Replay => {
                 match self.pending {
                     RecoveryPending::Control => {
                         let offset = self
@@ -1282,7 +1291,7 @@ impl JournalRecoveryOperation {
     /// Returns an error for inconsistent committed-prefix cursors or failed pre-write allocation.
     fn advance_pass_boundary(&mut self) -> Result<()> {
         loop {
-            if matches!(self.phase, RecoveryPhase::Scan)
+            if matches!(self.phase, RecoveryPhase::Scan(_))
                 && self.walk.consumed >= self.journal.data.usable_log_blocks()?
             {
                 self.finish_scan()?;
@@ -1327,7 +1336,18 @@ impl JournalRecoveryOperation {
     /// Returns an error for an invalid phase or committed control-block corruption.
     fn process_control_block(&mut self, block: &[u8]) -> Result<()> {
         match self.phase {
-            RecoveryPhase::Scan => self.scan_control_block(block),
+            RecoveryPhase::Scan(RecoveryScan::FollowRecords) => self.scan_control_block(block),
+            RecoveryPhase::Scan(RecoveryScan::FindCommitAfterDamage(error)) => {
+                if self
+                    .journal
+                    .data
+                    .parse_commit_block(block, self.walk.sequence)
+                    .is_ok()
+                {
+                    return Err(error);
+                }
+                self.advance_walk_blocks(1)
+            }
             RecoveryPhase::Validate | RecoveryPhase::Replay => {
                 self.validate_or_replay_control_block(block)
             }
@@ -1348,8 +1368,9 @@ impl JournalRecoveryOperation {
         }
         match header.block_type() {
             JBD2_DESCRIPTOR_BLOCK => {
-                let Ok(tag_count) = self.journal.data.descriptor_tag_count_for_scan(block) else {
-                    return self.finish_scan();
+                let tag_count = match self.journal.data.for_each_descriptor_tag(block, |_| Ok(())) {
+                    Ok(count) => count,
+                    Err(error) => return self.scan_after_damaged_control(error),
                 };
                 self.walk.scan_transaction_tags = self
                     .walk
@@ -1367,8 +1388,9 @@ impl JournalRecoveryOperation {
                 if !self.journal.data.profile.has_revokes() {
                     return Err(Error::JournalCorrupt);
                 }
-                let Ok(revoke_count) = self.journal.data.revoke_count_for_scan(block) else {
-                    return self.finish_scan();
+                let revoke_count = match self.journal.data.revoke_count_for_scan(block) {
+                    Ok(count) => count,
+                    Err(error) => return self.scan_after_damaged_control(error),
                 };
                 self.walk.scan_transaction_revokes = self
                     .walk
@@ -1392,9 +1414,6 @@ impl JournalRecoveryOperation {
                         return self.finish_scan();
                     }
                     return Err(error);
-                }
-                if self.walk.scan_transaction_tags == 0 && self.walk.scan_transaction_revokes == 0 {
-                    return Err(Error::JournalCorrupt);
                 }
                 self.advance_walk_blocks(1)?;
                 self.summary.max_transaction_tags = self
@@ -1424,6 +1443,18 @@ impl JournalRecoveryOperation {
             _ => self.finish_scan()?,
         }
         Ok(())
+    }
+
+    /// An interrupted write can leave an invalid control block. Its length cannot locate the
+    /// commit, so search the remaining ring block by block before deciding to discard the suffix.
+    /// # Errors
+    /// Returns checked cursor failures or scan finalization failures in discard mode.
+    fn scan_after_damaged_control(&mut self, error: Error) -> Result<()> {
+        if self.policy == RecoveryPolicy::Discard {
+            return self.finish_scan();
+        }
+        self.phase = RecoveryPhase::Scan(RecoveryScan::FindCommitAfterDamage(error));
+        self.advance_walk_blocks(1)
     }
 
     /// Finishes pass one and reserves all address memory before any home write.
@@ -2201,34 +2232,7 @@ impl JournalData {
         Ok(())
     }
 
-    /// Counts structurally decodable tags during the committed-prefix scan.
-    ///
-    /// Descriptor checksum failure is deliberately deferred to pass two so a valid later commit
-    /// record distinguishes committed corruption from an incomplete tail.
-    /// # Errors
-    ///
-    /// Returns an error when no complete, structurally valid tag stream terminates in the block.
-    fn descriptor_tag_count_for_scan(&self, block: &[u8]) -> Result<usize> {
-        let mut offset = JOURNAL_HEADER_BYTES;
-        let limit = if self.profile.has_metadata_checksums() {
-            block.len().checked_sub(4).ok_or(Error::InvalidSuperblock)?
-        } else {
-            block.len()
-        };
-        let mut count = 0_usize;
-        loop {
-            let Some((tag, next_offset)) = self.parse_tag(block, offset, limit, count == 0)? else {
-                return Err(Error::JournalCorrupt);
-            };
-            count = count.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
-            offset = next_offset;
-            if tag.flags & JBD2_TAG_FLAG_LAST_TAG != 0 {
-                return Ok(count);
-            }
-        }
-    }
-
-    /// Visits every fully validated descriptor tag without retaining a descriptor-owned vector.
+    /// Visits and counts fully validated descriptor tags without retaining a descriptor-owned vector.
     /// # Errors
     ///
     /// Returns an error for checksum, UUID, flag, layout, or visitor rejection.
@@ -2236,14 +2240,10 @@ impl JournalData {
         &self,
         block: &[u8],
         mut visit: impl FnMut(JournalTag) -> Result<()>,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         self.verify_block_tail_checksum(block)?;
         let mut offset = JOURNAL_HEADER_BYTES;
-        let limit = if self.profile.has_metadata_checksums() {
-            block.len().checked_sub(4).ok_or(Error::InvalidSuperblock)?
-        } else {
-            block.len()
-        };
+        let limit = self.descriptor_payload_limit(block.len())?;
         let mut count = 0_usize;
         loop {
             let Some((tag, next_offset)) = self.parse_tag(block, offset, limit, count == 0)? else {
@@ -2253,7 +2253,7 @@ impl JournalData {
             count = count.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
             offset = next_offset;
             if tag.flags & JBD2_TAG_FLAG_LAST_TAG != 0 {
-                return Ok(());
+                return Ok(count);
             }
         }
     }
@@ -4931,7 +4931,7 @@ mod tests {
                 torn_recovery.scan_control_block(&torn),
                 Err(Error::ChecksumMismatch)
             );
-            assert!(matches!(torn_recovery.phase, RecoveryPhase::Scan));
+            assert!(matches!(torn_recovery.phase, RecoveryPhase::Scan(_)));
             assert_eq!(torn_recovery.summary.transactions, 0);
 
             let mut committed =
@@ -5144,7 +5144,7 @@ mod tests {
                 JournalRecoveryOperation::new(journal, RecoveryState::NeedsRecovery)?;
             operation.summary.max_transaction_tags = usize::MAX;
             assert_eq!(operation.finish_scan(), Err(Error::OutOfMemory));
-            assert!(matches!(operation.phase, RecoveryPhase::Scan));
+            assert!(matches!(operation.phase, RecoveryPhase::Scan(_)));
             Ok(())
         })();
         assert_eq!(outcome, Ok(()));
