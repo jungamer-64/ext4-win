@@ -1784,6 +1784,13 @@ impl RecoveryTag {
     }
 }
 
+impl<State> Journal<State> {
+    /// Physical device selected by the validated journal placement.
+    pub(crate) const fn storage_target(&self) -> StorageTarget {
+        self.data.location.storage_target()
+    }
+}
+
 impl Journal<CleanJournal> {
     /// Copies encoding state for finalization after the host has drained all journal users.
     /// The snapshot supplies no independent admission or media ownership authority.

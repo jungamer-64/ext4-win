@@ -662,6 +662,29 @@ struct UnpublishedMount {
     destination: Box<MaybeUninit<CompletedMount>>,
 }
 
+/// Resources that can enter a live session once required recovery completes.
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "publication moves preallocated state without allocating"
+)]
+enum MountPublication {
+    /// A read-only view may retain private recovery but owns no writable journal.
+    ReadOnly {
+        /// Device that held the admitted replay log, if one was loaded.
+        journal_target: Option<StorageTarget>,
+        /// Sealed in-memory recovery images, when requested.
+        recovery: Option<ext4_shared::Shared<super::recovery::RecoveryOverlay>>,
+    },
+    /// Writable recovery has completed both journal and allocation admission.
+    ReadWrite {
+        /// Journal usable for ordinary commits after session marker and orphan checkpointing.
+        journal: Journal<CleanJournal>,
+        /// Allocation ownership corresponding to the final recovered metadata.
+        clusters: ClusterReferenceIndex,
+    },
+}
+
 /// Journal resolution result before recovery begins.
 #[derive(Debug)]
 enum JournalResolution {
@@ -963,44 +986,28 @@ impl MountOperation {
             }
             MountState::VerifyingReplayedPrimary {
                 completion: recovered,
-                journal_target,
             } => {
                 self.filesystem.complete(completion)?;
                 self.state = MountState::VerifyingReplayedPrimary {
                     completion: recovered,
-                    journal_target,
                 };
             }
-            MountState::PreparingDeltas {
-                mut operation,
-                journal_target,
-            } => {
+            MountState::PreparingDeltas { mut operation } => {
                 operation.complete(completion)?;
-                self.state = MountState::PreparingDeltas {
-                    operation,
-                    journal_target,
-                };
+                self.state = MountState::PreparingDeltas { operation };
             }
-            MountState::DeltaWritePending {
-                pending,
-                journal_target,
-            } => {
+            MountState::DeltaWritePending { pending } => {
                 self.state = MountState::DeltaWrites {
                     sequence: pending.complete(completion)?,
-                    journal_target,
                 };
             }
             MountState::Recovering {
                 primary,
-                journal_target,
+
                 mut operation,
             } => {
                 operation.complete(completion)?;
-                self.state = MountState::Recovering {
-                    primary,
-                    journal_target,
-                    operation,
-                };
+                self.state = MountState::Recovering { primary, operation };
             }
             MountState::SessionPending { recovered, pending } => {
                 self.state = MountState::SessionWrites {
@@ -1032,12 +1039,8 @@ impl MountOperation {
                     step = operation.drive_step();
                     continue;
                 }
-                MountStep::PrepareDeltas {
-                    mount,
-                    operation,
-                    journal_target,
-                } => {
-                    step = mount.prepare_deltas(operation, journal_target);
+                MountStep::PrepareDeltas { mount, operation } => {
+                    step = mount.prepare_deltas(operation);
                     continue;
                 }
                 MountStep::PrepareMarker { mount, indexed } => {
@@ -1156,15 +1159,10 @@ impl MountOperation {
                         self.state = MountState::ScanningOrphans(MountPublicationSeed {
                             superblock,
                             journal: None,
-                            journal_target: None,
                         });
                     }
-                    Ok(JournalResolution::Loaded {
-                        primary,
-                        journal,
-                        journal_target,
-                    }) => {
-                        return self.admit_journal(primary, journal, journal_target);
+                    Ok(JournalResolution::Loaded { primary, journal }) => {
+                        return self.admit_journal(primary, journal);
                     }
                     Ok(JournalResolution::External {
                         primary,
@@ -1219,11 +1217,7 @@ impl MountOperation {
                         ExternalJournalLoadTransition::Complete(Ok(
                             ExternalJournalLoad::Match(journal),
                         )) => {
-                            return self.admit_journal(
-                                primary,
-                                journal,
-                                StorageTarget::ExternalJournal,
-                            );
+                            return self.admit_journal(primary, journal);
                         }
                         ExternalJournalLoadTransition::Complete(Ok(
                             ExternalJournalLoad::Mismatch,
@@ -1237,15 +1231,11 @@ impl MountOperation {
                 }
                 MountState::Recovering {
                     primary,
-                    journal_target,
+
                     mut operation,
                 } => match operation.next_request() {
                     Ok(Some(request)) => {
-                        self.state = MountState::Recovering {
-                            primary,
-                            journal_target,
-                            operation,
-                        };
+                        self.state = MountState::Recovering { primary, operation };
                         return MountStep::Yield(MountTransition::SubmitLower {
                             request,
                             suspended: self,
@@ -1258,40 +1248,24 @@ impl MountOperation {
                                 StorageTarget::Filesystem,
                                 filesystem_length,
                             );
-                            self.state = MountState::VerifyingReplayedPrimary {
-                                completion,
-                                journal_target,
-                            };
+                            self.state = MountState::VerifyingReplayedPrimary { completion };
                         }
                         Err(error) => return MountStep::Yield(self.fail(error)),
                     },
                     Err(error) => return MountStep::Yield(self.fail(error)),
                 },
-                MountState::VerifyingReplayedPrimary {
-                    completion,
-                    journal_target,
-                } => {
-                    return self.verify_replayed_primary(completion, journal_target);
+                MountState::VerifyingReplayedPrimary { completion } => {
+                    return self.verify_replayed_primary(completion);
                 }
-                MountState::PreparingDeltas {
-                    operation,
-                    journal_target,
-                } => {
+                MountState::PreparingDeltas { operation } => {
                     return MountStep::PrepareDeltas {
                         mount: self,
                         operation,
-                        journal_target,
                     };
                 }
-                MountState::DeltaWrites {
-                    sequence,
-                    journal_target,
-                } => match sequence.advance() {
+                MountState::DeltaWrites { sequence } => match sequence.advance() {
                     StorageRequestSequenceStep::Submit { request, suspended } => {
-                        self.state = MountState::DeltaWritePending {
-                            pending: suspended,
-                            journal_target,
-                        };
+                        self.state = MountState::DeltaWritePending { pending: suspended };
                         return MountStep::Yield(MountTransition::SubmitLower {
                             request,
                             suspended: self,
@@ -1304,7 +1278,6 @@ impl MountOperation {
                         );
                         self.state = MountState::VerifyingReplayedPrimary {
                             completion: JournalRecoveryCompletion::Clean(journal.into_clean()),
-                            journal_target,
                         };
                     }
                 },
@@ -1411,14 +1384,32 @@ impl MountOperation {
         let IndexedMount {
             superblock,
             journal,
-            journal_target,
+
             clusters,
             orphans: _,
         } = *recovered.image;
+        let publication = match self.access {
+            super::MountAccess::ReadOnly { .. } => MountPublication::ReadOnly {
+                journal_target: journal.as_ref().map(Journal::storage_target),
+                recovery,
+            },
+            super::MountAccess::ReadWrite => {
+                let (Some(journal), Some(clusters)) = (journal, clusters) else {
+                    return self.fail(Error::JournalCorrupt);
+                };
+                MountPublication::ReadWrite { journal, clusters }
+            }
+        };
         let access = self.access.media_access();
-        let (journal, clusters) = match access {
-            super::MediaAccess::ReadOnly => (None, None),
-            super::MediaAccess::ReadWrite => (journal, clusters),
+        let (journal, journal_target, clusters, recovery) = match publication {
+            MountPublication::ReadOnly {
+                journal_target,
+                recovery,
+            } => (None, journal_target, None, recovery),
+            MountPublication::ReadWrite { journal, clusters } => {
+                let target = journal.storage_target();
+                (Some(journal), Some(target), Some(clusters), None)
+            }
         };
         let profile = MountedProfile::new(
             &self.mount,
@@ -1494,7 +1485,6 @@ impl MountOperation {
     fn verify_replayed_primary(
         mut self: Box<Self>,
         completion: JournalRecoveryCompletion,
-        journal_target: StorageTarget,
     ) -> MountStep {
         let primary = {
             let mut filesystem = OperationDevice::new(&mut self.filesystem);
@@ -1514,7 +1504,6 @@ impl MountOperation {
                         MountState::ScanningOrphans(MountPublicationSeed {
                             superblock,
                             journal: Some(journal),
-                            journal_target: Some(journal_target),
                         })
                     }
                     JournalRecoveryCompletion::Deltas(seed) => {
@@ -1530,10 +1519,7 @@ impl MountOperation {
                                 return MountStep::Yield(self.fail(error));
                             }
                         };
-                        MountState::PreparingDeltas {
-                            operation,
-                            journal_target,
-                        }
+                        MountState::PreparingDeltas { operation }
                     }
                 };
             }
@@ -1541,10 +1527,7 @@ impl MountOperation {
                 return MountStep::Yield(self.fail(Error::ChecksumMismatch));
             }
             Err(Error::OperationSuspended) => {
-                self.state = MountState::VerifyingReplayedPrimary {
-                    completion,
-                    journal_target,
-                };
+                self.state = MountState::VerifyingReplayedPrimary { completion };
                 return self.submit_pending_read();
             }
             Err(error) => return MountStep::Yield(self.fail(error)),
@@ -1557,26 +1540,17 @@ impl MountOperation {
     fn prepare_deltas(
         mut self: Box<Self>,
         mut operation: Box<super::fast_commit::DeltaReplayOperation>,
-        journal_target: StorageTarget,
     ) -> MountStep {
         match operation.next_request(&self.fscrypt_keys) {
             Ok(Some(request)) => {
-                self.state = MountState::PreparingDeltas {
-                    operation,
-                    journal_target,
-                };
+                self.state = MountState::PreparingDeltas { operation };
                 return MountStep::Yield(MountTransition::SubmitLower {
                     request,
                     suspended: self,
                 });
             }
             Ok(None) => match (*operation).into_sequence() {
-                Ok(sequence) => {
-                    self.state = MountState::DeltaWrites {
-                        sequence,
-                        journal_target,
-                    }
-                }
+                Ok(sequence) => self.state = MountState::DeltaWrites { sequence },
                 Err(error) => return MountStep::Yield(self.fail(error)),
             },
             Err(error) => return MountStep::Yield(self.fail(error)),
@@ -1670,7 +1644,7 @@ impl MountOperation {
             superblock: publication.superblock,
             orphans: orphans.into_queue(),
             journal: publication.journal,
-            journal_target: publication.journal_target,
+
             clusters,
         }) {
             Ok(indexed) => indexed,
@@ -1777,7 +1751,7 @@ impl MountOperation {
                     recovery: super::ReadOnlyRecovery::Replay
                 }
             ) && self.device_access == super::DeviceWriteAccess::Writable
-                && mount.image.journal_target.is_some()
+                && mount.image.journal.is_some()
             {
                 MountState::FinishingReadOnly(mount)
             } else {
@@ -1817,8 +1791,8 @@ impl MountOperation {
         mut self: Box<Self>,
         primary: ResolvedPrimary,
         journal: Journal<LoadedJournal>,
-        journal_target: StorageTarget,
     ) -> MountStep {
+        let journal_target = journal.storage_target();
         if matches!(
             self.access,
             super::MountAccess::ReadOnly {
@@ -1837,7 +1811,6 @@ impl MountOperation {
             self.state = MountState::ScanningOrphans(MountPublicationSeed {
                 superblock,
                 journal: None,
-                journal_target: None,
             });
             return MountStep::Continue(self);
         }
@@ -1852,11 +1825,7 @@ impl MountOperation {
             ));
         }
         self.state = match primary.begin_recovery(journal, self.access) {
-            Ok(operation) => MountState::Recovering {
-                primary,
-                journal_target,
-                operation,
-            },
+            Ok(operation) => MountState::Recovering { primary, operation },
             Err(error) => return MountStep::Yield(self.fail(error)),
         };
         MountStep::Continue(self)
@@ -1934,11 +1903,7 @@ impl MountOperation {
                         &mut filesystem,
                     )?
                 };
-                Ok(JournalResolution::Loaded {
-                    primary,
-                    journal,
-                    journal_target: StorageTarget::Filesystem,
-                })
+                Ok(JournalResolution::Loaded { primary, journal })
             }
             JournalMode::External(journal_uuid) => Ok(JournalResolution::External {
                 primary,
