@@ -436,8 +436,6 @@ enum MountStep {
         mount: Box<MountOperation>,
         /// Private replay state for the next pass.
         operation: Box<super::fast_commit::DeltaReplayOperation>,
-        /// Device receiving the eventual journal checkpoint.
-        journal_target: StorageTarget,
     },
     /// Session checkpoint preparation runs after the dispatcher releases its scratch frame.
     PrepareMarker {
@@ -559,8 +557,6 @@ enum MountState {
     Recovering {
         /// Primary admission state whose checksum status selects ordinary or repair replay.
         primary: ResolvedPrimary,
-        /// Device selected by the validated journal location.
-        journal_target: StorageTarget,
         /// Consuming three-pass recovery operation.
         operation: Box<JournalRecoveryOperation>,
     },
@@ -568,29 +564,21 @@ enum MountState {
     VerifyingReplayedPrimary {
         /// Pending semantic replay remains owned until the fresh filesystem admits its operands.
         completion: JournalRecoveryCompletion,
-        /// Device containing the journal.
-        journal_target: StorageTarget,
     },
     /// Resolve and validate prospective images without granting write authority to its read phases.
     PreparingDeltas {
         /// Owns the program, original allocation evidence and candidate validation continuation.
         operation: Box<super::fast_commit::DeltaReplayOperation>,
-        /// Physical journal device selected during admission.
-        journal_target: StorageTarget,
     },
     /// Fully allocated full-commit conversion and home checkpoint requests.
     DeltaWrites {
         /// Only matching lower completions can advance this sequence.
         sequence: StorageRequestSequence<PreparedCleanJournal>,
-        /// Physical journal target retained for mount publication.
-        journal_target: StorageTarget,
     },
     /// A submitted delta-conversion transfer remains owned even after cancellation.
     DeltaWritePending {
         /// Consuming continuation revealed by the exact transfer completion.
         pending: crate::PendingStorageTransfer<StorageRequestSequence<PreparedCleanJournal>>,
-        /// Physical journal target retained for mount publication.
-        journal_target: StorageTarget,
     },
     /// Validate both persistent orphan trackers before granting write authority.
     ScanningOrphans(MountPublicationSeed),
@@ -639,8 +627,6 @@ struct MountPublicationSeed {
     superblock: Superblock,
     /// Admitted clean journal, absent when journal loading was suppressed or unnecessary.
     journal: Option<Journal<CleanJournal>>,
-    /// Device containing the journal.
-    journal_target: Option<StorageTarget>,
 }
 
 /// Validated orphan membership and resumable allocation ownership awaiting indexing.
@@ -663,8 +649,6 @@ struct IndexedMount {
     orphans: OrphanRecoveryQueue,
     /// Admitted journal for checkpointing and mutation.
     journal: Option<Journal<CleanJournal>>,
-    /// Device containing the admitted journal.
-    journal_target: Option<StorageTarget>,
     /// Fully validated committed allocation ownership.
     clusters: Option<ClusterReferenceIndex>,
 }
@@ -689,8 +673,6 @@ enum JournalResolution {
         primary: ResolvedPrimary,
         /// Current journal cursor.
         journal: Journal<LoadedJournal>,
-        /// Device containing this cursor.
-        journal_target: StorageTarget,
     },
     /// External placement needs either host discovery or a fresh exclusive-device read.
     External {
