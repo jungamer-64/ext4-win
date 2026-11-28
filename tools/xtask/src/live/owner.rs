@@ -1409,17 +1409,6 @@ fn exercise_driver(
         }
         session.state_mut().driver = DriverStage::Starting;
         session.publish(Phase::Intent(Operation::StartDriver))?;
-        if verifier == VerifierPlan::DeadlockDetection {
-            let mut command = Command::new("verifier.exe");
-            command
-                .args(["/volatile", "/flags"])
-                .arg(format!("{:#010x}", rules.flags()))
-                .args(["/adddriver", "ext4win.sys"]);
-            run_checked(
-                command,
-                "select Driver Verifier deadlock detection before SCM start",
-            )?;
-        }
         Ok(())
     })?;
     session.state_mut().driver = DriverStage::Running;
@@ -1726,36 +1715,6 @@ pub(crate) fn verify_live_vhdx(root: &Path, id: &OsStr, verifier: VerifierPlan) 
     combine_verification_and_cleanup(operation, completion)?;
     println!("live VHDX driver assurance: PASS");
     Ok(())
-}
-
-/// Runs a fresh VHDX workload with the exact completed session's driver package.
-///
-/// The disposable host owns its volatile named selection until shutdown.
-/// # Errors
-/// Returns admission, workload, package identity or mandatory cleanup failures.
-pub(crate) fn verify_live_vhdx_deadlock(
-    root: &Path,
-    live_id: &OsStr,
-    deadlock_id: &OsStr,
-) -> TaskResult<()> {
-    check_live_driver_host(root)?;
-    require_idle_verifier()?;
-    let live_id = SessionId::parse(live_id)?;
-    let id = SessionId::parse(deadlock_id)?;
-    let live: Session<LiveState> = Session::load(root, "live-vhdx-sessions", &live_id)?;
-    if live.phase() != Phase::Complete {
-        return Err(
-            io::Error::other("deadlock verification requires a completed live session").into(),
-        );
-    }
-    prepare_session(root, LiveWorkload::Assurance, id.clone(), |id, scope| {
-        driver_load::reinstall_completed_package(root, &live_id, id, scope)
-    })?;
-    verify_live_vhdx(
-        root,
-        OsStr::new(id.as_str()),
-        VerifierPlan::DeadlockDetection,
-    )
 }
 
 #[cfg(test)]
