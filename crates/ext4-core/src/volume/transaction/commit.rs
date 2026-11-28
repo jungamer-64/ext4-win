@@ -3,46 +3,6 @@
 use super::*;
 
 impl MetadataMutation<'_, '_> {
-    /// Selects a complete inode operand only when every changed byte belongs to stable metadata.
-    /// The full image remains authoritative; versions of its complete block are rechecked at commit.
-    /// # Errors
-    /// Propagates metadata read, coordinate or malformed inode failure before any write authority.
-    fn commit_image(
-        &mut self,
-        blocks: Vec<JournalBlock>,
-    ) -> Result<crate::disk_format::journal::JournalCommitImage> {
-        use crate::disk_format::journal::JournalCommitImage;
-        if !self
-            .volume
-            .superblock
-            .features()
-            .contains(crate::FilesystemFeature::FastCommit)
-            || blocks.len() != 1
-        {
-            return Ok(JournalCommitImage::full(blocks));
-        }
-        let Some(inode) = self.inode_updates.only_live() else {
-            return Ok(JournalCommitImage::full(blocks));
-        };
-        let block = blocks.first().ok_or(Error::InvalidWriteRange)?;
-        let size = self.volume.superblock.block_size();
-        let block_start = size.offset_of(block.block())?;
-        let mut base = match memory::repeated_vec(0, block.bytes().len()) {
-            Ok(base) => base,
-            Err(Error::OutOfMemory) => return Ok(JournalCommitImage::full(blocks)),
-            Err(error) => return Err(error),
-        };
-        self.volume
-            .device
-            .read_metadata_exact_at(block_start, &mut base)?;
-        let Some((offset, record_len)) =
-            inode.metadata_delta_region(block_start, &base, block.bytes())?
-        else {
-            return Ok(JournalCommitImage::full(blocks));
-        };
-        JournalCommitImage::inode(blocks, size, inode.id(), offset, record_len)
-    }
-
     /// Serializes all staged metadata mutations into byte-range writes.
     /// # Errors
     ///
