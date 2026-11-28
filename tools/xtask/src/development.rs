@@ -402,7 +402,7 @@ fn verify_cache_manager(root: &Path) -> TaskResult<()> {
     Ok(())
 }
 
-/// Replays every declared fuzz target against tracked inputs and an independent full-image seed.
+/// Replays every declared fuzz target against independently generated image seeds.
 ///
 /// The target list comes from `cargo fuzz list`; adding a target therefore cannot silently omit
 /// it from the deterministic pull-request gate. The separately pinned cargo-fuzz version remains
@@ -490,7 +490,7 @@ fn run_fuzz(repository_root: &Path, mode: FuzzMode) -> TaskResult<()> {
     Ok(())
 }
 
-/// Combines tracked malformed inputs with an independently generated complete image or pair.
+/// Copies the tracked inputs and assembles the external-journal pair for its target.
 /// # Errors
 /// Returns missing inputs, an unknown encoding, oversized seeds or file I/O failures.
 fn prepare_fuzz_corpus(root: &Path, target: &str, destination: &Path) -> TaskResult<()> {
@@ -503,15 +503,11 @@ fn prepare_fuzz_corpus(root: &Path, target: &str, destination: &Path) -> TaskRes
             fs::copy(entry.path(), destination.join(entry.file_name()))?;
         }
     }
-    let fixtures = root.join("tools/xtask/fixtures/journal");
-    let filesystem = fs::read(fixtures.join("external-4k-v3-64.filesystem.img"))?;
-    let mut seed = fs::File::create(destination.join("external-journal-image"))?;
     match target {
-        "mount_image" => {
-            require_fuzz_seed_length(filesystem.len())?;
-            seed.write_all(&filesystem)?;
-        }
+        "mount_image" => {}
         "journal_recovery" => {
+            let fixtures = root.join("tools/xtask/fixtures/journal");
+            let filesystem = fs::read(fixtures.join("external-4k-v3-64.filesystem.img"))?;
             let journal = fs::read(fixtures.join("external-4k-v3-64.journal.img"))?;
             let length = filesystem
                 .len()
@@ -519,6 +515,7 @@ fn prepare_fuzz_corpus(root: &Path, target: &str, destination: &Path) -> TaskRes
                 .and_then(|length| length.checked_add(4))
                 .ok_or_else(|| io::Error::other("fuzz seed length overflow"))?;
             require_fuzz_seed_length(length)?;
+            let mut seed = fs::File::create(destination.join("external-journal-image"))?;
             seed.write_all(&u32::try_from(filesystem.len())?.to_le_bytes())?;
             seed.write_all(&filesystem)?;
             seed.write_all(&journal)?;

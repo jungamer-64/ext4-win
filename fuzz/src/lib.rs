@@ -19,6 +19,16 @@ const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 /// Maximum completion-driven transitions before the harness rejects one input.
 const MAX_STEPS: usize = 4096;
 
+/// Access modes exercised by both fuzz targets and the seed-acceptance tests.
+const MOUNT_ACCESS_MODES: [ext4_core::MountAccess; 2] = [
+    ext4_core::MountAccess::ReadWrite,
+    ext4_core::MountAccess::ReadOnly {
+        recovery: ext4_core::ReadOnlyRecovery::Memory {
+            limit: ext4_core::RecoveryMemoryLimit::DEFAULT,
+        },
+    },
+];
+
 /// Stable terminal classification used to detect nondeterministic execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MountOutcome {
@@ -39,14 +49,7 @@ pub fn assert_deterministic_mount(filesystem: &[u8], external_journal: Option<&[
     {
         return;
     }
-    for access in [
-        ext4_core::MountAccess::ReadWrite,
-        ext4_core::MountAccess::ReadOnly {
-            recovery: ext4_core::ReadOnlyRecovery::Memory {
-                limit: ext4_core::RecoveryMemoryLimit::DEFAULT,
-            },
-        },
-    ] {
+    for access in MOUNT_ACCESS_MODES {
         let first = run_mount(filesystem, external_journal, access);
         let second = run_mount(filesystem, external_journal, access);
         assert_eq!(first, second, "mount/recovery result must be deterministic");
@@ -314,20 +317,22 @@ mod tests {
     use std::{fs, path::Path};
 
     #[test]
+    fn internal_journal_corpus_seed_mounts_without_an_external_device() {
+        let filesystem = include_bytes!("../corpus/mount_image/internal-journal.img");
+        assert!(filesystem.len() <= MAX_INPUT_BYTES);
+        for access in MOUNT_ACCESS_MODES {
+            assert_eq!(run_mount(filesystem, None, access), MountOutcome::Mounted);
+        }
+    }
+
+    #[test]
     fn independent_seed_reaches_external_recovery() -> Result<(), Box<dyn std::error::Error>> {
         let fixtures =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/xtask/fixtures/journal");
         let filesystem = fs::read(fixtures.join("external-4k-v3-64.filesystem.img"))?;
         let journal = fs::read(fixtures.join("external-4k-v3-64.journal.img"))?;
         assert!(filesystem.len() + journal.len() + 4 <= MAX_INPUT_BYTES);
-        for access in [
-            ext4_core::MountAccess::ReadWrite,
-            ext4_core::MountAccess::ReadOnly {
-                recovery: ext4_core::ReadOnlyRecovery::Memory {
-                    limit: ext4_core::RecoveryMemoryLimit::DEFAULT,
-                },
-            },
-        ] {
+        for access in MOUNT_ACCESS_MODES {
             assert_eq!(
                 run_mount(&filesystem, Some(&journal), access),
                 MountOutcome::Mounted
